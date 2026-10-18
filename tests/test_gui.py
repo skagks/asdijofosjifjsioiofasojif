@@ -46,7 +46,7 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     app = gui.App(root, manager, queue.Queue())
     pump(root, lambda: True)
     assert list(app.tree.get_children()) == [a.id, b.id]
-    assert "밀림 1" in app.tree.item(a.id, "values")[6]
+    assert "밀림 1" in app.tree.item(a.id, "values")[5]
 
     app.tree.selection_set(a.id)
     app._update_details()
@@ -62,4 +62,10 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     app.toggle([b.id])  # auto-apply kicks in
     pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
     assert (game_dir / "natives/STM/a.tex").read_text() == "a"
-    assert app.tree.item(b.id, "values")[0] == gui.CHECK_OFF
+    assert app.tree.item(b.id, "image")[0] == str(app.theme.image("check_off", 20))
+
+    app.apply_theme("light")  # switching themes repaints without errors
+    app.search_var.set("zzz")
+    assert app.tree.get_children() == ()
+    app.search_var.set("")
+    assert len(app.tree.get_children()) == 2

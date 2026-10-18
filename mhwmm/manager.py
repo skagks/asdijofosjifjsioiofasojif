@@ -127,6 +127,7 @@ def _from_dict(cls, data: dict):
 
 @dataclass
 class Settings:
+    theme: str = "dark"
     pak_chain: str = DEFAULT_PAK_CHAIN
     auto_apply: bool = True
     enable_on_install: bool = True

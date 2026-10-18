@@ -5,6 +5,7 @@ cd /d "%~dp0"
 python -m pip install --upgrade pyinstaller -r requirements.txt || goto :error
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --name MHWildsModManager ^
+    --icon assets\icon.ico ^
     --collect-all tkinterdnd2 ^
     MHWildsModManager.pyw || goto :error
 echo.
