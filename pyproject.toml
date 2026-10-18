@@ -1,0 +1,18 @@
+[project]
+name = "mhwilds-mod-manager"
+version = "1.0.0"
+description = "Monster Hunter Wilds mod manager (몬스터 헌터 와일즈 모드 매니저)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+extras = ["tkinterdnd2>=0.4", "Pillow>=10", "py7zr>=0.21"]
+
+[project.scripts]
+mhwmm = "mhwmm.cli:main"
+
+[tool.setuptools]
+packages = ["mhwmm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
