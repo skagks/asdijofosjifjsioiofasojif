@@ -218,13 +218,21 @@ class UpdateDialog(Dialog):
     def __init__(self, parent, theme: Theme, release: Release, can_install: bool):
         super().__init__(parent, theme, "업데이트")
         px = theme.px
+        history = release.history or [release]
         ttk.Label(self.body, text=f"새 버전 v{release.version}이 나왔습니다", style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.body, text=f"지금 쓰는 버전은 v{__version__}입니다.", style="Muted.TLabel").pack(
-            anchor="w", pady=(px(4), px(12)))
-        notes = theme.mark(tk.Text(self.body, height=12, width=66, wrap="word", font=theme.fonts["small"],
+        summary = f"지금 쓰는 버전은 v{__version__}입니다."
+        if len(history) > 1:
+            summary += f" 그동안 나온 {len(history)}개 버전의 변경 내역입니다."
+        ttk.Label(self.body, text=summary, style="Muted.TLabel").pack(anchor="w", pady=(px(4), px(12)))
+        notes = theme.mark(tk.Text(self.body, height=14, width=70, wrap="word", font=theme.fonts["small"],
                                    padx=px(14), pady=px(10), cursor="arrow"), "text")
-        text = release.changes.replace("**", "").replace("`", "") or "변경 내역이 없습니다."
-        notes.insert("1.0", text)
+        notes.tag_configure("version", font=theme.fonts["bold"], spacing1=px(10), spacing3=px(4))
+        notes.tag_configure("date", foreground=theme.p["muted"])
+        for item in history:
+            notes.insert("end", f"v{item.version}", "version")
+            if item.published:
+                notes.insert("end", f"   {item.published}", ("version", "date"))
+            notes.insert("end", "\n" + (item.plain_changes or "변경 내역이 없습니다.") + "\n")
         notes.configure(state="disabled")
         notes.pack(fill="both", expand=True)
         if not can_install:

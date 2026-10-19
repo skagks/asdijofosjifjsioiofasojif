@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__, fsutil
@@ -26,7 +26,7 @@ from .constants import EXE_NAME, GITHUB_REPO, RELEASES_URL
 
 log = logging.getLogger(__name__)
 
-API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50"
 DOWNLOAD_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
 USER_AGENT = f"MHWildsModManager/{__version__}"
 STAGED_SUFFIX = ".update.exe"
@@ -45,12 +45,31 @@ class Release:
     exe_url: str | None
     exe_size: int
     sums_url: str | None
+    published: str = ""  # YYYY-MM-DD
+    # Every release newer than the running version, newest first (filled by check_for_update).
+    history: list["Release"] = field(default_factory=list)
 
     @property
     def changes(self) -> str:
         """The "변경 내역" part of the release notes (without the download notes)."""
         head, sep, tail = self.notes.partition("### 변경 내역")
         return (tail if sep else head).strip()
+
+    @property
+    def plain_changes(self) -> str:
+        """``changes`` as plain text: markdown emphasis removed, wrapped list items joined."""
+        lines: list[str] = []
+        for raw in self.changes.replace("**", "").replace("`", "").splitlines():
+            stripped = raw.strip()
+            if lines and lines[-1].strip() and stripped and not stripped.startswith(("-", "*", "#")):
+                lines[-1] = lines[-1].rstrip() + " " + stripped
+            else:
+                lines.append(raw.rstrip())
+        return "\n".join(lines).strip()
+
+    @property
+    def sort_key(self) -> tuple[int, ...]:
+        return parse_version(self.version) or ()
 
 
 def parse_version(text: str) -> tuple[int, ...] | None:
@@ -86,12 +105,14 @@ def parse_release(data: dict) -> Release:
         exe_url=exe.get("browser_download_url"),
         exe_size=int(exe.get("size") or 0),
         sums_url=sums.get("browser_download_url"),
+        published=str(data.get("published_at") or "")[:10],
     )
 
 
-def fetch_latest() -> Release:
+def fetch_releases() -> list[Release]:
+    """Published (non-draft, non-prerelease) releases, newest version first."""
     try:
-        with _open(API_LATEST, api=True) as resp:
+        with _open(API_RELEASES, api=True) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -101,15 +122,25 @@ def fetch_latest() -> Release:
         raise UpdateError(f"GitHub 응답 오류 (HTTP {exc.code})") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise UpdateError(f"업데이트 정보를 가져오지 못했습니다: {getattr(exc, 'reason', exc)}") from exc
-    if not isinstance(data, dict):
+    if not isinstance(data, list):
         raise UpdateError("GitHub 응답을 이해하지 못했습니다.")
-    return parse_release(data)
+    releases = [parse_release(item) for item in data
+                if isinstance(item, dict) and not item.get("draft") and not item.get("prerelease")]
+    releases = [r for r in releases if parse_version(r.version)]
+    if not releases:
+        raise UpdateError("아직 공개된 릴리즈가 없습니다.")
+    return sorted(releases, key=lambda r: r.sort_key, reverse=True)
 
 
-def check_for_update() -> Release | None:
-    """The latest release if it is newer than this program, else None."""
-    release = fetch_latest()
-    return release if is_newer(release.version) else None
+def check_for_update(current: str = __version__) -> Release | None:
+    """The newest release if it is newer than ``current``, with every release in
+    between in ``history`` so all of their changes can be shown; else None."""
+    newer = [r for r in fetch_releases() if is_newer(r.version, current)]
+    if not newer:
+        return None
+    latest = newer[0]
+    latest.history = newer
+    return latest
 
 
 def can_self_update() -> bool:

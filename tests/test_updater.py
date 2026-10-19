@@ -48,22 +48,45 @@ def test_version_compare():
     assert not updater.is_newer("nightly", "1.0.0")
 
 
-def test_parse_release_and_check(monkeypatch):
-    data = {
-        "tag_name": "v9.0.0",
-        "html_url": "https://github.com/x/y/releases/tag/v9.0.0",
-        "body": "### 다운로드\n\n받으세요\n\n### 변경 내역\n\n- 좋아짐\n",
+def api_release(tag, body="", published="2026-10-19T11:00:00Z", **extra):
+    return {
+        "tag_name": tag, "html_url": f"https://github.com/x/y/releases/tag/{tag}", "body": body,
+        "published_at": published,
         "assets": [{"name": EXE_NAME, "browser_download_url": BASE + EXE_NAME, "size": 10},
                    {"name": "SHA256SUMS.txt", "browser_download_url": BASE + "SHA256SUMS.txt", "size": 80}],
+        **extra,
     }
-    serve(monkeypatch, {updater.API_LATEST: json.dumps(data).encode()})
-    found = updater.check_for_update()
-    assert found.version == "9.0.0" and found.exe_size == 10
-    assert found.changes == "- 좋아짐"
 
-    data["tag_name"] = "v0.0.1"
-    serve(monkeypatch, {updater.API_LATEST: json.dumps(data).encode()})
-    assert updater.check_for_update() is None
+
+def test_parse_release_and_check(monkeypatch):
+    body = "### 다운로드\n\n받으세요\n\n### 변경 내역\n\n- 좋아짐\n"
+    serve(monkeypatch, {updater.API_RELEASES: json.dumps([api_release("v9.0.0", body)]).encode()})
+    found = updater.check_for_update("1.0.0")
+    assert found.version == "9.0.0" and found.exe_size == 10 and found.published == "2026-10-19"
+    assert found.changes == "- 좋아짐"
+    assert updater.check_for_update("9.0.0") is None
+
+
+def test_update_lists_every_version_since_the_running_one(monkeypatch):
+    releases = [
+        api_release("v1.2.1", "### 변경 내역\n\n- 옵션 칸"),
+        api_release("v1.3.0", "### 변경 내역\n\n- 데이터 폴더"),
+        api_release("v1.4.0-beta", "베타", prerelease=True),
+        api_release("v9.9.9", "초안", draft=True),
+        api_release("v1.2.0", "### 변경 내역\n\n- 업데이트 기능"),
+        api_release("v1.1.1", "### 변경 내역\n\n- 반디집"),
+    ]
+    serve(monkeypatch, {updater.API_RELEASES: json.dumps(releases).encode()})
+    latest = updater.check_for_update("1.2.0")
+    assert latest.version == "1.3.0"
+    assert [r.version for r in latest.history] == ["1.3.0", "1.2.1"]
+    assert [r.changes for r in latest.history] == ["- 데이터 폴더", "- 옵션 칸"]
+
+
+def test_plain_changes_joins_wrapped_lines():
+    notes = "### 변경 내역\n\n- **긴** 항목이\n  다음 줄로 이어짐\n  - `하위` 항목\n- 둘째"
+    r = Release("1.0.0", "v1.0.0", notes, "", None, 0, None)
+    assert r.plain_changes == "- 긴 항목이 다음 줄로 이어짐\n  - 하위 항목\n- 둘째"
 
 
 def test_download_verifies_checksum(tmp_path, monkeypatch):

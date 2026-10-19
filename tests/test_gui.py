@@ -85,7 +85,11 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     app._on_update_checked(release, None, False)
     assert app.update_button.winfo_manager() == "pack"
     assert "v9.9.9" in app.update_button.cget("text")
+    older = Release("9.9.8", "v9.9.8", "### 변경 내역\n\n- 이전 수정", "https://example", None, 0, None, "2026-10-18")
+    release.history = [release, older]
     dialog = gui.UpdateDialog(root, app.theme, release, can_install=True)
+    shown = dialog.body.winfo_children()[2].get("1.0", "end")
+    assert "v9.9.9" in shown and "v9.9.8" in shown and "이전 수정" in shown
     dialog.destroy()
 
     app.apply_theme("light")  # switching themes repaints without errors
