@@ -37,3 +37,45 @@ jobs:
         with:
           name: MHWildsModManager-windows
           path: dist/MHWildsModManager.exe
+
+  release:
+    # Push a tag like v1.0.0 to publish the exe as a GitHub Release.
+    needs: windows-exe
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches the app version
+        run: |
+          version="v$(python3 -c 'import mhwmm; print(mhwmm.__version__)')"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match mhwmm.__version__ ($version)"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: MHWildsModManager-windows
+          path: dist
+      - name: Write release notes and checksums
+        run: |
+          cd dist && sha256sum MHWildsModManager.exe > SHA256SUMS.txt && cd ..
+          {
+            cat .github/release-header.md
+            echo "### 변경 내역"
+            echo
+            awk -v tag="$GITHUB_REF_NAME" '
+              $0 ~ "^## " tag "( |$)" { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md
+          } > release-notes.md
+          cat release-notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/MHWildsModManager.exe dist/SHA256SUMS.txt \
+            --title "MH Wilds Mod Manager $GITHUB_REF_NAME" \
+            --notes-file release-notes.md

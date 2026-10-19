@@ -37,9 +37,11 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
 
 ### 방법 1: 실행 파일(.exe)
 
-GitHub 저장소의 **Actions → Build** 실행 결과에서 `MHWildsModManager-windows` 아티팩트를 받아
-`MHWildsModManager.exe`를 실행합니다. 직접 만들려면 Python을 설치한 뒤 `build_exe.bat`를 실행하면
-`dist\MHWildsModManager.exe`가 만들어집니다.
+저장소의 [**Releases**](https://github.com/skagks/asdijofosjifjsioiofasojif/releases/latest) 페이지에서 `MHWildsModManager.exe`를 받아 실행합니다.
+설치는 필요 없습니다. 처음 실행할 때 Windows SmartScreen 경고가 뜨면 **추가 정보 → 실행**을 누르세요
+(서명되지 않은 실행 파일이라 나오는 경고입니다).
+
+직접 만들려면 Python을 설치한 뒤 `build_exe.bat`를 실행하면 `dist\MHWildsModManager.exe`가 만들어집니다.
 
 ### 방법 2: Python으로 실행
 
@@ -127,6 +129,9 @@ python -m mhwmm deploy | purge | verify
 - PAK 모드끼리 같은 대상을 바꾸는지는 PAK 내용을 열어 보지 않으므로 충돌 표시에 나오지 않습니다.
 
 ## 개발
+
+새 버전을 릴리즈하려면 `mhwmm/__init__.py`의 `__version__`과 `CHANGELOG.md`를 고친 뒤
+`v` + 버전 이름의 태그(예: `v1.0.1`)를 푸시하세요. GitHub Actions가 테스트, exe 빌드, 릴리즈 생성을 차례로 진행합니다.
 
 ```
 pip install pytest
