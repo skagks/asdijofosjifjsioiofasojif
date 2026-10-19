@@ -50,10 +50,11 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
 2. (선택) 추가 기능 설치: `pip install -r requirements.txt`
    - `tkinterdnd2`: 탐색기에서 파일을 끌어 놓아 설치
    - `Pillow`: JPG 미리보기 이미지 표시
-   - `py7zr`: 7-Zip 없이 `.7z` 압축 풀기
+   - `py7zr`: 다른 압축 프로그램 없이 `.7z` 압축 풀기
 3. `MHWildsModManager.pyw`를 더블클릭하거나 `python -m mhwmm`을 실행합니다.
 
-> `.rar` 파일과 (py7zr이 없을 때) `.7z` 파일은 [7-Zip](https://www.7-zip.org)이 설치되어 있어야 풀 수 있습니다.
+> `.rar` · `.7z` 파일은 PC에 설치된 **반디집** 또는 **7-Zip**으로 풀어서 설치합니다. 둘 다 없으면 Windows 11에
+> 들어 있는 기본 압축 풀기(tar)를 시도합니다. zip 파일은 아무것도 없어도 됩니다.
 
 ## 사용법
 

@@ -1476,7 +1476,7 @@ class App:
             "• PAK 모드는 re_chunk_000.pak.sub_000.pak.patch_XXX.pak 번호를 자동으로 매깁니다.\n"
             "• 게임 업데이트 후에는 '☰ > 적용 상태 점검'을 실행하세요. 업데이트가 덮어쓴 번호를 피해서 다시 배치합니다.\n"
             "• natives 폴더(루스 파일) 모드와 Lua 스크립트는 REFramework가 필요합니다. REFramework도 이 프로그램으로 설치할 수 있습니다.\n"
-            "• 7z/rar 파일은 7-Zip이 설치되어 있어야 풀 수 있습니다."), parent=self.root)
+            "• 7z/rar 파일은 PC에 설치된 반디집이나 7-Zip으로 풉니다."), parent=self.root)
 
     def show_about(self):
         messagebox.showinfo("정보", f"{APP_TITLE}\n버전 {__version__}\n\n데이터 폴더:\n{self.manager.data_dir}", parent=self.root)
