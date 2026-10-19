@@ -180,3 +180,34 @@ def test_refuses_other_game_dir(tmp_path, game_dir):
     other.mkdir()
     with pytest.raises(DeployError):
         Deployer(other, tmp_path / "data").run([a])
+
+
+def test_gap_left_by_another_tool_is_found_and_closed(tmp_path, game_dir):
+    # Another mod manager (e.g. Fluffy) had PAKs at 2 and 3, so ours went to 4.
+    write(game_dir / patch(2), "fluffy 1")
+    write(game_dir / patch(3), "fluffy 2")
+    a = mod(tmp_path, "a", {"Chen_Tex.pak": "tex"})
+    d = Deployer(game_dir, tmp_path / "data")
+    d.run([a])
+    assert (game_dir / patch(4)).read_text() == "tex"
+    assert d.verify() == [] and d.pak_gaps() == []
+
+    # Removing those leaves a gap: the game stops at 2 and never reads our PAK.
+    (game_dir / patch(2)).unlink()
+    (game_dir / patch(3)).unlink()
+    gaps = d.pak_gaps()
+    assert [(g.chain, g.missing, g.unread) for g in gaps] == [(CHAIN, [2, 3], [patch(4)])]
+    problems = d.verify()
+    assert len(problems) == 1 and patch(2) in problems[0] and patch(4) in problems[0]
+
+    d.run([a])  # applying again moves our PAK down into the gap
+    assert (game_dir / patch(2)).read_text() == "tex" and not (game_dir / patch(4)).exists()
+    assert d.verify() == [] and d.pak_gaps() == []
+
+
+def test_gap_only_below_foreign_paks_is_not_ours(tmp_path, game_dir):
+    a = mod(tmp_path, "a", {"a.pak": "A"})
+    d = Deployer(game_dir, tmp_path / "data")
+    d.run([a])  # ours at 2
+    write(game_dir / patch(9), "other tool")  # someone else's PAK after a gap
+    assert d.pak_gaps() == []

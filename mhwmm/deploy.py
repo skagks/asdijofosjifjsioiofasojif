@@ -11,6 +11,9 @@ manifest of the previous run and only performs the difference:
 * A manifest entry whose file changed on disk is re-checked before touching it.  A
   changed PAK means a game update reused that patch number, so the file now belongs
   to the game: it is never deleted and the mod gets a new number.
+* The game stops reading a chain at the first missing number.  When another tool
+  removes its PAKs from below ours, the gap is reported and the next run moves our
+  PAKs down into it.
 """
 
 from __future__ import annotations
@@ -47,6 +50,20 @@ def pak_chain_of(name: str, default_chain: str) -> str:
 def _pak_sort_key(name: str):
     m = PAK_PATCH_RE.match(name)
     return (0, int(m.group("num")), name.lower()) if m else (1, 0, name.lower())
+
+
+@dataclass
+class PakGap:
+    chain: str
+    missing: list[int]  # numbers below our PAKs that no file uses
+    unread: list[str]  # our PAKs the game cannot reach because of the gap
+
+    def describe(self) -> str:
+        first = f"{self.chain}.patch_{self.missing[0]:03d}.pak"
+        more = f" 외 {len(self.missing) - 1}개" if len(self.missing) > 1 else ""
+        return (f"PAK 번호가 비어 있습니다: {first}{more}. 게임은 빈 번호에서 읽기를 멈추므로 그 뒤의 모드 PAK "
+                f"{len(self.unread)}개({', '.join(self.unread[:3])}{' …' if len(self.unread) > 3 else ''})가 "
+                "적용되지 않습니다. 다시 적용하면 번호를 당겨 채웁니다.")
 
 
 @dataclass
@@ -168,7 +185,37 @@ class Deployer:
                 problems.append(f"없어진 파일: {entry['path']}")
             elif state == "changed" and entry.get("pak"):
                 problems.append(f"게임 업데이트 등으로 덮어써진 PAK: {entry['path']}")
+        problems += [gap.describe() for gap in self.pak_gaps(manifest)]
         return problems
+
+    def pak_gaps(self, manifest: dict | None = None) -> list[PakGap]:
+        """Missing patch numbers that keep the game from reading our PAKs."""
+        manifest = manifest or self.load_manifest()
+        ours: dict[str, dict[int, str]] = {}
+        for entry in manifest["files"].values():
+            m = PAK_PATCH_RE.match(entry["path"]) if entry.get("pak") else None
+            if m:
+                ours.setdefault(m.group("chain").lower(), {})[int(m.group("num"))] = entry["path"]
+        if not ours:
+            return []
+        present: dict[str, set[int]] = {}
+        try:
+            names = os.listdir(fsutil.longpath(self.game_dir))
+        except OSError:
+            return []
+        for name in names:
+            m = PAK_PATCH_RE.match(name)
+            if m:
+                present.setdefault(m.group("chain").lower(), set()).add(int(m.group("num")))
+        gaps = []
+        for chain, paks in ours.items():
+            have = present.get(chain, set())
+            missing = [n for n in range(1, max(paks) + 1) if n not in have]
+            if missing:
+                unread = [paks[n] for n in sorted(paks) if n > missing[0] and n in have]
+                if unread:
+                    gaps.append(PakGap(chain, missing, unread))
+        return gaps
 
     # ------------------------------------------------------------------ deploy
     def run(self, sources: list[ModSource], progress: ProgressFn | None = None) -> DeployReport:

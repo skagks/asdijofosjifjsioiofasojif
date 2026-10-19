@@ -1833,6 +1833,7 @@ class App:
             return
         try:
             problems = m.verify()
+            gaps = {gap.describe() for gap in m.pak_gaps()}
         except Exception as exc:
             log.warning("적용 상태를 점검하지 못했습니다: %s", exc)
             return
@@ -1842,9 +1843,14 @@ class App:
             m.dirty = True
             m.save()
             self._update_header()
-            if messagebox.askyesno(APP_TITLE, f"게임 폴더의 모드 파일 {len(problems)}개가 바뀌었거나 없어졌습니다.\n"
-                                              "게임 업데이트 후라면 PAK 모드 번호를 다시 맞춰야 합니다.\n\n지금 다시 적용할까요?",
-                                   parent=self.root):
+            if m.settings.auto_apply and all(p in gaps for p in problems):
+                # e.g. another mod manager removed its PAKs: moving ours down is always safe
+                log.info("PAK 번호에 빈칸이 생겨 번호를 다시 맞춥니다.")
+                self.apply()
+                return
+            shown = "\n".join(f"• {p}" for p in problems[:5]) + (f"\n… 외 {len(problems) - 5}개" if len(problems) > 5 else "")
+            if messagebox.askyesno(APP_TITLE, f"게임 폴더에서 모드 적용 문제 {len(problems)}개를 찾았습니다.\n\n{shown}\n\n"
+                                              "지금 다시 적용할까요? (PAK 번호를 다시 맞춥니다)", parent=self.root):
                 self.apply()
 
     # ------------------------------------------------------------------ game folder
@@ -2159,6 +2165,11 @@ class App:
     # ------------------------------------------------------------------ misc actions
     def launch_game(self):
         m = self.manager
+        if m.game_dir and not m.dirty and m.pak_gaps():
+            log.warning("PAK 번호에 빈칸이 있어 게임이 일부 모드 PAK을 읽지 못합니다. 번호를 다시 맞춥니다.")
+            m.dirty = True
+            m.save()
+            self._update_header()
         if m.dirty and m.game_dir:
             if m.settings.apply_before_launch:
                 log.info("남은 변경사항을 적용한 뒤 게임을 실행합니다.")

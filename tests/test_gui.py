@@ -317,3 +317,27 @@ def test_gui_checks_mod_updates_at_startup(root, manager, tmp_path, monkeypatch)
     app._mod_check_error = None
     app.refresh()
     assert not app.mods_badge.winfo_manager()
+
+
+def test_gui_closes_pak_gap_at_startup(root, manager, tmp_path, game_dir):
+    from mhwmm import gui
+
+    from conftest import write
+
+    # PAKs of another mod manager sat at 2 and 3, so ours went to 4 ...
+    chain = "re_chunk_000.pak.sub_000.pak"
+    for n in (2, 3):
+        write(game_dir / f"{chain}.patch_{n:03d}.pak", "fluffy")
+    with manager.prepare_install(make_zip(tmp_path / "Chen.zip", {"Chen_Tex.pak": "tex"})) as s:
+        manager.install_variant(s, s.variants[0])
+    manager.deploy()
+    assert (game_dir / f"{chain}.patch_004.pak").read_text() == "tex"
+    # ... then they were removed: the game stops at 2 and never reads our textures
+    for n in (2, 3):
+        (game_dir / f"{chain}.patch_{n:03d}.pak").unlink()
+    assert manager.pak_gaps()
+
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: (game_dir / f"{chain}.patch_002.pak").exists() and app.busy is None and not manager.dirty)
+    assert (game_dir / f"{chain}.patch_002.pak").read_text() == "tex"
+    assert not (game_dir / f"{chain}.patch_004.pak").exists() and not manager.pak_gaps()

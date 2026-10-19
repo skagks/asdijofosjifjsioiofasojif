@@ -1030,6 +1030,12 @@ class ModManager:
             return []
         return self.deployer().verify()
 
+    def pak_gaps(self) -> list:
+        """Missing PAK patch numbers (e.g. left by another mod manager) that hide our PAKs from the game."""
+        if not self.game_dir or not self.game_dir.is_dir():
+            return []
+        return self.deployer().pak_gaps()
+
     def deployed_files(self) -> dict:
         """Manifest entries of the current deployment, keyed by lower-cased game path."""
         if not self.game_dir:
