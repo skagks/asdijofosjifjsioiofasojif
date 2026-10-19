@@ -44,16 +44,24 @@ jobs:
           path: dist/MHWildsModManager.exe
 
   release:
-    # Publish the exe as a GitHub Release: push a tag like v1.0.0, or run this
-    # workflow manually with "release" checked (the tag is then created here).
+    # Publish the exe as a GitHub Release whenever the default branch carries a
+    # version (mhwmm.__version__) that has no release yet. Pushing a tag like
+    # v1.0.0, or a manual run with "release" checked, works too.
     needs: windows-exe
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+    if: (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) || (github.event_name == 'workflow_dispatch' && inputs.release)
     runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
       - name: Pick the release tag
+        id: tag
         run: |
           version="v$(python3 -c 'import mhwmm; print(mhwmm.__version__)')"
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$version" != "$GITHUB_REF_NAME" ]; then
@@ -61,28 +69,38 @@ jobs:
             exit 1
           fi
           echo "TAG=$version" >> "$GITHUB_ENV"
+          if gh release view "$version" > /dev/null 2>&1; then
+            echo "Release $version already exists; bump mhwmm.__version__ to publish a new one."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@v4
+        if: steps.tag.outputs.exists == 'false'
         with:
           name: MHWildsModManager-windows
           path: dist
       - name: Write release notes and checksums
+        if: steps.tag.outputs.exists == 'false'
         run: |
           cd dist && sha256sum MHWildsModManager.exe > SHA256SUMS.txt && cd ..
+          changes="$(awk -v tag="$TAG" '
+            $0 ~ "^## " tag "( |$)" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -z "$(echo "$changes" | tr -d '[:space:]')" ]; then
+            changes="자세한 변경 내역은 커밋 기록을 참고하세요."
+          fi
           {
             cat .github/release-header.md
             echo "### 변경 내역"
             echo
-            awk -v tag="$TAG" '
-              $0 ~ "^## " tag "( |$)" { found = 1; next }
-              found && /^## / { exit }
-              found { print }
-            ' CHANGELOG.md
+            echo "$changes"
           } > release-notes.md
           cat release-notes.md
       - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+        if: steps.tag.outputs.exists == 'false'
         run: |
           gh release create "$TAG" dist/MHWildsModManager.exe dist/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
