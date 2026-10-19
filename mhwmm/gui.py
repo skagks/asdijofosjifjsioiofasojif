@@ -21,7 +21,7 @@ from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_C
                         REFRAMEWORK_URL, STEAM_APP_ID)
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .manager import (InstallError, InstallSession, Mod, ModManager, acquire_instance_lock,
-                      default_data_dir, setup_logging)
+                      prepare_data_dir, resolve_data_dir, setup_logging)
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
 from .updater import Release, UpdateError
 
@@ -1699,6 +1699,45 @@ def _windows_setup():
         pass
 
 
+def _prepare_data_dir(root: tk.Tk, explicit) -> tuple[Path, str | None]:
+    """prepare_data_dir with a small progress window while data is being moved."""
+    if explicit or resolve_data_dir()[1] is None:
+        return prepare_data_dir(explicit)
+    win = tk.Toplevel(root)
+    win.title(APP_TITLE)
+    win.resizable(False, False)
+    frame = ttk.Frame(win, padding=20)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="데이터 폴더를 프로그램 옆으로 옮기는 중입니다.\n모드가 많으면 몇 분 걸릴 수 있습니다.",
+              justify="left").pack(anchor="w")
+    bar = ttk.Progressbar(frame, length=360, mode="determinate", maximum=1)
+    bar.pack(fill="x", pady=(12, 0))
+    updates: queue.Queue = queue.Queue()
+    result: dict = {}
+
+    def work():
+        try:
+            result["value"] = prepare_data_dir(None, lambda done, total, msg: updates.put((done, total)))
+        except BaseException as exc:  # reported below
+            result["error"] = exc
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        try:
+            while True:
+                done, total = updates.get_nowait()
+                bar.configure(maximum=total, value=done)
+        except queue.Empty:
+            pass
+        win.update()
+        time.sleep(0.05)
+    win.destroy()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 def main(data_dir=None) -> int:
     _windows_setup()
     root = None
@@ -1712,8 +1751,10 @@ def main(data_dir=None) -> int:
     root.withdraw()
     events: queue.Queue = queue.Queue()
     try:
-        data_path = Path(data_dir) if data_dir else None
-        lock = acquire_instance_lock(data_path or default_data_dir())
+        data_path, problem = _prepare_data_dir(root, data_dir)
+        if problem:
+            messagebox.showwarning(APP_TITLE, problem)
+        lock = acquire_instance_lock(data_path)
         if lock is None:
             messagebox.showerror(APP_TITLE, "모드 매니저가 이미 실행 중입니다.")
             root.destroy()

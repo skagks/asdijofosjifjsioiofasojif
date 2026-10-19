@@ -10,7 +10,7 @@ from pathlib import Path
 from . import __version__, steam
 from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
-from .manager import InstallError, ModManager, acquire_instance_lock, default_data_dir, setup_logging
+from .manager import InstallError, ModManager, acquire_instance_lock, prepare_data_dir, setup_logging
 
 KIND_NAMES = {
     "reframework": "REFramework", "pak": "PAK", "loose": "루스", "script": "스크립트",
@@ -249,7 +249,9 @@ def main(argv=None) -> int:
             except (ValueError, OSError):
                 pass
     try:
-        data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+        data_dir, problem = prepare_data_dir(args.data_dir)
+        if problem:
+            print(f"경고: {problem}", file=sys.stderr)
         lock = acquire_instance_lock(data_dir)
         if lock is None and args.cmd not in READ_ONLY_COMMANDS:
             print("모드 매니저가 이미 실행 중입니다. 종료한 뒤 다시 시도하세요.", file=sys.stderr)

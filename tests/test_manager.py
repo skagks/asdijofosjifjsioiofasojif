@@ -210,3 +210,71 @@ def test_options_are_off_until_chosen(manager, game_dir, tmp_path):
     manager.deploy()
     assert (game_dir / "natives/STM/a.tex").read_text() == "red2"
     assert not (game_dir / f"{CHAIN}.patch_002.pak").exists()
+
+
+@pytest.fixture
+def frozen_exe(tmp_path, monkeypatch):
+    """Pretend to run as the packaged exe in tmp_path/app, with the old data folder in tmp_path/legacy."""
+    from mhwmm import manager as mgr
+
+    app = tmp_path / "app"
+    write(app / "MHWildsModManager.exe", "exe")
+    monkeypatch.setattr(mgr.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mgr.sys, "executable", str(app / "MHWildsModManager.exe"))
+    monkeypatch.setattr(mgr, "user_data_dir", lambda: tmp_path / "legacy")
+    monkeypatch.delenv("MHWMM_DATA_DIR", raising=False)
+    return app
+
+
+def test_data_dir_next_to_exe(frozen_exe, tmp_path, monkeypatch):
+    from mhwmm import manager as mgr
+
+    assert mgr.resolve_data_dir() == (frozen_exe / "MHWildsModManager_data", None)
+    write(tmp_path / "legacy" / "state.json", "{}")
+    assert mgr.resolve_data_dir() == (frozen_exe / "MHWildsModManager_data", tmp_path / "legacy")
+    (frozen_exe / "MHWildsModManager_data").mkdir()
+    assert mgr.resolve_data_dir() == (frozen_exe / "MHWildsModManager_data", None)
+    (frozen_exe / "MHWildsModManager_data").rmdir()
+    monkeypatch.setattr(mgr, "_dir_writable", lambda path: False)  # e.g. C:\Program Files
+    assert mgr.resolve_data_dir() == (tmp_path / "legacy", None)
+    monkeypatch.setenv("MHWMM_DATA_DIR", str(tmp_path / "custom"))
+    assert mgr.resolve_data_dir() == (tmp_path / "custom", None)
+
+
+@pytest.mark.parametrize("same_drive", [True, False])
+def test_old_data_is_moved_next_to_exe(frozen_exe, tmp_path, monkeypatch, same_drive):
+    from mhwmm import manager as mgr
+
+    legacy = tmp_path / "legacy"
+    old = ModManager(legacy)
+    with old.prepare_install(make_zip(tmp_path / "A.zip", {"natives/x.tex": "a"})) as session:
+        mod = old.install_variant(session, session.variants[0])
+    stored = old.files_dir(mod.id) / "natives/x.tex"
+    mtime = stored.stat().st_mtime_ns
+    if not same_drive:
+        real = mgr._rename_dir
+        monkeypatch.setattr(mgr, "_rename_dir",
+                            lambda src, dst: (_ for _ in ()).throw(OSError("other drive")) if src == legacy else real(src, dst))
+    seen = []
+    path, problem = mgr.prepare_data_dir(progress=lambda done, total, msg: seen.append(done))
+    target = frozen_exe / "MHWildsModManager_data"
+    assert (path, problem) == (target, None)
+    assert not legacy.exists()
+    moved = ModManager(target)
+    assert [m.name for m in moved.mods] == ["A"]
+    assert (moved.files_dir(mod.id) / "natives/x.tex").stat().st_mtime_ns == mtime  # no redeploy needed
+    assert bool(seen) is not same_drive
+
+
+def test_failed_move_keeps_old_data(frozen_exe, tmp_path, monkeypatch):
+    from mhwmm import manager as mgr
+
+    legacy = tmp_path / "legacy"
+    write(legacy / "state.json", "{}")
+    write(legacy / "mods" / "m1" / "files" / "a.pak", "p")
+    monkeypatch.setattr(mgr, "_rename_dir", lambda src, dst: (_ for _ in ()).throw(OSError("other drive")))
+    monkeypatch.setattr(mgr.fsutil, "copy_file", lambda src, dst: (_ for _ in ()).throw(OSError("disk full")))
+    path, problem = mgr.prepare_data_dir()
+    assert path == legacy and "disk full" in problem
+    assert (legacy / "mods" / "m1" / "files" / "a.pak").exists()
+    assert not (frozen_exe / "MHWildsModManager_data.partial").exists()

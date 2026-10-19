@@ -93,3 +93,24 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     assert app.tree.get_children() == ()
     app.search_var.set("")
     assert len(app.tree.get_children()) == 3
+
+
+def test_gui_moves_old_data_with_progress(root, tmp_path, monkeypatch):
+    from mhwmm import gui, manager as mgr
+
+    from conftest import write
+
+    app_dir = tmp_path / "app"
+    write(app_dir / "MHWildsModManager.exe", "exe")
+    legacy = tmp_path / "legacy"
+    write(legacy / "state.json", "{}")
+    write(legacy / "mods" / "m1" / "files" / "a.pak", "p" * 1000)
+    monkeypatch.setattr(mgr.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mgr.sys, "executable", str(app_dir / "MHWildsModManager.exe"))
+    monkeypatch.setattr(mgr, "user_data_dir", lambda: legacy)
+    monkeypatch.delenv("MHWMM_DATA_DIR", raising=False)
+    monkeypatch.setattr(mgr, "_rename_dir", lambda s, d: (_ for _ in ()).throw(OSError("x")) if s == legacy
+                        else mgr.os.replace(s, d))
+    path, problem = gui._prepare_data_dir(root, None)
+    assert problem is None and path == app_dir / "MHWildsModManager_data"
+    assert (path / "mods" / "m1" / "files" / "a.pak").exists() and not legacy.exists()

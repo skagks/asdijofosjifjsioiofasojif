@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 STATE_VERSION = 1
 SINGLE_FILE_EXTS = (".pak", ".lua", ".dll", ".asi")
 STALE_TEMP_SECONDS = 2 * 3600
+DATA_DIR_NAME = "MHWildsModManager_data"  # next to the exe
 
 
 class InstallError(Exception):
@@ -37,18 +38,112 @@ def app_directory() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def default_data_dir() -> Path:
-    env = os.environ.get("MHWMM_DATA_DIR")
-    if env:
-        return Path(env)
-    app_dir = app_directory()
-    if (app_dir / "portable.txt").exists():
-        return app_dir / "data"
+def user_data_dir() -> Path:
+    """Per-user data folder (the default before v1.3.0, and the fallback)."""
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     else:
         base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(base) / "MHWildsModManager"
+
+
+def _dir_writable(path: Path) -> bool:
+    probe = path / f".mhwmm-write-test-{os.getpid()}"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _has_data(path: Path) -> bool:
+    return (path / "state.json").is_file() or (path / "mods").is_dir()
+
+
+def resolve_data_dir() -> tuple[Path, Path | None]:
+    """(data folder to use, older data folder to move into it first or None).
+
+    The packaged exe keeps its data in ``MHWildsModManager_data`` next to itself
+    unless that folder cannot be written; running from source uses the user folder."""
+    env = os.environ.get("MHWMM_DATA_DIR")
+    if env:
+        return Path(env), None
+    app_dir = app_directory()
+    if (app_dir / "portable.txt").exists():  # portable mode from older versions
+        return app_dir / "data", None
+    legacy = user_data_dir()
+    if not getattr(sys, "frozen", False):
+        return legacy, None
+    target = app_dir / DATA_DIR_NAME
+    if target.is_dir():
+        return target, None
+    if not _dir_writable(app_dir):
+        return legacy, None
+    return target, (legacy if _has_data(legacy) else None)
+
+
+def default_data_dir() -> Path:
+    return resolve_data_dir()[0]
+
+
+def _rename_dir(src: Path, dst: Path) -> None:
+    os.replace(fsutil.longpath(src), fsutil.longpath(dst))
+
+
+def migrate_data_dir(src: Path, dst: Path, progress: ProgressFn | None = None) -> None:
+    """Move the whole data folder ``src`` to ``dst`` (which must not exist yet).
+
+    A rename is used when both are on the same drive; otherwise the files are copied
+    to a temporary folder first, so a failure leaves ``src`` untouched."""
+    progress = progress or (lambda done, total, msg: None)
+    try:
+        _rename_dir(src, dst)
+        return
+    except OSError:
+        pass  # different drive or in use: copy instead
+    files = []
+    for dirpath, _dirnames, filenames in os.walk(fsutil.longpath(src)):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            files.append((full, os.path.relpath(full, fsutil.longpath(src)), os.path.getsize(full)))
+    total = sum(size for _, _, size in files) or 1
+    partial = dst.with_name(dst.name + ".partial")
+    fsutil.rmtree(partial)
+    done = 0
+    try:
+        for full, rel, size in files:
+            fsutil.copy_file(full, partial / rel)  # keeps modification times, so nothing is redeployed
+            done += size
+            progress(done, total, f"데이터 폴더 옮기는 중... {done * 100 // total}%")
+        _rename_dir(partial, dst)
+    except BaseException:
+        fsutil.rmtree(partial)
+        raise
+    try:
+        fsutil.rmtree(src)
+    except OSError as exc:
+        log.warning("이전 데이터 폴더를 지우지 못했습니다: %s (%s)", src, exc)
+
+
+def prepare_data_dir(explicit=None, progress: ProgressFn | None = None) -> tuple[Path, str | None]:
+    """Pick the data folder, moving data from an older location if needed.
+
+    Returns (folder, problem): ``problem`` explains why an older folder is still used."""
+    if explicit:
+        return Path(explicit), None
+    target, legacy = resolve_data_dir()
+    if legacy is None:
+        return target, None
+    probe = acquire_instance_lock(legacy)
+    if probe is None:  # an older version is running from there; let the caller report it
+        return legacy, None
+    probe.close()  # the lock file moves along with the folder
+    try:
+        migrate_data_dir(legacy, target, progress)
+    except OSError as exc:
+        return legacy, f"데이터 폴더를 {target}(으)로 옮기지 못해 이전 위치({legacy})를 계속 씁니다: {exc}"
+    return target, None
 
 
 def setup_logging(data_dir: Path, extra: logging.Handler | None = None) -> None:

@@ -108,9 +108,13 @@ v1.2.0부터는 프로그램이 켜질 때 새 버전을 확인합니다. 새 �
 
 | 항목 | 위치 |
 | --- | --- |
-| 기본 | `%LOCALAPPDATA%\MHWildsModManager` |
-| 포터블 모드 | 실행 파일과 같은 폴더에 빈 `portable.txt` 파일을 만들면 그 옆 `data\` 폴더 사용 |
+| 기본 (exe) | 실행 파일과 같은 폴더의 `MHWildsModManager_data` (없으면 자동으로 만듦) |
+| exe 폴더에 쓸 수 없을 때 | `%LOCALAPPDATA%\MHWildsModManager` (예: `C:\Program Files`에 둔 경우) |
+| Python으로 실행 | `%LOCALAPPDATA%\MHWildsModManager` |
 | 직접 지정 | `--data-dir <폴더>` 옵션 또는 `MHWMM_DATA_DIR` 환경 변수 |
+
+v1.2.1 이하에서 `%LOCALAPPDATA%\MHWildsModManager`에 쌓인 데이터는 v1.3.0 이상을 처음 실행할 때 exe 옆으로 자동으로
+옮겨집니다. 모드 파일이 데이터 폴더에 저장되므로, 용량이 넉넉한 드라이브에 exe를 두면 됩니다.
 
 - `mods\<id>\files\` : 설치된 모드 파일 (게임 폴더 기준 구조)
 - `state.json` : 모드 목록, 순서, 활성 상태, 설정
