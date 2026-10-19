@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Create a GitHub Release (tag v<version>) from this commit"
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -39,21 +44,23 @@ jobs:
           path: dist/MHWildsModManager.exe
 
   release:
-    # Push a tag like v1.0.0 to publish the exe as a GitHub Release.
+    # Publish the exe as a GitHub Release: push a tag like v1.0.0, or run this
+    # workflow manually with "release" checked (the tag is then created here).
     needs: windows-exe
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Check that the tag matches the app version
+      - name: Pick the release tag
         run: |
           version="v$(python3 -c 'import mhwmm; print(mhwmm.__version__)')"
-          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match mhwmm.__version__ ($version)"
             exit 1
           fi
+          echo "TAG=$version" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: MHWildsModManager-windows
@@ -65,7 +72,7 @@ jobs:
             cat .github/release-header.md
             echo "### 변경 내역"
             echo
-            awk -v tag="$GITHUB_REF_NAME" '
+            awk -v tag="$TAG" '
               $0 ~ "^## " tag "( |$)" { found = 1; next }
               found && /^## / { exit }
               found { print }
@@ -75,7 +82,9 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/MHWildsModManager.exe dist/SHA256SUMS.txt \
-            --title "MH Wilds Mod Manager $GITHUB_REF_NAME" \
+          gh release create "$TAG" dist/MHWildsModManager.exe dist/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "MH Wilds Mod Manager $TAG" \
             --notes-file release-notes.md

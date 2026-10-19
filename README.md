@@ -131,7 +131,8 @@ python -m mhwmm deploy | purge | verify
 ## 개발
 
 새 버전을 릴리즈하려면 `mhwmm/__init__.py`의 `__version__`과 `CHANGELOG.md`를 고친 뒤
-`v` + 버전 이름의 태그(예: `v1.0.1`)를 푸시하세요. GitHub Actions가 테스트, exe 빌드, 릴리즈 생성을 차례로 진행합니다.
+`v` + 버전 이름의 태그(예: `v1.0.1`)를 푸시하거나, GitHub의 **Actions → Build → Run workflow**에서 `release`를
+체크해 실행하세요. 테스트, exe 빌드, 릴리즈 생성이 차례로 진행됩니다.
 
 ```
 pip install pytest
