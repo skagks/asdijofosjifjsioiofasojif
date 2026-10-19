@@ -58,6 +58,8 @@ def manager(tmp_path: Path, game_dir: Path):
 
     m = ModManager(tmp_path / "data")
     m.settings.check_game_running = False
+    m.settings.check_updates = False  # no network in tests
+    m.settings.check_refw_updates = False
     m.set_game_dir(game_dir)
     return m
 

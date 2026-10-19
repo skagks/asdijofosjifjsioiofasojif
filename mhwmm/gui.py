@@ -15,7 +15,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, fsutil, steam, updater
+from . import __version__, fsutil, refw, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_CHAINS,
@@ -272,6 +272,43 @@ class UpdateDialog(Dialog):
         self.destroy()
 
 
+class RefwDialog(Dialog):
+    """REFramework status; result is "install", "page" or None."""
+
+    def __init__(self, parent, theme: Theme, status: refw.Status, managed: bool):
+        super().__init__(parent, theme, "REFramework")
+        px = theme.px
+        latest = status.latest
+        ttk.Label(self.body, text="REFramework", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.body, text="루스 파일 모드와 Lua 스크립트를 쓰려면 필요한 프로그램입니다.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(px(4), px(14)))
+        grid = ttk.Frame(self.body)
+        grid.pack(fill="x")
+        rows = (("설치된 버전", refw.describe_installed(status)),
+                ("최신 버전", f"{latest.label}" + (f"   ({latest.published})" if latest.published else "")))
+        for i, (key, value) in enumerate(rows):
+            ttk.Label(grid, text=key, style="Muted.TLabel").grid(row=i, column=0, sticky="w", padx=(0, px(16)), pady=px(3))
+            ttk.Label(grid, text=value).grid(row=i, column=1, sticky="w", pady=px(3))
+        notes = ["VR을 쓰지 않을 때의 REFramework 안내에 따라 dinput8.dll만 설치합니다."]
+        if status.installed and not managed:
+            notes.append("직접 넣어 둔 dinput8.dll은 백업해 두었다가, 이 REFramework를 끄거나 지우면 되돌립니다.")
+        for note in notes:
+            ttk.Label(self.body, text="• " + note, style="Muted.TLabel", font=theme.fonts["small"],
+                      wraplength=px(460), justify="left").pack(anchor="w", pady=(px(8), 0))
+        if not status.installed:
+            ok_text = "설치"
+        elif status.up_to_date:
+            ok_text = "다시 설치"
+        else:
+            ok_text = "업데이트"
+        row = self.buttons(ok_text, lambda: self.finish("install"), cancel_text="닫기")
+        ttk.Button(row, text="릴리즈 페이지", command=lambda: self.finish("page")).pack(side="left")
+
+    def finish(self, result: str):
+        self.result = result
+        self.destroy()
+
+
 class SettingsDialog(Dialog):
     def __init__(self, parent, theme: Theme, manager: ModManager):
         super().__init__(parent, theme, "설정")
@@ -308,6 +345,7 @@ class SettingsDialog(Dialog):
         check(left, "minimize_on_launch", "게임을 실행하면 이 창 최소화")
         section(left, "업데이트")
         check(left, "check_updates", "시작할 때 새 버전 확인")
+        check(left, "check_refw_updates", "시작할 때 REFramework 업데이트 확인")
 
         section(right, "모드 적용")
         check(right, "auto_apply", "변경 즉시 게임 폴더에 적용")
@@ -363,6 +401,7 @@ class App:
         self._log_visible = True
         self._update: Release | None = None
         self._launch_after_apply = False
+        self._refw_status: refw.Status | None = None
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -394,6 +433,8 @@ class App:
         root.after(300, self._startup)
         if manager.settings.check_updates:
             root.after(2500, lambda: self.check_updates(manual=False))
+        if manager.settings.check_refw_updates:
+            root.after(3500, lambda: self.check_refw(manual=False))
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -498,10 +539,11 @@ class App:
         m.add_command(label="모두 비활성화", command=lambda: self.set_enabled_all(False))
         m.add_separator()
         m.add_command(label="데이터 폴더 열기", command=lambda: fsutil.open_in_explorer(self.manager.data_dir))
-        m.add_command(label="REFramework 다운로드", command=lambda: webbrowser.open(REFRAMEWORK_URL))
+        m.add_command(label="REFramework 릴리즈 페이지", command=lambda: webbrowser.open(REFRAMEWORK_URL))
         m.add_command(label="Nexus Mods (몬헌 와일즈)", command=lambda: webbrowser.open(NEXUS_URL))
         m.add_separator()
         m.add_command(label="업데이트 확인", command=lambda: self.check_updates(manual=True))
+        m.add_command(label="REFramework 업데이트 확인", command=lambda: self.check_refw(manual=True))
         m.add_command(label="사용법", command=self.show_help)
         m.add_command(label="정보", command=self.show_about)
         m.add_separator()
@@ -845,10 +887,15 @@ class App:
             self.game_button.configure(text=f"⌂  {shorten_middle(m.game_dir.name, 28)}")
         else:
             self.game_button.configure(text="⌂  게임 폴더 지정")
+        status = self._refw_status
         if not m.game_dir:
             self.refw_badge.configure(text="● REFramework", style="BadgeNeutral.TLabel")
+        elif m.refw_installed() and status is not None and status.installed and not status.up_to_date:
+            self.refw_badge.configure(text="● REFramework 업데이트", style="BadgeWarn.TLabel")
         elif m.refw_installed():
-            self.refw_badge.configure(text="● REFramework 설치됨", style="BadgeOk.TLabel")
+            latest = status is not None and status.up_to_date
+            self.refw_badge.configure(text="● REFramework 최신" if latest else "● REFramework 설치됨",
+                                      style="BadgeOk.TLabel")
         else:
             needed = m.needs_refw()
             self.refw_badge.configure(text="● REFramework 없음",
@@ -930,16 +977,95 @@ class App:
         m = self.manager
         if not m.game_dir:
             return "게임 폴더를 지정하면 REFramework 설치 여부를 확인합니다"
-        if m.refw_installed():
-            return "dinput8.dll이 게임 폴더에 있습니다"
-        text = "REFramework(dinput8.dll)가 없습니다. 클릭하면 다운로드 페이지를 엽니다."
-        if m.needs_refw():
+        status = self._refw_status
+        if status is not None:
+            text = f"설치된 버전: {refw.describe_installed(status)}\n최신 버전: {status.latest.label}"
+        elif m.refw_installed():
+            text = "dinput8.dll이 게임 폴더에 있습니다"
+        else:
+            text = "REFramework(dinput8.dll)가 없습니다."
+        if not m.refw_installed() and m.needs_refw():
             text += "\n활성화된 루스 파일/스크립트 모드가 동작하려면 필요합니다."
-        return text
+        return text + "\n클릭하면 설치·업데이트 창을 엽니다."
 
     def _on_refw_click(self):
-        if self.manager.game_dir and not self.manager.refw_installed():
-            webbrowser.open(REFRAMEWORK_URL)
+        if not self.manager.game_dir:
+            return
+        if self._refw_status is None:
+            self.check_refw(manual=True)
+        else:
+            self.show_refw()
+
+    # ------------------------------------------------------------------ REFramework updates
+    def check_refw(self, manual: bool, builds: list | None = None):
+        """Find the installed and the latest REFramework build in the background."""
+        game = self.manager.game_dir
+        if not game:
+            if manual:
+                messagebox.showwarning("REFramework", "먼저 게임 폴더를 지정하세요.", parent=self.root)
+            return
+
+        def worker():
+            try:
+                status = refw.check(game, builds)
+            except UpdateError as exc:
+                self.events.put(("call", self._on_refw_checked, None, exc, manual))
+            else:
+                self.events.put(("call", self._on_refw_checked, status, None, manual))
+
+        if manual:
+            self.status_var.set("REFramework 확인 중...")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_refw_checked(self, status: refw.Status | None, error: Exception | None, manual: bool):
+        if manual:
+            self.status_var.set("준비")
+        if error is not None:
+            log.info("REFramework 확인 실패: %s", error)
+            if manual:
+                messagebox.showwarning("REFramework", str(error), parent=self.root)
+            return
+        was_outdated = self._refw_status is not None and self._refw_status.needs_action
+        self._refw_status = status
+        self._update_header()
+        if status.installed and not status.up_to_date and not was_outdated:
+            log.info("REFramework 새 빌드(%s)가 있습니다. 위쪽 REFramework 배지를 누르면 업데이트할 수 있습니다.",
+                     status.latest.label)
+        if manual:
+            self.show_refw()
+
+    def show_refw(self):
+        status = self._refw_status
+        if status is None:
+            return
+        managed = self.manager.refw_mod() is not None
+        choice = RefwDialog(self.root, self.theme, status, managed).show()
+        if choice == "page":
+            webbrowser.open(status.latest.page_url)
+        elif choice == "install":
+            self.install_refw(status.latest)
+
+    def install_refw(self, build: refw.Build):
+        if not self.manager.game_dir or not self._idle():
+            return
+        m = self.manager
+
+        def work(progress):
+            m.temp_root.mkdir(parents=True, exist_ok=True)
+            archive = m.temp_root / f"REFramework-{build.number}.zip"
+            try:
+                refw.download(build, archive, progress)
+                return m.install_refw(archive, build.label, f"{refw.ASSET_NAME} ({build.tag})")
+            finally:
+                fsutil.remove_file(archive)
+
+        def done(mod):
+            log.info("REFramework %s를 설치했습니다.", build.label)
+            self.refresh(select=mod.id)
+            self.apply()  # put the new dinput8.dll into the game folder right away
+
+        self.run_task("refw", f"REFramework {build.label} 내려받는 중...", work, on_done=done,
+                      on_error=lambda exc: self.show_error("REFramework", str(exc)))
 
     def _fill_game_menu(self):
         menu = self.game_menu
@@ -1019,7 +1145,7 @@ class App:
                         "게임에 아무 파일도 적용되지 않습니다.\n", "warn")]
         if kinds & {"loose", "script"} and not m.refw_installed():
             chunks += [("\n", None), ("REFramework가 필요합니다\n", ("warn", "warn_title")),
-                       ("REFramework를 설치하고, 게임 안 REFramework 메뉴의 LooseFileLoader에서 "
+                       ("위쪽 REFramework 배지를 눌러 설치하고, 게임 안 REFramework 메뉴의 LooseFileLoader에서 "
                         "'Enable Loose File Loader'를 켜세요.\n", "warn")]
         if mod.description:
             chunks.append(("\n" + mod.description.replace("\\n", "\n") + "\n", "desc"))
@@ -1588,6 +1714,8 @@ class App:
             elif self._launch_after_apply and not self._apply_pending and not m.dirty:
                 self._launch_after_apply = False
                 self._start_game()
+            if self._refw_status is not None:
+                self.check_refw(manual=False, builds=self._refw_status.builds)
 
         def failed(exc):
             self._launch_after_apply = False

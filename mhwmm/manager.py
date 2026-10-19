@@ -18,7 +18,7 @@ from pathlib import Path
 from . import fsutil, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
-from .constants import DEFAULT_PAK_CHAIN, GAME_EXE, PAK_CHAIN_RE, REFRAMEWORK_DLL
+from .constants import DEFAULT_PAK_CHAIN, GAME_EXE, PAK_CHAIN_RE, REFRAMEWORK_DLL, REFW_ORIGIN
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
 
 log = logging.getLogger(__name__)
@@ -237,6 +237,7 @@ class Settings:
     enable_on_install: bool = True
     check_game_running: bool = True
     check_updates: bool = True
+    check_refw_updates: bool = True
     confirm_remove: bool = True
     apply_before_launch: bool = True
     minimize_on_launch: bool = False
@@ -264,6 +265,7 @@ class Mod:
     # Only the options listed in ``selected`` are deployed (none right after install).
     options: list = field(default_factory=list)
     selected: list = field(default_factory=list)
+    origin: str = ""  # "reframework" for the REFramework installed by the REFramework updater
 
     def __post_init__(self):
         self.options = [o for o in self.options
@@ -861,6 +863,41 @@ class ModManager:
             log.info("설치 완료: %s (옵션 %d개, 사용할 옵션을 골라 주세요)", mod.name, len(mod.options))
         else:
             log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
+        return mod
+
+    def refw_mod(self) -> Mod | None:
+        """The mod that provides REFramework's dinput8.dll, if one is installed here."""
+        for m in self.mods:
+            if m.origin == REFW_ORIGIN:
+                return m
+        for m in self.mods:
+            if any(path_key(f) == REFRAMEWORK_DLL for f in self.mod_files(m.id)):
+                return m
+        return None
+
+    def install_refw(self, archive: Path, version: str, source: str) -> Mod:
+        """Install or update REFramework from REFramework.zip and switch it on.
+
+        Only dinput8.dll is used, as REFramework advises for players without VR."""
+        with self.prepare_install(archive) as session:
+            variant = next((v for v in session.variants
+                            if any(dst.lower() == REFRAMEWORK_DLL for _, dst in v.files)), None)
+            if variant is None:
+                raise InstallError(f"{Path(archive).name}에 {REFRAMEWORK_DLL}이(가) 없습니다.")
+            variant.files = [(src, dst) for src, dst in variant.files if dst.lower() == REFRAMEWORK_DLL]
+            variant.name = variant.package = variant.option = "REFramework"
+            variant.version = version
+            existing = self.refw_mod()
+            mod = self.install_package(session, [variant], existing.id if existing else None)
+        mod.origin = REFW_ORIGIN
+        mod.version = version
+        mod.source = source
+        mod.enabled = True
+        if existing is None:  # keep REFramework at the top of the load order
+            self.mods.remove(mod)
+            self.mods.insert(0, mod)
+        self._write_mod_meta(mod)
+        self._changed()
         return mod
 
     def _unique_name(self, name: str) -> str:

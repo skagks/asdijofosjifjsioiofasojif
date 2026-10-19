@@ -7,7 +7,7 @@ import logging
 import sys
 from pathlib import Path
 
-from . import __version__, steam
+from . import __version__, fsutil, steam
 from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
 from .manager import InstallError, ModManager, acquire_instance_lock, prepare_data_dir, setup_logging
@@ -127,6 +127,40 @@ def cmd_profile(manager: ModManager, args) -> int:
     return _maybe_deploy(manager, args)
 
 
+def cmd_refw(manager: ModManager, args) -> int:
+    from . import refw
+    from .updater import UpdateError
+
+    if not manager.game_dir:
+        print("게임 폴더를 먼저 설정하세요: game <경로>", file=sys.stderr)
+        return 1
+    try:
+        status = refw.check(manager.game_dir)
+    except UpdateError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    latest = status.latest
+    print(f"설치된 버전: {refw.describe_installed(status)}")
+    print(f"최신 버전: {latest.label}" + (f" ({latest.published})" if latest.published else ""))
+    if not args.install:
+        return 0
+    if status.up_to_date and not args.force:
+        print("이미 최신 버전입니다. 다시 설치하려면 --force를 붙이세요.")
+        return 0
+    manager.temp_root.mkdir(parents=True, exist_ok=True)
+    archive = manager.temp_root / f"REFramework-{latest.number}.zip"
+    try:
+        refw.download(latest, archive)
+        mod = manager.install_refw(archive, latest.label, f"{refw.ASSET_NAME} ({latest.tag})")
+    except UpdateError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        fsutil.remove_file(archive)
+    print(f"설치: {mod.name} {mod.version}")
+    return _maybe_deploy(manager, args)
+
+
 def cmd_options(manager: ModManager, args) -> int:
     (mod,) = _resolve(manager, [args.mod])
     if not mod.options:
@@ -240,6 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", type=int, nargs="*", metavar="번호", help="켤 옵션 번호들 (나머지는 꺼짐, 비우면 모두 끔)")
     p.add_argument("--no-deploy", action="store_true")
 
+    p = sub.add_parser("refw", help="REFramework 버전 확인/설치/업데이트")
+    p.add_argument("--install", action="store_true", help="최신 빌드 설치 또는 업데이트")
+    p.add_argument("--force", action="store_true", help="최신이어도 다시 설치")
+    p.add_argument("--no-deploy", action="store_true")
+
     p = sub.add_parser("profile", help="프로필 목록/전환/만들기/삭제")
     p.add_argument("name", nargs="?", help="프로필 이름 (생략하면 목록)")
     p.add_argument("--create", action="store_true", help="현재 상태를 복사해 새 프로필 만들기")
@@ -260,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 READ_ONLY_COMMANDS = ("list", "verify")
 COMMANDS = {
-    "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "enable": cmd_toggle, "disable": cmd_toggle,
+    "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game,
 }

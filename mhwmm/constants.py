@@ -22,6 +22,7 @@ MAX_PAK_PATCH = 999
 
 # REFramework is installed as dinput8.dll next to the game executable.
 REFRAMEWORK_DLL = "dinput8.dll"
+REFW_ORIGIN = "reframework"  # Mod.origin of the REFramework installed through the updater
 
 REFRAMEWORK_URL = "https://github.com/praydog/REFramework-nightly/releases"
 NEXUS_URL = "https://www.nexusmods.com/games/monsterhunterwilds/mods"

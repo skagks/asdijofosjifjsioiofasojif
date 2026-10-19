@@ -21,6 +21,17 @@ def root():
         pass
 
 
+@pytest.fixture(autouse=True)
+def answer_dialogs(monkeypatch):
+    """A message box left open would block the test, so answer them all."""
+    from mhwmm import gui
+
+    for name in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(gui.messagebox, name, lambda *a, **k: None)
+    for name in ("askyesno", "askyesnocancel"):
+        monkeypatch.setattr(gui.messagebox, name, lambda *a, **k: True)
+
+
 def pump(root, until, timeout=10.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -174,3 +185,35 @@ def test_gui_profiles_filter_settings_and_launch(root, manager, tmp_path, game_d
     app.toggle_log()
     app._save_window_state()
     assert manager.settings.window_geometry and not manager.settings.log_visible
+
+
+def test_gui_refw_badge_and_install(root, manager, game_dir, monkeypatch):
+    import zipfile
+
+    from mhwmm import gui, refw
+
+    from conftest import write
+
+    for name in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(gui.messagebox, name, lambda *a, **k: None)
+    old = refw.Build("nightly-01420-a", 1420, "a" * 40, refw.DOWNLOAD_PREFIX + "o/REFramework.zip", 0, None, "p")
+    new = refw.Build("nightly-01432-b", 1432, "b" * 40, refw.DOWNLOAD_PREFIX + "n/REFramework.zip", 0, None, "p",
+                     "2026-10-11")
+    write(game_dir / "dinput8.dll", b"MZ" + old.commit.encode())
+    app = gui.App(root, manager, queue.Queue())
+    status = refw.check(game_dir, [new, old])
+    app._on_refw_checked(status, None, False)
+    assert "업데이트" in app.refw_badge.cget("text")
+    dialog = gui.RefwDialog(root, app.theme, status, managed=False)
+    dialog.destroy()
+
+    def fake_download(build, dest, progress=None):
+        with zipfile.ZipFile(dest, "w") as zf:
+            zf.writestr("dinput8.dll", b"MZ" + build.commit.encode())
+        return dest
+
+    monkeypatch.setattr(refw, "download", fake_download)
+    app.install_refw(new)
+    pump(root, lambda: app.busy is None and not manager.dirty and "최신" in app.refw_badge.cget("text"))
+    assert manager.refw_mod().version == "nightly 01432"
+    assert (game_dir / "dinput8.dll").read_bytes() == b"MZ" + new.commit.encode()

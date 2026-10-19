@@ -175,10 +175,9 @@ def _expected_sha256(url: str) -> str | None:
     return None
 
 
-def download(release: Release, dest: Path, progress=None) -> Path:
-    """Download and verify the release exe to ``dest``."""
-    url = _check_url(release.exe_url)
-    expected = _expected_sha256(release.sums_url) if release.sums_url else None
+def download_file(url: str, dest: Path, size: int = 0, sha256: str | None = None, progress=None,
+                  label: str = "다운로드 중...") -> Path:
+    """Download ``url`` to ``dest`` through a .part file, checking size and SHA-256 when known."""
     progress = progress or (lambda done, total, msg: None)
     dest = Path(dest)
     part = dest.with_name(dest.name + ".part")
@@ -186,7 +185,7 @@ def download(release: Release, dest: Path, progress=None) -> Path:
     done = 0
     try:
         with _open(url, timeout=60) as resp, open(part, "wb") as out:
-            total = int(resp.headers.get("Content-Length") or release.exe_size or 0)
+            total = int(resp.headers.get("Content-Length") or size or 0)
             while True:
                 chunk = resp.read(256 * 1024)
                 if not chunk:
@@ -195,23 +194,34 @@ def download(release: Release, dest: Path, progress=None) -> Path:
                 digest.update(chunk)
                 done += len(chunk)
                 percent = f" {done * 100 // total}%" if total else ""
-                progress(done, total or done, f"업데이트 다운로드 중...{percent}")
-    except PermissionError as exc:
+                progress(done, total or done, f"{label}{percent}")
+    except PermissionError:
         fsutil.remove_file(part)
-        raise UpdateError(f"프로그램 폴더({dest.parent})에 쓸 수 없습니다. "
-                          "MHWildsModManager.exe를 바탕 화면 같은 사용자 폴더로 옮긴 뒤 다시 시도하세요.") from exc
+        raise
     except (urllib.error.URLError, OSError) as exc:
         fsutil.remove_file(part)
-        raise UpdateError(f"업데이트를 내려받지 못했습니다: {getattr(exc, 'reason', exc)}") from exc
-    if release.exe_size and done != release.exe_size:
+        raise UpdateError(f"내려받지 못했습니다: {getattr(exc, 'reason', exc)}") from exc
+    if size and done != size:
         fsutil.remove_file(part)
         raise UpdateError("내려받은 파일 크기가 맞지 않습니다. 다시 시도하세요.")
-    if expected and digest.hexdigest() != expected:
+    if sha256 and digest.hexdigest() != sha256.lower():
         fsutil.remove_file(part)
-        raise UpdateError("내려받은 파일의 SHA-256 값이 릴리즈와 다릅니다. 다시 시도하세요.")
+        raise UpdateError("내려받은 파일의 SHA-256 값이 맞지 않습니다. 다시 시도하세요.")
     fsutil.replace_file(part, dest)
-    log.info("업데이트 v%s를 내려받았습니다.", release.version)
     return dest
+
+
+def download(release: Release, dest: Path, progress=None) -> Path:
+    """Download and verify the release exe to ``dest``."""
+    url = _check_url(release.exe_url)
+    expected = _expected_sha256(release.sums_url) if release.sums_url else None
+    try:
+        download_file(url, dest, release.exe_size, expected, progress, "업데이트 다운로드 중...")
+    except PermissionError as exc:
+        raise UpdateError(f"프로그램 폴더({Path(dest).parent})에 쓸 수 없습니다. "
+                          "MHWildsModManager.exe를 바탕 화면 같은 사용자 폴더로 옮긴 뒤 다시 시도하세요.") from exc
+    log.info("업데이트 v%s를 내려받았습니다.", release.version)
+    return Path(dest)
 
 
 def _detached_flags() -> int:

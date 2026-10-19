@@ -82,7 +82,15 @@ v1.2.0부터는 프로그램이 켜질 때 새 버전을 확인합니다. 새 �
 ### REFramework
 
 루스 파일(`natives`) 모드와 Lua 스크립트는 [REFramework](https://github.com/praydog/REFramework-nightly/releases)가
-필요합니다. 받은 `MHWILDS.zip`을 다른 모드처럼 이 프로그램으로 설치해도 됩니다.
+필요합니다. **이 프로그램에서 바로 설치·업데이트할 수 있습니다.**
+
+- 오른쪽 위 **REFramework 배지**를 누르면 설치된 빌드와 최신 nightly 빌드를 비교해 보여 주고, **설치/업데이트**를 누르면
+  `REFramework.zip`을 내려받아(GitHub가 제공하는 SHA-256으로 확인) 게임 폴더에 바로 적용합니다.
+- 프로그램을 켤 때 새 빌드가 있는지 확인하고, 있으면 배지가 **REFramework 업데이트**로 바뀝니다 (설정에서 끌 수 있음).
+- 직접 넣어 둔 `dinput8.dll`도 몇 번째 빌드인지 알아냅니다. 이 프로그램으로 설치하면 기존 파일은 백업했다가
+  REFramework 모드를 끄거나 지우면 되돌립니다.
+- REFramework 안내에 따라(VR을 쓰지 않는 경우) `dinput8.dll`만 설치합니다.
+
 루스 파일 모드는 게임 안 REFramework 메뉴의 **LooseFileLoader → Enable Loose File Loader**가 켜져 있어야 합니다.
 
 ### PAK 모드 번호는 어떻게 매기나요?
@@ -138,6 +146,7 @@ python -m mhwmm enable 1 "모드 이름"          # 번호, 이름, id로 지정
 python -m mhwmm disable 3
 python -m mhwmm move "모드 이름" 5            # 로드 순서 변경 (아래일수록 우선)
 python -m mhwmm remove 2
+python -m mhwmm refw [--install]             # REFramework 버전 확인 / 설치·업데이트
 python -m mhwmm profile                      # 프로필 목록
 python -m mhwmm profile "사진 촬영용" --create [--empty]   # 새 프로필 (--empty: 모두 꺼진 상태)
 python -m mhwmm profile "기본"                # 프로필 전환
