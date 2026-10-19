@@ -267,3 +267,23 @@ def test_gui_nexus_updates(root, manager, tmp_path, monkeypatch):
     monkeypatch.setattr(gui.TextDialog, "show", lambda self: "")
     app.link_nexus()
     assert other.nexus_id == 0 and other.nexus_unlinked
+
+
+def test_gui_help_window(root, manager):
+    from mhwmm import gui, helptext
+    from mhwmm.theme import Theme
+
+    theme = Theme(root, "dark")
+    theme.use("dark")
+    dialog = gui.HelpDialog(root, theme, "nexus")
+    pump(root, lambda: dialog._active is not None)
+    shown = dialog.text.get("1.0", "end")
+    for section in helptext.SECTIONS:
+        assert section.title in shown
+    assert "**" not in shown and "[[" not in shown  # markup is rendered, not shown
+    assert dialog._active == [s.key for s in helptext.SECTIONS].index("nexus")
+    assert dialog.text.window_names()  # step numbers and keys are drawn as chips
+    dialog.go(0)
+    assert str(dialog.nav_buttons[0].cget("style")) == "NavActive.TButton"
+    assert str(dialog.nav_buttons[1].cget("style")) == "Nav.TButton"
+    dialog.destroy()

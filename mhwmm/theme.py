@@ -249,6 +249,13 @@ class Theme:
                font=f["small"], width=-2)
         button("Update.TButton", p["accent"], p["on_accent"], p["accent_hover"], p["accent_press"],
                padding=(12, 5), font=f["small_bold"], width=-2)
+        # table of contents in the usage guide
+        button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 8), width=-2)
+        s.configure("Nav.TButton", anchor="w")
+        s.map("Nav.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])
+        button("NavActive.TButton", p["select"], p["select_text"], p["select"], p["select"], padding=(14, 8),
+               font=f["bold"], width=-2)
+        s.configure("NavActive.TButton", anchor="w")
 
         for style, bg, border in (("Chip.TMenubutton", p["raised"], p["border"]),
                                   ("Ghost.TMenubutton", p["surface"], p["surface"])):

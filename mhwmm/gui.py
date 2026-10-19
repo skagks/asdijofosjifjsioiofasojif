@@ -21,6 +21,7 @@ from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_CHAINS,
                         REFRAMEWORK_URL, STEAM_APP_ID)
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
+from .helptext import SECTIONS as HELP_SECTIONS
 from .manager import (InstallError, InstallSession, Mod, ModManager, acquire_instance_lock,
                       prepare_data_dir, resolve_data_dir, setup_logging)
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
@@ -312,6 +313,145 @@ class RefwDialog(Dialog):
         self.destroy()
 
 
+class HelpDialog(Dialog):
+    """Usage guide: topics on the left, the whole guide as one scrolling page on the right."""
+
+    INLINE = re.compile(r"\*\*(.+?)\*\*|\[\[(.+?)\]\]")
+
+    def __init__(self, parent, theme: Theme, topic: str | None = None):
+        super().__init__(parent, theme, "사용법")
+        px, f = theme.px, theme.fonts
+        self.minsize(px(760), px(480))
+        self.body.configure(padding=0)
+        nav = ttk.Frame(self.body, padding=(px(16), px(20), px(8), px(18)))
+        nav.pack(side="left", fill="y")
+        ttk.Label(nav, text="사용법", style="DialogTitle.TLabel").pack(anchor="w", padx=px(6))
+        ttk.Label(nav, text=f"버전 {__version__}", style="Muted.TLabel", font=f["small"]).pack(
+            anchor="w", padx=px(6), pady=(px(2), px(14)))
+        self.nav_buttons = [ttk.Button(nav, text=s.title, style="Nav.TButton", command=lambda i=i: self.go(i))
+                            for i, s in enumerate(HELP_SECTIONS)]
+        for button in self.nav_buttons:
+            button.pack(fill="x", pady=(0, px(2)))
+        ttk.Button(nav, text="닫기", command=self.cancel).pack(side="bottom", fill="x")
+
+        card = theme.mark(tk.Frame(self.body), "card")
+        card.pack(side="left", fill="both", expand=True, padx=(px(8), px(18)), pady=px(18))
+        self.text = theme.mark(tk.Text(card, wrap="word", width=70, height=30, font=f["base"], padx=px(30),
+                                       pady=px(24), cursor="arrow", spacing2=px(3)), "text")
+        scrollbar = ttk.Scrollbar(card, orient="vertical", command=self.text.yview)
+        show_scrollbar = autohide(scrollbar, side="right", fill="y")
+        self.text.configure(yscrollcommand=lambda first, last: (show_scrollbar(first, last), self._follow_scroll()))
+        self.text.pack(side="left", fill="both", expand=True)
+        self._active: int | None = None
+        self._jumped = 0.0
+        self._configure_tags()
+        self._render()
+        self.text.configure(state="disabled")
+        keys = [s.key for s in HELP_SECTIONS]
+        self.after_idle(lambda: self.go(keys.index(topic) if topic in keys else 0))
+
+    def _configure_tags(self):
+        p, f, px = self.theme.p, self.theme.fonts, self.theme.px
+        t = self.text
+        t.tag_configure("h1", font=f["title"], spacing1=px(30), spacing3=px(12))
+        t.tag_configure("first", spacing1=0)
+        t.tag_configure("lead", foreground=p["muted"], spacing3=px(10))
+        t.tag_configure("p", spacing1=px(10), spacing3=px(8))
+        t.tag_configure("step", lmargin1=0, lmargin2=px(34), tabs=(px(34),), spacing1=px(6), spacing3=px(6))
+        t.tag_configure("bullet", lmargin1=px(8), lmargin2=px(26), tabs=(px(26),), spacing1=px(4), spacing3=px(4))
+        t.tag_configure("dot", foreground=p["accent"], font=f["bold"])
+        t.tag_configure("keyrow", tabs=(px(160),), spacing1=px(4), spacing3=px(4))
+        t.tag_configure("strong", font=f["bold"])
+        for tag, fg, bg in (("tip", "info", "info_bg"), ("warn", "warn", "warn_bg")):
+            t.tag_configure(tag, background=p[bg], lmargin1=px(14), lmargin2=px(14), rmargin=px(14),
+                            spacing1=px(10), spacing3=px(10))
+            try:
+                t.tag_configure(tag, lmargincolor=p[bg], rmargincolor=p[bg])
+            except tk.TclError:  # Tk < 8.6.6
+                pass
+            t.tag_configure(f"{tag}_label", foreground=p[fg], font=f["bold"])
+        t.tag_configure("gap", font=f["small"], spacing1=0, spacing3=0)
+
+    def _chip(self, text: str, tags: tuple, accent: bool = False):
+        """A key cap or step number (a label: tag backgrounds would also fill the line spacing)."""
+        p, px = self.theme.p, self.theme.px
+        label = tk.Label(self.text, text=text, font=self.theme.fonts["small_bold"], padx=px(6), pady=0, bd=0,
+                         bg=p["accent"] if accent else p["pressed"], fg=p["on_accent"] if accent else p["text"])
+        index = self.text.index("end-1c")
+        self.text.window_create(index, window=label, align="center", padx=px(2))
+        for tag in tags:
+            self.text.tag_add(tag, index)
+
+    def _inline(self, text: str, tags: tuple):
+        pos = 0
+        for m in self.INLINE.finditer(text):
+            self.text.insert("end", text[pos:m.start()], tags)
+            if m.group(1):
+                self.text.insert("end", m.group(1), tags + ("strong",))
+            else:
+                self._chip(m.group(2), tags)
+            pos = m.end()
+        self.text.insert("end", text[pos:] + "\n", tags)
+
+    def _render(self):
+        t = self.text
+        for i, section in enumerate(HELP_SECTIONS):
+            t.mark_set(f"section{i}", "end-1c")
+            t.mark_gravity(f"section{i}", "left")
+            t.insert("end", section.title + "\n", ("h1", "first") if i == 0 else ("h1",))
+            for kind, content in section.blocks:
+                if kind in ("lead", "p"):
+                    self._inline(content, (kind,))
+                elif kind == "steps":
+                    for n, line in enumerate(content, 1):
+                        self._chip(str(n), ("step",), accent=True)
+                        t.insert("end", "\t", ("step",))
+                        self._inline(line, ("step",))
+                elif kind == "bullets":
+                    for line in content:
+                        t.insert("end", "•", ("bullet", "dot"))
+                        t.insert("end", "\t", ("bullet",))
+                        self._inline(line, ("bullet",))
+                elif kind == "keys":
+                    for keys, what in content:
+                        for n, key in enumerate(keys):
+                            if n:
+                                t.insert("end", " ", ("keyrow",))
+                            self._chip(key, ("keyrow",))
+                        t.insert("end", f"\t{what}\n", ("keyrow",))
+                elif kind in ("tip", "warn"):
+                    t.insert("end", "\n", ("gap",))
+                    t.insert("end", ("팁" if kind == "tip" else "주의") + "   ", (kind, f"{kind}_label"))
+                    self._inline(content, (kind,))
+                    t.insert("end", "\n", ("gap",))
+        t.delete("end-2c", "end-1c")  # no empty line at the very end
+
+    def go(self, index: int):
+        """Scroll the page to a topic."""
+        self.text.yview(f"section{index}")
+        self._jumped = time.monotonic()
+        self._set_active(index)
+
+    def _follow_scroll(self):
+        """Highlight the topic being read while scrolling."""
+        if time.monotonic() - self._jumped < 0.3:  # the scroll from clicking a topic
+            return
+        first, last = self.text.yview()
+        if last >= 1.0 and first > 0.0:
+            self._set_active(len(HELP_SECTIONS) - 1)
+            return
+        line = self.text.index(f"@0,{self.text.winfo_height() // 4}")
+        self._set_active(max((i for i in range(len(HELP_SECTIONS))
+                              if self.text.compare(f"section{i}", "<=", line)), default=0))
+
+    def _set_active(self, index: int):
+        if index == self._active:
+            return
+        self._active = index
+        for i, button in enumerate(self.nav_buttons):
+            button.configure(style="NavActive.TButton" if i == index else "Nav.TButton")
+
+
 class SettingsDialog(Dialog):
     def __init__(self, parent, theme: Theme, manager: ModManager):
         super().__init__(parent, theme, "설정")
@@ -601,7 +741,7 @@ class App:
         m.add_command(label="업데이트 확인", command=lambda: self.check_updates(manual=True))
         m.add_command(label="REFramework 업데이트 확인", command=lambda: self.check_refw(manual=True))
         m.add_command(label="모드 업데이트 확인 (Nexus)", command=lambda: self.check_mod_updates(manual=True))
-        m.add_command(label="사용법", command=self.show_help)
+        m.add_command(label="사용법", accelerator="F1", command=self.show_help)
         m.add_command(label="정보", command=self.show_about)
         m.add_separator()
         m.add_command(label="종료", command=self.on_close)
@@ -843,6 +983,7 @@ class App:
         self.root.bind("<Control-s>", lambda e: self.apply())
         self.root.bind("<Control-f>", lambda e: (self.search_entry.focus_set(), "break")[1])
         self.root.bind("<F5>", lambda e: self.refresh())
+        self.root.bind("<F1>", lambda e: self.show_help())
         self.tree.bind("<space>", lambda e: (self.toggle(self._selected_ids()), "break")[1])
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<F2>", lambda e: self.rename_selected())
@@ -2010,17 +2151,8 @@ class App:
             if self.manager.settings.nexus_api_key and self.manager.settings.nexus_api_key != old_key:
                 self.check_mod_updates(manual=False)  # a new key: look for updates right away
 
-    def show_help(self):
-        messagebox.showinfo("사용법", (
-            "1. 게임 폴더를 지정합니다 (보통 자동으로 찾습니다).\n"
-            "2. '＋ 모드 추가'로 Nexus 등에서 받은 zip/7z/rar 파일을 추가하거나 창에 끌어 놓습니다.\n"
-            "3. 체크박스로 모드를 켜고 끕니다. '즉시 적용'이 켜져 있으면 바로 게임 폴더에 반영됩니다.\n"
-            "4. 같은 파일을 바꾸는 모드가 여러 개면 목록 아래쪽 모드가 이깁니다. 드래그나 ▲▼로 순서를 바꾸세요.\n\n"
-            "• PAK 모드는 re_chunk_000.pak.sub_000.pak.patch_XXX.pak 번호를 자동으로 매깁니다.\n"
-            "• 게임 업데이트 후에는 '☰ > 적용 상태 점검'을 실행하세요. 업데이트가 덮어쓴 번호를 피해서 다시 배치합니다.\n"
-            "• natives 폴더(루스 파일) 모드와 Lua 스크립트는 REFramework가 필요합니다. REFramework도 이 프로그램으로 설치할 수 있습니다.\n"
-            "• 설정에서 Nexus API 키를 넣으면 '☰ > 모드 업데이트 확인'으로 새 버전이 나온 모드를 찾습니다.\n"
-            "• 7z/rar 파일은 PC에 설치된 반디집이나 7-Zip으로 풉니다."), parent=self.root)
+    def show_help(self, topic: str | None = None):
+        HelpDialog(self.root, self.theme, topic).show()
 
     # ------------------------------------------------------------------ updates
     def check_updates(self, manual: bool):
