@@ -8,17 +8,15 @@ GAME_EXE = "MonsterHunterWilds.exe"
 STEAM_APP_ID = "2246340"
 STEAM_INSTALL_DIR = "MonsterHunterWilds"
 
-# PAK mods are loaded as numbered patches of this archive chain.  The game
-# reads re_chunk_000.pak.sub_000.pak.patch_001.pak, _002, ... and stops at the
-# first missing number, so mod patches have to stay contiguous.
-DEFAULT_PAK_CHAIN = "re_chunk_000.pak.sub_000.pak"
-PAK_CHAINS = ("re_chunk_000.pak.sub_000.pak", "re_chunk_000.pak")
+# The game only reads its own numbered patches (re_chunk_000.pak.sub_000.pak.patch_NNN.pak),
+# so mod PAKs go to this folder instead: REFramework mounts every .pak in it (lower-case
+# extension, any name) into a free patch slot, in name order.
+PAK_MODS_DIR = "pak_mods"
+# Names of patch files, used to recognise PAKs older versions put into the patch chain.
 PAK_PATCH_RE = re.compile(
     r"^(?P<chain>re_chunk_\d{3}\.pak(?:\.sub_\d{3}\.pak)?)\.patch_(?P<num>\d{3})\.pak$",
     re.IGNORECASE,
 )
-PAK_CHAIN_RE = re.compile(r"^re_chunk_\d{3}\.pak(?:\.sub_\d{3}\.pak)?$", re.IGNORECASE)
-MAX_PAK_PATCH = 999
 
 # REFramework is installed as dinput8.dll next to the game executable.
 REFRAMEWORK_DLL = "dinput8.dll"

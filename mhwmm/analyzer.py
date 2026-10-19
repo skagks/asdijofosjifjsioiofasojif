@@ -3,7 +3,8 @@
 Mods for Monster Hunter Wilds come in a handful of layouts:
 
 * loose files: ``natives/STM/...`` (needs REFramework's loose file loader)
-* PAK patches: ``*.pak`` files that get numbered into the patch chain
+* PAK mods: ``*.pak`` files (in the archive root or a ``pak_mods`` folder), deployed to
+  ``pak_mods`` where REFramework loads them
 * REFramework scripts/plugins: ``reframework/autorun/*.lua``, ``reframework/plugins/*.dll``
   (often shipped without the leading ``reframework/`` folder)
 * DLL mods such as REFramework itself (``dinput8.dll``) in the game root
@@ -31,7 +32,7 @@ JUNK_DIRS = {"__macosx", ".git", ".svn", "fomod"}
 JUNK_FILES = {".ds_store", "thumbs.db", "desktop.ini"}
 MODINFO = "modinfo.ini"
 
-GAME_DIRS = {"natives", "reframework"}
+GAME_DIRS = {"natives", "reframework", "pak_mods"}
 REFW_DIRS = {"autorun", "plugins"}
 REFW_EXTRA_DIRS = {"data", "fonts", "images"}
 EXTRA_GAME_DIRS = {"reshade-shaders"}
@@ -197,6 +198,9 @@ def _map_root(rels: list[str], mode: str) -> tuple[list[tuple[str, str]], list[s
             dst = "natives/" + rest
         elif top == "reframework":
             dst = "reframework/" + rest
+        elif top == "pak_mods":
+            if _ext(name) == ".pak":
+                dst = rest.replace("/", "_")  # a PAK like any other: numbered into pak_mods on deploy
         elif top in REFW_DIRS or (mode == "refw" and top in REFW_EXTRA_DIRS):
             dst = f"reframework/{top}/{rest}"
         elif top in EXTRA_GAME_DIRS:

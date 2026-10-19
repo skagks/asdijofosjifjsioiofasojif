@@ -4,28 +4,28 @@ Each run computes the files the game folder should contain, compares that with t
 manifest of the previous run and only performs the difference:
 
 * Loose files: later mods in the load order override earlier ones.
-* PAK files are renamed into the patch chain (``<chain>.patch_NNN.pak``).  Numbers
-  are assigned from the first free slot so the chain stays contiguous, skipping
-  numbers used by official patches or files from other tools.
+* PAK files go to ``pak_mods/`` as ``NNN_<mod>.pak``, numbered in load order.  The game
+  only reads its own patch numbers, so a PAK renamed into the patch chain past them is
+  ignored; REFramework mounts every ``.pak`` in ``pak_mods`` into a free patch slot in
+  name order, so later files take priority.
 * Game files that a mod overwrites are backed up and restored when no longer needed.
-* A manifest entry whose file changed on disk is re-checked before touching it.  A
-  changed PAK means a game update reused that patch number, so the file now belongs
-  to the game: it is never deleted and the mod gets a new number.
-* The game stops reading a chain at the first missing number.  When another tool
-  removes its PAKs from below ours, the gap is reported and the next run moves our
-  PAKs down into it.
+* A manifest entry whose file changed on disk is re-checked before touching it.
+* Older versions renamed PAKs into the patch chain in the game folder.  The next run
+  moves those to ``pak_mods``; one that a game update overwrote with its own patch is
+  left alone as a game file.
 """
 
 from __future__ import annotations
 
 import logging
-import os
+import posixpath
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from . import fsutil
-from .constants import DEFAULT_PAK_CHAIN, MAX_PAK_PATCH, PAK_PATCH_RE
+from .constants import PAK_MODS_DIR, PAK_PATCH_RE
 
 log = logging.getLogger(__name__)
 
@@ -42,28 +42,23 @@ def is_root_pak(rel: str) -> bool:
     return "/" not in rel and rel.lower().endswith(".pak")
 
 
-def pak_chain_of(name: str, default_chain: str) -> str:
-    m = PAK_PATCH_RE.match(name)
-    return (m.group("chain") if m else default_chain).lower()
-
-
 def _pak_sort_key(name: str):
     m = PAK_PATCH_RE.match(name)
     return (0, int(m.group("num")), name.lower()) if m else (1, 0, name.lower())
 
 
-@dataclass
-class PakGap:
-    chain: str
-    missing: list[int]  # numbers below our PAKs that no file uses
-    unread: list[str]  # our PAKs the game cannot reach because of the gap
+_UNSAFE_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f.]+')
 
-    def describe(self) -> str:
-        first = f"{self.chain}.patch_{self.missing[0]:03d}.pak"
-        more = f" 외 {len(self.missing) - 1}개" if len(self.missing) > 1 else ""
-        return (f"PAK 번호가 비어 있습니다: {first}{more}. 게임은 빈 번호에서 읽기를 멈추므로 그 뒤의 모드 PAK "
-                f"{len(self.unread)}개({', '.join(self.unread[:3])}{' …' if len(self.unread) > 3 else ''})가 "
-                "적용되지 않습니다. 다시 적용하면 번호를 당겨 채웁니다.")
+
+def pak_mods_name(number: int, *parts: str) -> str:
+    """``pak_mods/NNN_<label>.pak``: no dots inside, so REFramework never reads it as a patch number."""
+    label = _UNSAFE_NAME.sub("_", "_".join(p for p in parts if p)).strip(" _")[:60].rstrip(" _") or "mod"
+    return f"{PAK_MODS_DIR}/{number:03d}_{label}.pak"
+
+
+def is_chain_pak(entry: dict) -> bool:
+    """A PAK an older version renamed into the patch chain in the game folder."""
+    return bool(entry.get("pak")) and "/" not in entry["path"]
 
 
 @dataclass
@@ -115,11 +110,10 @@ class DeployError(Exception):
 
 
 class Deployer:
-    def __init__(self, game_dir, data_dir, default_chain: str = DEFAULT_PAK_CHAIN):
+    def __init__(self, game_dir, data_dir):
         self.game_dir = Path(game_dir)
         self.manifest_path = Path(data_dir) / "deployment.json"
         self.backup_dir = Path(data_dir) / "backups"
-        self.default_chain = (default_chain or DEFAULT_PAK_CHAIN).lower()
 
     # ------------------------------------------------------------------ manifest
     def load_manifest(self) -> dict:
@@ -175,7 +169,7 @@ class Deployer:
         report.backed_up += 1
         log.info("기존 파일 백업: %s", rel)
 
-    def verify(self) -> list[str]:
+    def verify(self, include_outdated: bool = True) -> list[str]:
         """Problems with deployed files, without changing anything."""
         manifest = self.load_manifest()
         problems = []
@@ -183,39 +177,19 @@ class Deployer:
             state = self._entry_state(entry)
             if state == "missing":
                 problems.append(f"없어진 파일: {entry['path']}")
-            elif state == "changed" and entry.get("pak"):
+            elif state == "changed" and is_chain_pak(entry):
                 problems.append(f"게임 업데이트 등으로 덮어써진 PAK: {entry['path']}")
-        problems += [gap.describe() for gap in self.pak_gaps(manifest)]
+        outdated = self.outdated_paks(manifest)
+        if include_outdated and outdated:
+            problems.append(f"예전 방식(패치 번호)으로 넣은 PAK {len(outdated)}개는 게임이 읽지 않습니다. "
+                            f"다시 적용하면 {PAK_MODS_DIR} 폴더로 옮깁니다.")
         return problems
 
-    def pak_gaps(self, manifest: dict | None = None) -> list[PakGap]:
-        """Missing patch numbers that keep the game from reading our PAKs."""
+    def outdated_paks(self, manifest: dict | None = None) -> list[str]:
+        """Our PAKs still in the patch chain, where the game no longer reads them."""
         manifest = manifest or self.load_manifest()
-        ours: dict[str, dict[int, str]] = {}
-        for entry in manifest["files"].values():
-            m = PAK_PATCH_RE.match(entry["path"]) if entry.get("pak") else None
-            if m:
-                ours.setdefault(m.group("chain").lower(), {})[int(m.group("num"))] = entry["path"]
-        if not ours:
-            return []
-        present: dict[str, set[int]] = {}
-        try:
-            names = os.listdir(fsutil.longpath(self.game_dir))
-        except OSError:
-            return []
-        for name in names:
-            m = PAK_PATCH_RE.match(name)
-            if m:
-                present.setdefault(m.group("chain").lower(), set()).add(int(m.group("num")))
-        gaps = []
-        for chain, paks in ours.items():
-            have = present.get(chain, set())
-            missing = [n for n in range(1, max(paks) + 1) if n not in have]
-            if missing:
-                unread = [paks[n] for n in sorted(paks) if n > missing[0] and n in have]
-                if unread:
-                    gaps.append(PakGap(chain, missing, unread))
-        return gaps
+        return [e["path"] for e in manifest["files"].values()
+                if is_chain_pak(e) and self._entry_state(e) == "ok"]
 
     # ------------------------------------------------------------------ deploy
     def run(self, sources: list[ModSource], progress: ProgressFn | None = None) -> DeployReport:
@@ -244,7 +218,7 @@ class Deployer:
                 log.info("이미 없어진 파일을 목록에서 제거: %s", entry["path"])
             elif state == "ok":
                 status[key] = "ok"
-            elif entry.get("pak") or key in backups:
+            elif is_chain_pak(entry) or key in backups:
                 # Most likely a game update wrote its own file under this name.
                 del files[key]
                 stale = backups.pop(key, None)
@@ -259,37 +233,28 @@ class Deployer:
 
     def _desired(self, sources: list[ModSource], files: dict, status: dict, report: DeployReport) -> dict:
         desired: dict[str, dict] = {}
-        pak_queue: dict[str, list[dict]] = {}
+        paks: list[dict] = []
         for src in sources:
-            paks = []
+            mod_paks = []
             for rel in src.files:
                 if is_root_pak(rel):
-                    paks.append(rel)
+                    mod_paks.append(rel)
                     continue
                 item = self._source_item(src, rel)
                 if item:
                     desired[path_key(rel)] = item
-            for rel in sorted(paks, key=_pak_sort_key):
+            for rel in sorted(mod_paks, key=_pak_sort_key):
                 item = self._source_item(src, rel)
                 if item:
-                    pak_queue.setdefault(pak_chain_of(rel, self.default_chain), []).append(item)
-
-        occupied = self._foreign_patch_numbers(files)
-        for chain, items in pak_queue.items():
-            taken = occupied.get(chain, set())
-            num = 1
-            for item in items:
-                while num in taken:
-                    num += 1
-                if num > MAX_PAK_PATCH:
-                    report.errors.append(f"PAK 패치 번호가 {MAX_PAK_PATCH}를 넘어 '{item['src']}'을(를) 적용할 수 없습니다.")
-                    break
-                target = f"{chain}.patch_{num:03d}.pak"
-                item["path"] = target
-                item["pak"] = True
-                desired[path_key(target)] = item
-                report.paks.append((target, item["mod_name"], item["src"]))
-                num += 1
+                    stem = posixpath.splitext(rel)[0] if len(mod_paks) > 1 else ""
+                    paks.append((item, stem))
+        # Load order decides the number, and the number decides priority (last wins).
+        for number, (item, stem) in enumerate(paks, 1):
+            target = pak_mods_name(number, item["mod_name"], stem)
+            item["path"] = target
+            item["pak"] = True
+            desired[path_key(target)] = item
+            report.paks.append((target, item["mod_name"], item["src"]))
         return desired
 
     @staticmethod
@@ -310,20 +275,6 @@ class Deployer:
             "pak": False,
         }
 
-    def _foreign_patch_numbers(self, files: dict) -> dict[str, set[int]]:
-        """Patch numbers per chain that are used by files we do not own."""
-        taken: dict[str, set[int]] = {}
-        try:
-            entries = list(os.scandir(fsutil.longpath(self.game_dir)))
-        except OSError as exc:
-            raise DeployError(f"게임 폴더를 읽을 수 없습니다: {exc}") from exc
-        for entry in entries:
-            m = PAK_PATCH_RE.match(entry.name)
-            if not m or path_key(entry.name) in files:
-                continue
-            taken.setdefault(m.group("chain").lower(), set()).add(int(m.group("num")))
-        return taken
-
     @staticmethod
     def _identity(item: dict) -> tuple:
         return (item["mod"], item["src"], item["src_size"], item["src_mtime"])
@@ -339,7 +290,7 @@ class Deployer:
                 to_place.append(key)
         to_remove = [k for k in files if k not in desired]
 
-        # PAKs that only change number are renamed instead of copied again.
+        # PAKs that only change number (or move to pak_mods) are renamed instead of copied again.
         owned_paks = {self._identity(e): k for k, e in files.items() if e.get("pak") and status.get(k) == "ok"}
         relocate: dict[str, str] = {}
         for key in to_place:
@@ -400,9 +351,11 @@ class Deployer:
                     self._backup(key, rel, backups, report)
                 if key in relocate:
                     entry = files.pop(relocate[key])
+                    fsutil.makedirs(target.parent)
                     fsutil.replace_file(self._target(entry["path"]), target)
                     report.renamed += 1
-                    log.info("PAK 번호 변경: %s -> %s", entry["path"].removesuffix(TMP_SUFFIX), rel)
+                    dirs_to_prune.add(self._target(entry["path"]).parent)
+                    log.info("PAK 이름 변경: %s -> %s", entry["path"].removesuffix(TMP_SUFFIX), rel)
                 else:
                     fsutil.copy_file(item["src_path"], target)
                     report.copied += 1

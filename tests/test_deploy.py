@@ -36,71 +36,82 @@ def test_loose_override_and_removal(tmp_path, game_dir):
     assert (game_dir / patch(1)).read_text() == "official-1"
 
 
-def test_pak_numbering_after_official_patches(tmp_path, game_dir):
+def test_paks_go_to_pak_mods_in_load_order(tmp_path, game_dir):
     write(game_dir / patch(2), "official-2")
     a = mod(tmp_path, "a", {"cool.pak": "A"})
-    b = mod(tmp_path, "b", {"re_chunk_000.pak.sub_000.pak.patch_009.pak": "B"})
+    b = mod(tmp_path, "b", {"re_chunk_000.pak.sub_000.pak.patch_009.pak": "B", "b2.pak": "B2"})
     d = Deployer(game_dir, tmp_path / "data")
 
     r = d.run([a, b])
-    assert (game_dir / patch(3)).read_text() == "A"
-    assert (game_dir / patch(4)).read_text() == "B"
-    assert [t for t, _, _ in r.paks] == [patch(3), patch(4)]
+    assert [t for t, _, _ in r.paks] == ["pak_mods/001_a.pak", "pak_mods/002_b_re_chunk_000_pak_sub_000_pak_patch_009.pak",
+                                         "pak_mods/003_b_b2.pak"]
+    assert (game_dir / "pak_mods/001_a.pak").read_text() == "A"
+    assert (game_dir / "pak_mods/003_b_b2.pak").read_text() == "B2"
+    assert sorted(p.name for p in game_dir.glob("*.patch_*.pak")) == [patch(1), patch(2)]  # the chain is the game's
 
-    r = d.run([b, a])  # swapping the order only renames
-    assert (game_dir / patch(3)).read_text() == "B"
-    assert (game_dir / patch(4)).read_text() == "A"
-    assert r.renamed == 2 and r.copied == 0
+    r = d.run([b, a])  # the last mod gets the highest number (wins); reordering only renames
+    assert (game_dir / "pak_mods/003_a.pak").read_text() == "A"
+    assert r.renamed == 3 and r.copied == 0
 
-    r = d.run([a])  # removing one keeps the chain contiguous
-    assert (game_dir / patch(3)).read_text() == "A"
-    assert not (game_dir / patch(4)).exists()
+    r = d.run([a])
+    assert [p.name for p in (game_dir / "pak_mods").iterdir()] == ["001_a.pak"]
+    d.run([])
+    assert not (game_dir / "pak_mods").exists()
     assert (game_dir / patch(2)).read_text() == "official-2"
 
 
-def test_game_update_overwrites_mod_pak(tmp_path, game_dir):
+def test_other_files_in_pak_mods_are_left_alone(tmp_path, game_dir):
+    write(game_dir / "pak_mods/someone_else.pak", "other tool")
     a = mod(tmp_path, "a", {"a.pak": "A"})
-    b = mod(tmp_path, "b", {"b.pak": "B"})
-    d = Deployer(game_dir, tmp_path / "data")
-    d.run([a, b])
-    assert (game_dir / patch(2)).read_text() == "A"
-
-    # A game update ships its own patch_002 over mod A.
-    touch_later(game_dir / patch(2), "official-2")
-    assert any("patch_002" in p for p in d.verify())
-
-    r = d.run([a, b])
-    assert r.warnings
-    assert (game_dir / patch(2)).read_text() == "official-2"  # never deleted
-    assert (game_dir / patch(3)).read_text() == "A"  # load order is preserved
-    assert (game_dir / patch(4)).read_text() == "B"
-    assert r.copied == 1 and r.renamed == 1
-
-    d.run([])
-    assert (game_dir / patch(1)).read_text() == "official-1"
-    assert (game_dir / patch(2)).read_text() == "official-2"
-    assert not (game_dir / patch(3)).exists()
-    assert not (game_dir / patch(4)).exists()
-
-
-def test_foreign_paks_are_skipped(tmp_path, game_dir):
-    write(game_dir / patch(3), "other tool")  # gap at 2, foreign file at 3
-    a = mod(tmp_path, "a", {"a.pak": "A"})
-    b = mod(tmp_path, "b", {"b.pak": "B"})
-    d = Deployer(game_dir, tmp_path / "data")
-    d.run([a, b])
-    assert (game_dir / patch(2)).read_text() == "A"
-    assert (game_dir / patch(3)).read_text() == "other tool"
-    assert (game_dir / patch(4)).read_text() == "B"
-    d.run([])
-    assert (game_dir / patch(3)).read_text() == "other tool"
-
-
-def test_other_chain_from_filename(tmp_path, game_dir):
-    a = mod(tmp_path, "a", {"re_chunk_000.pak.patch_005.pak": "A"})
     d = Deployer(game_dir, tmp_path / "data")
     d.run([a])
-    assert (game_dir / "re_chunk_000.pak.patch_001.pak").read_text() == "A"
+    d.run([])
+    assert (game_dir / "pak_mods/someone_else.pak").read_text() == "other tool"
+
+
+def _old_chain_deployment(tmp_path, game_dir, d, mods_and_numbers):
+    """The manifest an older version left after renaming PAKs into the patch chain."""
+    import json
+
+    files = {}
+    for source, number in mods_and_numbers:
+        rel = patch(number)
+        src_path, key = source.source(source.files[0])
+        write(game_dir / rel, src_path.read_text())
+        st, src_st = (game_dir / rel).stat(), src_path.stat()
+        files[rel] = {"path": rel, "mod": source.mod_id, "src": key, "src_size": src_st.st_size,
+                      "src_mtime": src_st.st_mtime_ns, "size": st.st_size, "mtime": st.st_mtime_ns, "pak": True}
+    write(d.manifest_path, json.dumps({"version": 1, "game_dir": str(game_dir), "files": files, "backups": {}}))
+
+
+def test_paks_from_the_patch_chain_move_to_pak_mods(tmp_path, game_dir):
+    a = mod(tmp_path, "a", {"Chen_Tex.pak": "tex"})
+    b = mod(tmp_path, "b", {"b.pak": "B"})
+    d = Deployer(game_dir, tmp_path / "data")
+    _old_chain_deployment(tmp_path, game_dir, d, [(a, 16), (b, 17)])
+    assert d.outdated_paks() == [patch(16), patch(17)]
+    assert any("pak_mods" in p for p in d.verify()) and d.verify(include_outdated=False) == []
+
+    r = d.run([a, b])
+    assert (game_dir / "pak_mods/001_a.pak").read_text() == "tex"
+    assert (game_dir / "pak_mods/002_b.pak").read_text() == "B"
+    assert not (game_dir / patch(16)).exists() and not (game_dir / patch(17)).exists()
+    assert r.renamed == 2 and r.copied == 0 and d.outdated_paks() == [] and d.verify() == []
+
+
+def test_chain_pak_overwritten_by_game_update_is_kept(tmp_path, game_dir):
+    a = mod(tmp_path, "a", {"a.pak": "A"})
+    d = Deployer(game_dir, tmp_path / "data")
+    _old_chain_deployment(tmp_path, game_dir, d, [(a, 2)])
+    touch_later(game_dir / patch(2), "official-2")  # a game update shipped its own patch_002
+    assert any("patch_002" in p for p in d.verify())
+
+    r = d.run([a])
+    assert r.warnings
+    assert (game_dir / patch(2)).read_text() == "official-2"  # never deleted
+    assert (game_dir / "pak_mods/001_a.pak").read_text() == "A"
+    d.run([])
+    assert (game_dir / patch(2)).read_text() == "official-2"
 
 
 def test_backup_and_restore_of_game_files(tmp_path, game_dir):
@@ -157,7 +168,7 @@ def test_changed_mod_source_is_recopied(tmp_path, game_dir):
     r = d.run([a])
     assert r.copied == 2
     assert (game_dir / "natives/STM/x.tex").read_text() == "A2"
-    assert (game_dir / patch(2)).read_text() == "P2"
+    assert (game_dir / "pak_mods/001_a.pak").read_text() == "P2"
 
 
 def test_unrelated_files_are_left_alone(tmp_path, game_dir):
@@ -181,33 +192,3 @@ def test_refuses_other_game_dir(tmp_path, game_dir):
     with pytest.raises(DeployError):
         Deployer(other, tmp_path / "data").run([a])
 
-
-def test_gap_left_by_another_tool_is_found_and_closed(tmp_path, game_dir):
-    # Another mod manager (e.g. Fluffy) had PAKs at 2 and 3, so ours went to 4.
-    write(game_dir / patch(2), "fluffy 1")
-    write(game_dir / patch(3), "fluffy 2")
-    a = mod(tmp_path, "a", {"Chen_Tex.pak": "tex"})
-    d = Deployer(game_dir, tmp_path / "data")
-    d.run([a])
-    assert (game_dir / patch(4)).read_text() == "tex"
-    assert d.verify() == [] and d.pak_gaps() == []
-
-    # Removing those leaves a gap: the game stops at 2 and never reads our PAK.
-    (game_dir / patch(2)).unlink()
-    (game_dir / patch(3)).unlink()
-    gaps = d.pak_gaps()
-    assert [(g.chain, g.missing, g.unread) for g in gaps] == [(CHAIN, [2, 3], [patch(4)])]
-    problems = d.verify()
-    assert len(problems) == 1 and patch(2) in problems[0] and patch(4) in problems[0]
-
-    d.run([a])  # applying again moves our PAK down into the gap
-    assert (game_dir / patch(2)).read_text() == "tex" and not (game_dir / patch(4)).exists()
-    assert d.verify() == [] and d.pak_gaps() == []
-
-
-def test_gap_only_below_foreign_paks_is_not_ours(tmp_path, game_dir):
-    a = mod(tmp_path, "a", {"a.pak": "A"})
-    d = Deployer(game_dir, tmp_path / "data")
-    d.run([a])  # ours at 2
-    write(game_dir / patch(9), "other tool")  # someone else's PAK after a gap
-    assert d.pak_gaps() == []

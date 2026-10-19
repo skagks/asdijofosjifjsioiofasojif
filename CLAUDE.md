@@ -24,7 +24,7 @@
 - UI 이미지 다시 만들기: `python tools/make_assets.py` (Pillow 필요)
 - 구조
   - `mhwmm/analyzer.py`: 압축 파일 구조 분석, 옵션(variant) 찾기
-  - `mhwmm/deploy.py`: 게임 폴더 적용·해제, PAK 패치 번호 관리, 원본 백업
+  - `mhwmm/deploy.py`: 게임 폴더 적용·해제, PAK 모드 pak_mods 배치, 원본 백업
   - `mhwmm/manager.py`: 모드 목록·옵션·설정·설치
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

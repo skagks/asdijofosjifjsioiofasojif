@@ -68,7 +68,7 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     app.apply()
     pump(root, lambda: app.busy is None and not manager.dirty)
     assert (game_dir / "natives/STM/a.tex").read_text() == "b"
-    assert (game_dir / "re_chunk_000.pak.sub_000.pak.patch_002.pak").read_text() == "p"
+    assert (game_dir / "pak_mods/001_A.pak").read_text() == "p"
 
     app.toggle([b.id])  # auto-apply kicks in
     pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
@@ -319,25 +319,21 @@ def test_gui_checks_mod_updates_at_startup(root, manager, tmp_path, monkeypatch)
     assert not app.mods_badge.winfo_manager()
 
 
-def test_gui_closes_pak_gap_at_startup(root, manager, tmp_path, game_dir):
+def test_gui_moves_old_chain_paks_to_pak_mods_at_startup(root, manager, tmp_path, game_dir):
     from mhwmm import gui
 
-    from conftest import write
+    from test_deploy import _old_chain_deployment
 
-    # PAKs of another mod manager sat at 2 and 3, so ours went to 4 ...
-    chain = "re_chunk_000.pak.sub_000.pak"
-    for n in (2, 3):
-        write(game_dir / f"{chain}.patch_{n:03d}.pak", "fluffy")
     with manager.prepare_install(make_zip(tmp_path / "Chen.zip", {"Chen_Tex.pak": "tex"})) as s:
-        manager.install_variant(s, s.variants[0])
-    manager.deploy()
-    assert (game_dir / f"{chain}.patch_004.pak").read_text() == "tex"
-    # ... then they were removed: the game stops at 2 and never reads our textures
-    for n in (2, 3):
-        (game_dir / f"{chain}.patch_{n:03d}.pak").unlink()
-    assert manager.pak_gaps()
+        chen = manager.install_variant(s, s.variants[0])
+    source = manager.prepare_deploy()[0][0]
+    # an older version put the PAK at patch_017, which the game never reads
+    _old_chain_deployment(tmp_path, game_dir, manager.deployer(), [(source, 17)])
+    manager.dirty = False
+    assert manager.outdated_paks()
 
     app = gui.App(root, manager, queue.Queue())
-    pump(root, lambda: (game_dir / f"{chain}.patch_002.pak").exists() and app.busy is None and not manager.dirty)
-    assert (game_dir / f"{chain}.patch_002.pak").read_text() == "tex"
-    assert not (game_dir / f"{chain}.patch_004.pak").exists() and not manager.pak_gaps()
+    target = game_dir / "pak_mods" / "001_Chen.pak"
+    pump(root, lambda: target.exists() and app.busy is None and not manager.dirty)
+    assert target.read_text() == "tex" and chen.enabled
+    assert not (game_dir / "re_chunk_000.pak.sub_000.pak.patch_017.pak").exists() and not manager.outdated_paks()

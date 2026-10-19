@@ -7,7 +7,6 @@ from mhwmm.manager import ModManager
 
 from conftest import make_tree, make_zip, write
 
-CHAIN = "re_chunk_000.pak.sub_000.pak"
 
 
 def install(manager, path, pick=None, replace=False):
@@ -101,7 +100,7 @@ def test_install_single_pak_and_folder(manager, game_dir, tmp_path):
     (m2,) = install(manager, folder)
     assert (folder / "natives/STM/z.tex").exists()
     report = manager.deploy()
-    assert (game_dir / f"{CHAIN}.patch_002.pak").read_text() == "P"
+    assert (game_dir / "pak_mods/001_MyPak.pak").read_text() == "P"
     assert (game_dir / "natives/STM/z.tex").read_text() == "z"
     assert report.paks[0][1] == m1.name
 
@@ -141,12 +140,14 @@ def test_bad_zip(tmp_path):
         extract(bad, tmp_path / "out")
 
 
-def test_settings_chain_validation(manager):
-    with pytest.raises(ValueError):
-        manager.update_settings(pak_chain="nonsense.pak")
-    manager.dirty = False
-    manager.update_settings(pak_chain="re_chunk_000.pak")
-    assert manager.dirty
+def test_settings_from_older_versions_load(manager):
+    import json
+
+    state = json.loads((manager.data_dir / "state.json").read_text(encoding="utf-8"))
+    state["settings"]["pak_chain"] = "re_chunk_000.pak"  # removed setting
+    (manager.data_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    reloaded = type(manager)(manager.data_dir)
+    assert not hasattr(reloaded.settings, "pak_chain") and reloaded.settings.auto_apply == manager.settings.auto_apply
 
 
 def test_instance_lock(tmp_path):
@@ -182,18 +183,18 @@ def test_options_are_off_until_chosen(manager, game_dir, tmp_path):
     manager.deploy()
     assert (game_dir / "natives/STM/a.tex").read_text() == "red"
     assert (game_dir / "natives/STM/red_only.tex").exists()
-    assert not (game_dir / f"{CHAIN}.patch_002.pak").exists()
+    assert not (game_dir / "pak_mods/001_Colors.pak").exists()
 
     manager.set_options(mod.id, [blue])
     manager.deploy()
     assert (game_dir / "natives/STM/a.tex").read_text() == "blue"
     assert not (game_dir / "natives/STM/red_only.tex").exists()
-    assert (game_dir / f"{CHAIN}.patch_002.pak").read_text() == "bluepak"
+    assert (game_dir / "pak_mods/001_Colors.pak").read_text() == "bluepak"
 
     manager.set_options(mod.id, [red, blue])  # both on: the later option wins shared files
     manager.deploy()
     assert (game_dir / "natives/STM/a.tex").read_text() == "red"
-    assert (game_dir / f"{CHAIN}.patch_002.pak").read_text() == "bluepak"
+    assert (game_dir / "pak_mods/001_Colors.pak").read_text() == "bluepak"
     assert ModManager(manager.data_dir).get(mod.id).selected == [blue, red]
 
     # an update keeps the chosen options by name; new options start switched off
@@ -209,7 +210,7 @@ def test_options_are_off_until_chosen(manager, game_dir, tmp_path):
     assert sorted(names[i] for i in updated.selected) == ["Blue", "Red"]
     manager.deploy()
     assert (game_dir / "natives/STM/a.tex").read_text() == "red2"
-    assert not (game_dir / f"{CHAIN}.patch_002.pak").exists()
+    assert not (game_dir / "pak_mods/001_Colors.pak").exists()
 
 
 @pytest.fixture

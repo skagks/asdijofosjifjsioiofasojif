@@ -34,6 +34,13 @@ def test_pak_mod(tmp_path):
     assert v.kinds == {"pak"}
 
 
+def test_pak_mods_folder_stays_with_the_rest_of_the_mod(tmp_path):
+    base = make_tree(tmp_path / "x", {"Chen/natives/STM/a.mesh": "m", "Chen/pak_mods/tex/Chen_Tex.pak": "p"})
+    (v,) = analyze(base, "Chen")
+    assert mapping(v) == {"Chen/natives/STM/a.mesh": "natives/STM/a.mesh", "Chen/pak_mods/tex/Chen_Tex.pak": "tex_Chen_Tex.pak"}
+    assert v.kinds == {"loose", "pak"}
+
+
 def test_fluffy_variants(tmp_path):
     base = make_tree(tmp_path / "x", {
         "Pack/modinfo.ini": "name=Pack\nauthor=Hunter\nversion=2.0\n",

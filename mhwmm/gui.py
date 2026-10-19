@@ -18,8 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__, fsutil, nexus, refw, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
-from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_CHAINS,
-                        REFRAMEWORK_URL, STEAM_APP_ID)
+from .constants import APP_TITLE, GAME_EXE, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL, STEAM_APP_ID
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .helptext import SECTIONS as HELP_SECTIONS
 from .manager import (InstallError, InstallSession, Mod, ModManager, acquire_instance_lock,
@@ -283,7 +282,7 @@ class RefwDialog(Dialog):
         px = theme.px
         latest = status.latest
         ttk.Label(self.body, text="REFramework", style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.body, text="루스 파일 모드와 Lua 스크립트를 쓰려면 필요한 프로그램입니다.",
+        ttk.Label(self.body, text="루스 파일 · PAK 모드와 Lua 스크립트를 쓰려면 필요한 프로그램입니다.",
                   style="Muted.TLabel").pack(anchor="w", pady=(px(4), px(14)))
         grid = ttk.Frame(self.body)
         grid.pack(fill="x")
@@ -494,12 +493,9 @@ class SettingsDialog(Dialog):
         check(right, "enable_on_install", "설치한 모드를 바로 활성화")
         check(right, "confirm_remove", "모드를 삭제하기 전에 확인")
         check(right, "check_game_running", "적용 전에 게임 실행 여부 확인")
-        ttk.Label(right, text="PAK 대상 파일").pack(anchor="w", padx=(px(4), 0), pady=(px(10), px(4)))
-        self.chain = tk.StringVar(value=s.pak_chain)
-        ttk.Combobox(right, textvariable=self.chain, values=PAK_CHAINS, width=32).pack(anchor="w", padx=(px(4), 0))
-        ttk.Label(right, text="파일 이름에 번호가 들어 있는 PAK은 그 이름을 따릅니다.", style="Muted.TLabel",
-                  font=theme.fonts["small"], wraplength=px(300), justify="left").pack(anchor="w", padx=(px(4), 0),
-                                                                                   pady=(px(4), 0))
+        ttk.Label(right, text=f"PAK 모드는 게임 폴더의 {PAK_MODS_DIR} 폴더에 넣고, REFramework가 불러옵니다.",
+                  style="Muted.TLabel", font=theme.fonts["small"], wraplength=px(300),
+                  justify="left").pack(anchor="w", padx=(px(4), 0), pady=(px(10), 0))
 
         section(self.body, "Nexus Mods")
         ttk.Label(self.body, text="설치한 모드의 새 버전을 Nexus에서 확인합니다. Nexus 계정 설정의 API 키 화면에서 "
@@ -562,7 +558,6 @@ class SettingsDialog(Dialog):
         try:
             self.manager.update_settings(
                 theme=theme_name,
-                pak_chain=self.chain.get().strip().lower(),
                 nexus_api_key=self.key_var.get().strip(),
                 **{key: var.get() for key, var in self.vars.items()},
             )
@@ -1253,7 +1248,7 @@ class App:
         else:
             text = "REFramework(dinput8.dll)가 없습니다."
         if not m.refw_installed() and m.needs_refw():
-            text += "\n활성화된 루스 파일/스크립트 모드가 동작하려면 필요합니다."
+            text += "\n활성화된 루스 파일 · PAK · 스크립트 모드가 동작하려면 필요합니다."
         return text + "\n클릭하면 설치·업데이트 창을 엽니다."
 
     def _on_refw_click(self):
@@ -1529,10 +1524,13 @@ class App:
             chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
                        ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
                         "게임에 아무 파일도 적용되지 않습니다.\n", "warn")]
-        if kinds & {"loose", "script"} and not m.refw_installed():
-            chunks += [("\n", None), ("REFramework가 필요합니다\n", ("warn", "warn_title")),
-                       ("위쪽 REFramework 배지를 눌러 설치하고, 게임 안 REFramework 메뉴의 LooseFileLoader에서 "
-                        "'Enable Loose File Loader'를 켜세요.\n", "warn")]
+        if kinds & {"loose", "script", "pak"} and not m.refw_installed():
+            how = "위쪽 REFramework 배지를 눌러 설치하세요."
+            if kinds & {"loose"}:
+                how += " 루스 파일은 게임 안 REFramework 메뉴의 LooseFileLoader에서 'Enable Loose File Loader'를 켜야 합니다."
+            if "pak" in kinds:
+                how += f" PAK은 REFramework가 {PAK_MODS_DIR} 폴더에서 불러옵니다."
+            chunks += [("\n", None), ("REFramework가 필요합니다\n", ("warn", "warn_title")), (how + "\n", "warn")]
         if mod.description:
             chunks.append(("\n" + mod.description.replace("\\n", "\n") + "\n", "desc"))
         self._set_text(self.info_text, chunks)
@@ -1832,25 +1830,27 @@ class App:
             log.warning("게임 폴더가 없습니다: %s", m.game_dir)
             return
         try:
-            problems = m.verify()
-            gaps = {gap.describe() for gap in m.pak_gaps()}
+            problems = m.verify(include_outdated=False)
+            outdated = m.outdated_paks()
         except Exception as exc:
             log.warning("적용 상태를 점검하지 못했습니다: %s", exc)
             return
+        if outdated:
+            log.info("게임이 읽지 않는 예전 방식(패치 번호)의 PAK %d개를 %s 폴더로 옮겨야 합니다.", len(outdated), PAK_MODS_DIR)
+            if m.settings.auto_apply and not problems:
+                m.dirty = True
+                self.apply()  # only renames our own PAKs
+                return
+            problems = m.verify()
         if problems:
             for p in problems[:20]:
                 log.warning(p)
             m.dirty = True
             m.save()
             self._update_header()
-            if m.settings.auto_apply and all(p in gaps for p in problems):
-                # e.g. another mod manager removed its PAKs: moving ours down is always safe
-                log.info("PAK 번호에 빈칸이 생겨 번호를 다시 맞춥니다.")
-                self.apply()
-                return
             shown = "\n".join(f"• {p}" for p in problems[:5]) + (f"\n… 외 {len(problems) - 5}개" if len(problems) > 5 else "")
             if messagebox.askyesno(APP_TITLE, f"게임 폴더에서 모드 적용 문제 {len(problems)}개를 찾았습니다.\n\n{shown}\n\n"
-                                              "지금 다시 적용할까요? (PAK 번호를 다시 맞춥니다)", parent=self.root):
+                                              "지금 다시 적용할까요?", parent=self.root):
                 self.apply()
 
     # ------------------------------------------------------------------ game folder
@@ -2165,8 +2165,8 @@ class App:
     # ------------------------------------------------------------------ misc actions
     def launch_game(self):
         m = self.manager
-        if m.game_dir and not m.dirty and m.pak_gaps():
-            log.warning("PAK 번호에 빈칸이 있어 게임이 일부 모드 PAK을 읽지 못합니다. 번호를 다시 맞춥니다.")
+        if m.game_dir and not m.dirty and m.outdated_paks():
+            log.warning("게임이 읽지 않는 예전 방식의 PAK이 있어 %s 폴더로 옮깁니다.", PAK_MODS_DIR)
             m.dirty = True
             m.save()
             self._update_header()

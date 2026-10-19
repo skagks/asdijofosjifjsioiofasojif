@@ -18,7 +18,7 @@ from pathlib import Path
 from . import fsutil, nexus, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
-from .constants import DEFAULT_PAK_CHAIN, GAME_EXE, PAK_CHAIN_RE, REFRAMEWORK_DLL, REFW_ORIGIN
+from .constants import GAME_EXE, REFRAMEWORK_DLL, REFW_ORIGIN
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
 
 log = logging.getLogger(__name__)
@@ -236,7 +236,6 @@ def _from_dict(cls, data: dict):
 @dataclass
 class Settings:
     theme: str = "dark"
-    pak_chain: str = DEFAULT_PAK_CHAIN
     auto_apply: bool = True
     enable_on_install: bool = True
     check_game_running: bool = True
@@ -560,7 +559,7 @@ class ModManager:
         game = game_dir or self.game_dir
         if not game:
             raise DeployError("게임 폴더가 설정되지 않았습니다.")
-        return Deployer(game, self.data_dir, self.settings.pak_chain)
+        return Deployer(game, self.data_dir)
 
     def detect_game_dir(self) -> Path | None:
         return steam.find_game_dir()
@@ -575,7 +574,7 @@ class ModManager:
             old = Path(bound)
             if old.is_dir():
                 log.info("이전 게임 폴더에서 모드를 해제합니다: %s", old)
-                report = Deployer(old, self.data_dir, self.settings.pak_chain).run([], progress)
+                report = Deployer(old, self.data_dir).run([], progress)
                 if report.errors:
                     raise DeployError("이전 게임 폴더에서 모드를 해제하지 못했습니다:\n" + "\n".join(report.errors[:5]))
             else:
@@ -591,7 +590,8 @@ class ModManager:
         return bool(self.game_dir) and (self.game_dir / REFRAMEWORK_DLL).is_file()
 
     def needs_refw(self) -> bool:
-        return any(self.mod_kinds(m.id) & {"loose", "script"} for m in self.mods if m.enabled)
+        """Enabled mods only work with REFramework: loose files, scripts and PAKs (loaded from pak_mods)."""
+        return any(self.mod_kinds(m.id) & {"loose", "script", "pak"} for m in self.mods if m.enabled)
 
     # ------------------------------------------------------------- queries
     def get(self, mod_id: str) -> Mod:
@@ -759,17 +759,10 @@ class ModManager:
             log.warning("모드 폴더를 완전히 지우지 못했습니다: %s", exc)
 
     def update_settings(self, **changes) -> None:
-        chain = changes.get("pak_chain")
-        if chain is not None and not PAK_CHAIN_RE.match(chain):
-            raise ValueError(f"올바르지 않은 PAK 체인 이름입니다: {chain}")
-        affects_deploy = chain is not None and chain.lower() != self.settings.pak_chain.lower()
         for k, v in changes.items():
             if hasattr(self.settings, k):
                 setattr(self.settings, k, v)
-        if affects_deploy:
-            self._changed()
-        else:
-            self.save()
+        self.save()
 
     # ------------------------------------------------------------- install
     def prepare_install(self, path) -> InstallSession:
@@ -1025,16 +1018,16 @@ class ModManager:
         self.save()
         return report
 
-    def verify(self) -> list[str]:
+    def verify(self, include_outdated: bool = True) -> list[str]:
         if not self.game_dir:
             return []
-        return self.deployer().verify()
+        return self.deployer().verify(include_outdated)
 
-    def pak_gaps(self) -> list:
-        """Missing PAK patch numbers (e.g. left by another mod manager) that hide our PAKs from the game."""
+    def outdated_paks(self) -> list[str]:
+        """PAKs an older version put into the patch chain, which the game no longer reads."""
         if not self.game_dir or not self.game_dir.is_dir():
             return []
-        return self.deployer().pak_gaps()
+        return self.deployer().outdated_paks()
 
     def deployed_files(self) -> dict:
         """Manifest entries of the current deployment, keyed by lower-cased game path."""
