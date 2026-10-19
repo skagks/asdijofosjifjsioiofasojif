@@ -15,7 +15,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__, fsutil, steam
-from .analyzer import Variant
+from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_CHAINS,
                         REFRAMEWORK_URL, STEAM_APP_ID)
@@ -54,8 +54,15 @@ INSTALL_FILETYPES = [
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, OSError, ValueError)
 
 
+KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
+
+
 def kinds_text(kinds: set[str]) -> str:
     return " + ".join(label for k, label in KIND_LABELS.items() if k in kinds) or "-"
+
+
+def kinds_short(kinds: set[str]) -> str:
+    return " · ".join(label for k, label in KIND_SHORT.items() if k in kinds) or "-"
 
 
 def format_size(n: int) -> str:
@@ -201,56 +208,6 @@ class TextDialog(Dialog):
 
     def ok(self):
         self.result = self.var.get()
-        self.destroy()
-
-
-class VariantDialog(Dialog):
-    def __init__(self, parent, theme: Theme, source_name: str, variants: list[Variant]):
-        super().__init__(parent, theme, "설치할 옵션 선택")
-        px = theme.px
-        self.variants = variants
-        ttk.Label(self.body, text="설치할 옵션을 고르세요", style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.body, text=f"'{source_name}' 안에 옵션이 {len(variants)}개 있습니다. "
-                                  "선택한 옵션은 각각 별도의 모드로 추가됩니다.",
-                  style="Muted.TLabel", wraplength=px(520), justify="left").pack(anchor="w", pady=(px(4), px(12)))
-        frame = ttk.Frame(self.body)
-        frame.pack(fill="both", expand=True)
-        canvas = theme.mark(tk.Canvas(frame, height=min(px(340), px(52) * len(variants) + px(8))), "canvas_bg")
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        if len(variants) > 6:
-            scroll.pack(side="right", fill="y")
-        self.vars = []
-        for i, v in enumerate(variants):
-            var = tk.BooleanVar(value=(i == 0))
-            self.vars.append(var)
-            theme.checkbutton(inner, v.name, var).pack(anchor="w", pady=(px(4), 0))
-            ttk.Label(inner, text=f"{kinds_text(v.kinds)} · 파일 {len(v.files)}개",
-                      style="Muted.TLabel", font=theme.fonts["small"]).pack(anchor="w", padx=(px(34), 0))
-
-        def wheel(event):
-            delta = -1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4) else 1
-            canvas.yview_scroll(delta, "units")
-
-        for w in (canvas, inner):
-            w.bind("<MouseWheel>", wheel)
-            w.bind("<Button-4>", wheel)
-            w.bind("<Button-5>", wheel)
-        inner.update_idletasks()
-        canvas.configure(width=min(px(760), max(px(440), inner.winfo_reqwidth())))
-        row = self.buttons("설치", self.ok)
-        ttk.Button(row, text="모두 선택", command=lambda: [v.set(True) for v in self.vars]).pack(side="left")
-
-    def ok(self):
-        chosen = [v for v, var in zip(self.variants, self.vars) if var.get()]
-        if not chosen:
-            messagebox.showwarning("선택 없음", "설치할 옵션을 하나 이상 선택하세요.", parent=self)
-            return
-        self.result = chosen
         self.destroy()
 
 
@@ -520,8 +477,8 @@ class App:
         self.tree.column("#0", width=px(46), minwidth=px(46), stretch=False)
         for col, text, width, anchor, stretch in (
             ("order", "#", 34, "center", False),
-            ("name", "이름", 200, "w", True),
-            ("kind", "종류", 116, "w", False),
+            ("name", "이름", 190, "w", True),
+            ("kind", "종류", 140, "w", False),
             ("version", "버전", 56, "w", False),
             ("files", "파일", 46, "e", False),
             ("conflict", "충돌", 118, "w", False),
@@ -561,6 +518,19 @@ class App:
         self.info_text.configure(state="disabled", tabs=(px(84),))
         self.notebook.add(info, text="정보")
 
+        self.options_tab = ttk.Frame(self.notebook, style="Card.TFrame")
+        self.options_canvas = t.mark(tk.Canvas(self.options_tab), "canvas")
+        osb = ttk.Scrollbar(self.options_tab, orient="vertical", command=self.options_canvas.yview)
+        self.options_canvas.configure(yscrollcommand=autohide(osb, side="right", fill="y"))
+        self.options_canvas.pack(side="left", fill="both", expand=True)
+        self.options_inner = ttk.Frame(self.options_canvas, style="Card.TFrame", padding=(px(18), px(14)))
+        window = self.options_canvas.create_window((0, 0), window=self.options_inner, anchor="nw")
+        self.options_inner.bind("<Configure>", lambda e: self.options_canvas.configure(
+            scrollregion=self.options_canvas.bbox("all")))
+        self.options_canvas.bind("<Configure>", lambda e: self.options_canvas.itemconfigure(window, width=e.width))
+        self._option_vars: list[tuple[str, tk.BooleanVar]] = []
+        self.notebook.add(self.options_tab, text="옵션", state="hidden")
+
         files = ttk.Frame(self.notebook, style="Card.TFrame", padding=(px(6), px(8), px(6), px(6)))
         self.files_tree = ttk.Treeview(files, columns=("path", "status"), show="headings")
         self.files_tree.heading("path", text="게임 폴더 기준 경로", anchor="w")
@@ -589,11 +559,13 @@ class App:
             tree.tag_configure("disabled", foreground=p["subtle"])
             tree.tag_configure("overridden", foreground=p["warn"])
             tree.tag_configure("pending", foreground=p["subtle"])
+            tree.tag_configure("attention", foreground=p["warn"])
         info = self.info_text
         info.tag_configure("title", font=f["detail_title"], spacing3=px(8))
         info.tag_configure("chip", background=p["chip"], foreground=p["chip_text"], font=f["small_bold"])
         info.tag_configure("chip_ok", background=p["success_bg"], foreground=p["success"], font=f["small_bold"])
         info.tag_configure("chip_off", background=p["raised"], foreground=p["muted"], font=f["small_bold"])
+        info.tag_configure("chip_warn", background=p["warn_bg"], foreground=p["warn"], font=f["small_bold"])
         info.tag_configure("key", foreground=p["muted"], spacing1=px(3), spacing3=px(3))
         info.tag_configure("value", foreground=p["text"], spacing1=px(3), spacing3=px(3))
         info.tag_configure("muted", foreground=p["muted"])
@@ -679,9 +651,15 @@ class App:
             tags = ["odd"] if pos % 2 else []
             if not mod.enabled:
                 tags.append("disabled")
+            elif mod.needs_option:
+                tags.append("attention")
             elif losses and not wins and losses == sum(1 for f in files if not is_root_pak(f)):
                 tags.append("overridden")
-            values = (index + 1, mod.name, kinds_text(m.mod_kinds(mod.id)), mod.version, len(files), conflict)
+            name = mod.name
+            if mod.options:
+                name += ("   ·  옵션을 선택하세요" if mod.needs_option
+                         else f"   ·  옵션 {len(mod.selected)}/{len(mod.options)}")
+            values = (index + 1, name, kinds_short(self._display_kinds(mod)), mod.version, len(files), conflict)
             image = on if mod.enabled else off
             if mod.id in existing:
                 self.tree.item(mod.id, image=image, values=values, tags=tags)
@@ -712,6 +690,15 @@ class App:
             self.empty.place_forget()
         self._update_header()
         self._update_details()
+
+    def _display_kinds(self, mod: Mod) -> set[str]:
+        """Kinds of the files a mod deploys, or of all its options while none is chosen."""
+        if mod.needs_option:
+            kinds: set[str] = set()
+            for opt in mod.options:
+                kinds |= classify(self.manager.option_files(mod.id, opt["id"]))
+            return kinds
+        return self.manager.mod_kinds(mod.id)
 
     def _update_header(self):
         m = self.manager
@@ -795,6 +782,7 @@ class App:
                           ("목록에서 모드를 선택하면 정보, 파일 목록, 충돌 내용을 볼 수 있습니다.", "muted")]
             self._set_text(self.info_text, chunks)
             self._set_text(self.conflict_text, [("충돌\n", "title"), ("모드를 선택하세요.", "muted")])
+            self._fill_options(None)
             return
         m = self.manager
         self._show_preview(m.screenshot_path(mod))
@@ -802,13 +790,16 @@ class App:
         kinds = m.mod_kinds(mod.id)
         chunks = [(mod.name + "\n", "title")]
         chips = [("활성" if mod.enabled else "비활성", "chip_ok" if mod.enabled else "chip_off")]
-        chips += [(KIND_LABELS[k], "chip") for k in KIND_LABELS if k in kinds]
+        if mod.needs_option:
+            chips.append(("옵션 선택 필요", "chip_warn"))
+        chips += [(KIND_LABELS[k], "chip") for k in KIND_LABELS if k in self._display_kinds(mod)]
         if mod.version:
             chips.append((f"v{mod.version}" if mod.version[:1].isdigit() else mod.version, "chip"))
         for text, tag in chips:
             chunks += [(f"  {text}  ", tag), ("  ", None)]
         chunks.append(("\n\n", None))
         for label, value in (
+            ("옵션", f"{len(mod.options)}개 중 {len(mod.selected)}개 사용" if mod.options else ""),
             ("제작자", mod.author),
             ("분류", mod.category),
             ("파일", f"{len(files)}개 · {format_size(m.mod_size(mod.id))}"),
@@ -818,6 +809,10 @@ class App:
         ):
             if value:
                 chunks += [(f"{label}\t", "key"), (f"{value}\n", "value")]
+        if mod.needs_option:
+            chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
+                       ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
+                        "게임에 아무 파일도 적용되지 않습니다.\n", "warn")]
         if kinds & {"loose", "script"} and not m.refw_installed():
             chunks += [("\n", None), ("REFramework가 필요합니다\n", ("warn", "warn_title")),
                        ("REFramework를 설치하고, 게임 안 REFramework 메뉴의 LooseFileLoader에서 "
@@ -827,6 +822,78 @@ class App:
         self._set_text(self.info_text, chunks)
         self._fill_files(mod, files)
         self._fill_conflicts(mod)
+        self._fill_options(mod)
+
+    def _fill_options(self, mod: Mod | None):
+        for child in self.options_inner.winfo_children():
+            child.destroy()
+        self._option_vars = []
+        if mod is None or not mod.options:
+            self.notebook.tab(self.options_tab, state="hidden", text="옵션")
+            return
+        t, px, m = self.theme, self.theme.px, self.manager
+        inner = self.options_inner
+        self.notebook.tab(self.options_tab, state="normal",
+                          text=f"옵션 {len(mod.selected)}/{len(mod.options)}" if mod.selected else "옵션 ●")
+        ttk.Label(inner, text="옵션", style="CardTitle.TLabel").pack(anchor="w")
+        if mod.needs_option:
+            callout = ttk.Frame(inner, style="Callout.TFrame", padding=(px(14), px(10)))
+            callout.pack(fill="x", pady=(px(10), px(4)))
+            ttk.Label(callout, text="옵션을 활성화해 주세요", style="CalloutTitle.TLabel").pack(anchor="w")
+            ttk.Label(callout, text="사용할 옵션을 아래에서 하나 이상 켜야 게임에 적용됩니다.",
+                      style="Callout.TLabel", wraplength=px(380), justify="left").pack(anchor="w", pady=(px(2), 0))
+        else:
+            ttk.Label(inner, text="여러 옵션을 함께 켤 수 있습니다. 같은 파일이 겹치면 아래쪽 옵션이 우선합니다.",
+                      style="CardMuted.TLabel", wraplength=px(380), justify="left").pack(anchor="w", pady=(px(4), px(4)))
+        for opt in mod.options:
+            var = tk.BooleanVar(value=opt["id"] in mod.selected)
+            self._option_vars.append((opt["id"], var))
+            row = ttk.Frame(inner, style="Card.TFrame")
+            row.pack(fill="x", pady=(px(10), 0))
+            t.checkbutton(row, opt["name"], var, card=True,
+                          command=lambda: self._on_options_changed(mod.id)).pack(side="left")
+            ttk.Button(row, text="이것만 사용", style="Link.TButton",
+                       command=lambda oid=opt["id"]: self._set_options(mod.id, [oid])).pack(side="right")
+            files = m.option_files(mod.id, opt["id"])
+            ttk.Label(inner, text=f"{kinds_text(classify(files))} · 파일 {len(files)}개",
+                      style="CardMuted.TLabel", font=t.fonts["small"]).pack(anchor="w", padx=(px(34), 0))
+        buttons = ttk.Frame(inner, style="Card.TFrame")
+        buttons.pack(fill="x", pady=(px(16), 0))
+        ttk.Button(buttons, text="모두 켜기", style="Compact.TButton",
+                   command=lambda: self._set_options(mod.id, [o["id"] for o in mod.options])).pack(side="left")
+        ttk.Button(buttons, text="모두 끄기", style="Compact.TButton",
+                   command=lambda: self._set_options(mod.id, [])).pack(side="left", padx=(px(6), 0))
+        self._bind_wheel(inner, self.options_canvas)
+        self.options_canvas.yview_moveto(0)
+
+    def _bind_wheel(self, widget, canvas: tk.Canvas):
+        def wheel(event):
+            delta = -1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4) else 1
+            canvas.yview_scroll(delta, "units")
+
+        for w in (widget, canvas):
+            w.bind("<MouseWheel>", wheel)
+            w.bind("<Button-4>", wheel)
+            w.bind("<Button-5>", wheel)
+        for child in widget.winfo_children():
+            self._bind_wheel(child, canvas)
+
+    def _on_options_changed(self, mod_id: str):
+        self._set_options(mod_id, [oid for oid, var in self._option_vars if var.get()])
+
+    def _set_options(self, mod_id: str, selected: list[str]):
+        if not self.can_mutate():
+            self.root.after_idle(self._update_details)  # put the checkboxes back
+            return
+        self.manager.set_options(mod_id, selected)
+        # rebuild after the click handler has returned (it destroys the clicked widget)
+        self.root.after_idle(lambda: self._changed(select=mod_id))
+
+    def show_options(self, mod_id: str):
+        self.tree.selection_set(mod_id)
+        self.tree.see(mod_id)
+        self._update_details()
+        self.notebook.select(self.options_tab)
 
     def _show_preview(self, path: Path | None):
         self._preview = None
@@ -856,6 +923,10 @@ class App:
     def _fill_files(self, mod: Mod, files: list[str]):
         deployed = self.manager.deployed_files()
         by_source = {(e.get("mod"), e.get("src")): e["path"] for e in deployed.values()}
+        entries = self.manager.mod_entries(mod.id)
+        if mod.needs_option:
+            self.files_tree.insert("", "end", values=("선택된 옵션이 없습니다 — '옵션' 탭에서 옵션을 켜세요", ""),
+                                   tags=("attention",))
         names = {x.id: x.name for x in self.manager.mods}
         conflicts = self._conflicts
         for i, rel in enumerate(files[:MAX_FILE_ROWS]):
@@ -864,7 +935,7 @@ class App:
             if not mod.enabled:
                 status, tag = "비활성", "pending"
             elif is_root_pak(rel):
-                target = by_source.get((mod.id, rel))
+                target = by_source.get((mod.id, entries[rel][1] if rel in entries else rel))
                 status = f"→ {target}" if target else "적용 대기"
                 tag = "" if target else "pending"
             elif conflicts and key in conflicts.owners and conflicts.winner(key) != mod.id:
@@ -1155,49 +1226,37 @@ class App:
                 self.root.after(1, self._next_install)
                 return
             variants = [raw]
-        elif len(variants) > 1:
-            chosen = VariantDialog(self.root, self.theme, name, variants).show()
-            if not chosen:
+
+        package = package_name(variants) if len(variants) > 1 else variants[0].name
+        existing = self.manager.find_by_name(package)
+        replace_id = None
+        if existing:
+            answer = messagebox.askyesnocancel(
+                "이미 설치된 모드",
+                f"'{existing.name}' 모드가 이미 있습니다.\n\n"
+                "예: 기존 모드를 새 파일로 교체 (업데이트)\n아니요: 별도의 모드로 추가\n취소: 설치하지 않음",
+                parent=self.root)
+            if answer is None:
                 session.cleanup()
                 self.root.after(1, self._next_install)
                 return
-            variants = chosen
-
-        plan = []
-        for v in variants:
-            existing = self.manager.find_by_name(v.name)
-            replace_id = None
-            if existing:
-                answer = messagebox.askyesnocancel(
-                    "이미 설치된 모드",
-                    f"'{existing.name}' 모드가 이미 있습니다.\n\n"
-                    "예: 기존 모드를 새 파일로 교체 (업데이트)\n아니요: 별도의 모드로 추가\n취소: 이 항목 건너뛰기",
-                    parent=self.root)
-                if answer is None:
-                    continue
-                replace_id = existing.id if answer else None
-            plan.append((v, replace_id))
-        if not plan:
-            session.cleanup()
-            self.root.after(1, self._next_install)
-            return
+            replace_id = existing.id if answer else None
 
         def work(progress):
             try:
-                mods = []
-                for i, (v, rid) in enumerate(plan):
-                    progress(i, len(plan), f"설치 중: {v.name}")
-                    mods.append(self.manager.install_variant(session, v, rid))
-                return mods
+                progress(0, 1, f"설치 중: {package}")
+                return self.manager.install_package(session, variants, replace_id)
             finally:
                 session.cleanup()
 
-        def done(mods):
-            for v, _ in plan:
+        def done(mod):
+            for v in variants:
                 if v.skipped:
                     log.info("  '%s'에서 게임에 필요 없는 파일 %d개는 제외했습니다 (예: %s)", v.name, len(v.skipped), v.skipped[0])
-            self.refresh(select=mods[-1].id if mods else None)
-            if any(mod.enabled for mod in mods):
+            self.refresh(select=mod.id)
+            if mod.options:
+                self.show_options(mod.id)
+            if mod.enabled:
                 self.request_apply()
             self.root.after(1, self._next_install)
 
@@ -1395,7 +1454,7 @@ class App:
     def open_mod_folder(self):
         mod = self._selected_mod()
         if mod:
-            fsutil.open_in_explorer(self.manager.files_dir(mod.id))
+            fsutil.open_in_explorer(self.manager.mod_dir(mod.id) if mod.options else self.manager.files_dir(mod.id))
 
     def open_settings(self):
         old_theme = self.manager.settings.theme
@@ -1479,6 +1538,8 @@ class App:
             menu.add_command(label="비활성화" if all(m.enabled for m in mods) else "활성화",
                              command=lambda: self.toggle(ids))
             if len(ids) == 1:
+                if mods[0].options:
+                    menu.add_command(label="옵션 선택...", command=lambda: self.show_options(ids[0]))
                 menu.add_separator()
                 menu.add_command(label="맨 위로", command=lambda: self.move_to_edge(True))
                 menu.add_command(label="맨 아래로 (최우선)", command=lambda: self.move_to_edge(False))

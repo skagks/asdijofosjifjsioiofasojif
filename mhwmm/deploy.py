@@ -55,6 +55,14 @@ class ModSource:
     name: str
     files_dir: Path
     files: list[str]  # game-relative posix paths
+    # Optional per-file (source file, source key); the default is files_dir/rel and rel.
+    # Mods with options keep each option in its own folder, so their keys name the option.
+    sources: dict[str, tuple[Path, str]] | None = None
+
+    def source(self, rel: str) -> tuple[Path, str]:
+        if self.sources is not None and rel in self.sources:
+            return self.sources[rel]
+        return self.files_dir / rel, rel
 
 
 @dataclass
@@ -239,7 +247,8 @@ class Deployer:
 
     @staticmethod
     def _source_item(src: ModSource, rel: str) -> dict | None:
-        st = fsutil.stat_or_none(src.files_dir / rel)
+        path, key = src.source(rel)
+        st = fsutil.stat_or_none(path)
         if st is None:
             log.warning("모드 '%s'의 파일이 없습니다: %s", src.name, rel)
             return None
@@ -247,8 +256,8 @@ class Deployer:
             "path": rel,
             "mod": src.mod_id,
             "mod_name": src.name,
-            "src": rel,
-            "src_path": src.files_dir / rel,
+            "src": key,
+            "src_path": path,
             "src_size": st.st_size,
             "src_mtime": st.st_mtime_ns,
             "pak": False,

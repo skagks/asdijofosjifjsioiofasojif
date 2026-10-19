@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, steam
-from .analyzer import Variant
+from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
 from .manager import InstallError, ModManager, acquire_instance_lock, default_data_dir, setup_logging
 
@@ -42,8 +42,13 @@ def _resolve(manager: ModManager, refs: list[str]):
     return mods
 
 
-def _variant_line(i: int, v: Variant) -> str:
-    return f"  [{i}] {v.name}  ({_kinds(v.kinds)}, {len(v.files)}개 파일)"
+def _print_options(manager: ModManager, mod) -> None:
+    for i, opt in enumerate(mod.options, 1):
+        files = manager.option_files(mod.id, opt["id"])
+        flag = "[x]" if opt["id"] in mod.selected else "[ ]"
+        print(f"  {i}. {flag} {opt['name']}  ({_kinds(classify(files))}, {len(files)}개 파일)")
+    if mod.needs_option:
+        print(f"  * 옵션을 활성화해 주세요: options {mod.id} --set <번호>")
 
 
 def cmd_list(manager: ModManager, args) -> int:
@@ -58,6 +63,8 @@ def cmd_list(manager: ModManager, args) -> int:
         flag = "[x]" if m.enabled else "[ ]"
         extra = f"  충돌 +{wins}/-{losses}" if wins or losses else ""
         version = f" v{m.version}" if m.version else ""
+        if m.options:
+            extra += "  옵션 선택 필요" if m.needs_option else f"  옵션 {len(m.selected)}/{len(m.options)}"
         print(f"{i:3d}. {flag} {m.name}{version}  ({_kinds(manager.mod_kinds(m.id))}, id={m.id}){extra}")
     if manager.dirty:
         print("\n* 적용되지 않은 변경사항이 있습니다. 'deploy'를 실행하세요.")
@@ -72,23 +79,39 @@ def cmd_install(manager: ModManager, args) -> int:
                 print("모드 구조를 인식하지 못했습니다. --raw 옵션으로 압축 내용을 그대로 설치할 수 있습니다.")
                 return 1
             variants = [session.raw_variant()]
-        elif len(variants) > 1 and not args.all and not args.variant:
-            print("여러 옵션이 들어 있습니다. --variant 번호 또는 --all 을 지정하세요:")
-            for i, v in enumerate(variants, 1):
-                print(_variant_line(i, v))
-            return 1
-        elif args.variant:
-            try:
-                variants = [variants[i - 1] for i in args.variant]
-            except IndexError:
-                raise SystemExit("잘못된 옵션 번호입니다.")
-        for v in variants:
-            existing = manager.find_by_name(v.name)
-            replace_id = existing.id if existing and args.replace else None
-            mod = manager.install_variant(session, v, replace_id)
-            if args.disabled and mod.enabled:
-                manager.set_enabled(mod.id, False)
-            print(f"설치: {mod.name}  ({_kinds(manager.mod_kinds(mod.id))}, {len(manager.mod_files(mod.id))}개 파일)")
+        if args.option and any(not 1 <= i <= len(variants) for i in args.option):
+            raise SystemExit("잘못된 옵션 번호입니다.")
+        selected = None
+        if args.all:
+            selected = list(range(len(variants)))
+        elif args.option:
+            selected = [i - 1 for i in args.option]
+        name = package_name(variants) if len(variants) > 1 else variants[0].name
+        existing = manager.find_by_name(name)
+        replace_id = existing.id if existing and args.replace else None
+        mod = manager.install_package(session, variants, replace_id, selected)
+        if args.disabled and mod.enabled:
+            manager.set_enabled(mod.id, False)
+        print(f"설치: {mod.name}  ({_kinds(manager.mod_kinds(mod.id))}, {len(manager.mod_files(mod.id))}개 파일)")
+        if mod.options:
+            _print_options(manager, mod)
+    return _maybe_deploy(manager, args)
+
+
+def cmd_options(manager: ModManager, args) -> int:
+    (mod,) = _resolve(manager, [args.mod])
+    if not mod.options:
+        print(f"'{mod.name}'에는 선택할 옵션이 없습니다.")
+        return 1
+    if args.set is None:
+        print(f"{mod.name} 옵션:")
+        _print_options(manager, mod)
+        return 0
+    if any(not 1 <= i <= len(mod.options) for i in args.set):
+        raise SystemExit("잘못된 옵션 번호입니다.")
+    manager.set_options(mod.id, [mod.options[i - 1]["id"] for i in args.set])
+    print(f"{mod.name} 옵션:")
+    _print_options(manager, mod)
     return _maybe_deploy(manager, args)
 
 
@@ -165,8 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("install", help="압축 파일/폴더/PAK에서 모드 설치")
     p.add_argument("path")
-    p.add_argument("--variant", type=int, action="append", help="설치할 옵션 번호 (여러 번 지정 가능)")
-    p.add_argument("--all", action="store_true", help="모든 옵션을 각각 설치")
+    p.add_argument("--option", "--variant", dest="option", type=int, action="append",
+                   help="옵션이 여러 개인 모드에서 바로 켤 옵션 번호 (여러 번 지정 가능, 기본값은 모두 꺼짐)")
+    p.add_argument("--all", action="store_true", help="모든 옵션을 켜기")
     p.add_argument("--raw", action="store_true", help="구조 분석 없이 그대로 설치")
     p.add_argument("--replace", action="store_true", help="같은 이름의 모드가 있으면 교체")
     p.add_argument("--disabled", action="store_true", help="비활성 상태로 설치")
@@ -182,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("position", type=int, help="1부터 시작하는 위치 (아래일수록 우선)")
     p.add_argument("--no-deploy", action="store_true")
 
+    p = sub.add_parser("options", help="모드의 옵션 보기/선택")
+    p.add_argument("mod", help="모드 id, 번호 또는 이름")
+    p.add_argument("--set", type=int, nargs="*", metavar="번호", help="켤 옵션 번호들 (나머지는 꺼짐, 비우면 모두 끔)")
+    p.add_argument("--no-deploy", action="store_true")
+
     sub.add_parser("deploy", help="활성화된 모드를 게임 폴더에 적용")
     sub.add_parser("purge", help="게임 폴더에서 모든 모드 파일 제거")
     sub.add_parser("verify", help="적용된 파일 점검")
@@ -194,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 READ_ONLY_COMMANDS = ("list", "verify")
 COMMANDS = {
-    "list": cmd_list, "install": cmd_install, "enable": cmd_toggle, "disable": cmd_toggle,
+    "list": cmd_list, "install": cmd_install, "options": cmd_options, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game,
 }

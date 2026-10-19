@@ -159,3 +159,54 @@ def test_instance_lock(tmp_path):
     second = acquire_instance_lock(tmp_path)
     assert second is not None
     second.close()
+
+
+def test_options_are_off_until_chosen(manager, game_dir, tmp_path):
+    archive = make_zip(tmp_path / "Colors-55-1-0-1740000000.zip", {
+        "Colors/Red/natives/STM/a.tex": "red",
+        "Colors/Red/natives/STM/red_only.tex": "r",
+        "Colors/Blue/natives/STM/a.tex": "blue",
+        "Colors/Blue/x.pak": "bluepak",
+    })
+    with manager.prepare_install(archive) as session:
+        mod = manager.install_package(session, session.variants)
+    assert mod.name == "Colors" and mod.version == "1.0"
+    assert [o["name"] for o in mod.options] == ["Blue", "Red"]
+    assert mod.needs_option and manager.mod_files(mod.id) == []
+    manager.deploy()
+    assert not (game_dir / "natives").exists()
+
+    blue, red = (o["id"] for o in mod.options)
+    manager.set_options(mod.id, [red])
+    assert manager.dirty
+    manager.deploy()
+    assert (game_dir / "natives/STM/a.tex").read_text() == "red"
+    assert (game_dir / "natives/STM/red_only.tex").exists()
+    assert not (game_dir / f"{CHAIN}.patch_002.pak").exists()
+
+    manager.set_options(mod.id, [blue])
+    manager.deploy()
+    assert (game_dir / "natives/STM/a.tex").read_text() == "blue"
+    assert not (game_dir / "natives/STM/red_only.tex").exists()
+    assert (game_dir / f"{CHAIN}.patch_002.pak").read_text() == "bluepak"
+
+    manager.set_options(mod.id, [red, blue])  # both on: the later option wins shared files
+    manager.deploy()
+    assert (game_dir / "natives/STM/a.tex").read_text() == "red"
+    assert (game_dir / f"{CHAIN}.patch_002.pak").read_text() == "bluepak"
+    assert ModManager(manager.data_dir).get(mod.id).selected == [blue, red]
+
+    # an update keeps the chosen options by name; new options start switched off
+    update = make_zip(tmp_path / "v2" / "Colors-55-1-1-1750000000.zip", {
+        "Colors/Red/natives/STM/a.tex": "red2",
+        "Colors/Blue/natives/STM/a.tex": "blue2",
+        "Colors/Green/natives/STM/a.tex": "green",
+    })
+    with manager.prepare_install(update) as session:
+        updated = manager.install_package(session, session.variants, replace_id=mod.id)
+    assert updated.version == "1.1"
+    names = {o["id"]: o["name"] for o in updated.options}
+    assert sorted(names[i] for i in updated.selected) == ["Blue", "Red"]
+    manager.deploy()
+    assert (game_dir / "natives/STM/a.tex").read_text() == "red2"
+    assert not (game_dir / f"{CHAIN}.patch_002.pak").exists()

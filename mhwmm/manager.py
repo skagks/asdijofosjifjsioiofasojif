@@ -10,12 +10,12 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
 from . import fsutil, steam
-from .analyzer import Variant, analyze, classify, list_files, raw_variant
+from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
 from .constants import DEFAULT_PAK_CHAIN, GAME_EXE, PAK_CHAIN_RE, REFRAMEWORK_DLL
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
@@ -121,6 +121,8 @@ def _from_dict(cls, data: dict):
             continue
         if isinstance(default, str) and not isinstance(v, str):
             continue
+        if f.default_factory is list and not isinstance(v, list):
+            continue
         kwargs[k] = v
     return cls(**kwargs)
 
@@ -147,6 +149,21 @@ class Mod:
     installed_at: str = ""
     updated_at: str = ""
     screenshot: str = ""
+    # Archives with several variants become one mod with options: [{"id": "o1", "name": ...}].
+    # Only the options listed in ``selected`` are deployed (none right after install).
+    options: list = field(default_factory=list)
+    selected: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.options = [o for o in self.options
+                        if isinstance(o, dict) and isinstance(o.get("id"), str) and isinstance(o.get("name"), str)]
+        ids = [o["id"] for o in self.options]
+        self.selected = [i for i in ids if i in self.selected]
+
+    @property
+    def needs_option(self) -> bool:
+        """True for a mod with options of which none is selected yet."""
+        return bool(self.options) and not self.selected
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -236,7 +253,8 @@ class ModManager:
         self.settings = Settings()
         self.dirty = False
         self.revision = 0  # bumped on every change that affects deployment
-        self._files_cache: dict[str, list[str]] = {}
+        self._entries_cache: dict[str, dict[str, tuple[Path, str]]] = {}
+        self._option_cache: dict[tuple[str, str], list[str]] = {}
         self._size_cache: dict[str, int] = {}
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.mods_dir.mkdir(exist_ok=True)
@@ -255,13 +273,13 @@ class ModManager:
         mods = []
         for raw in data.get("mods") or []:
             m = _from_dict(Mod, raw)
-            if m and m.id and (self.mods_dir / m.id / "files").is_dir():
+            if m and m.id and self._has_payload(self.mods_dir / m.id):
                 mods.append(m)
             elif m and m.id:
                 log.warning("모드 파일이 없어 목록에서 제외합니다: %s", m.name or m.id)
         known = {m.id for m in mods}
         for d in sorted(self.mods_dir.iterdir()) if self.mods_dir.is_dir() else []:
-            if d.name.startswith(".") or d.name in known or not (d / "files").is_dir():
+            if d.name.startswith(".") or d.name in known or not self._has_payload(d):
                 continue
             m = _from_dict(Mod, fsutil.read_json(d / "mod.json", {})) or Mod()
             m.id = d.name
@@ -270,6 +288,16 @@ class ModManager:
             mods.append(m)
             log.warning("목록에 없던 모드를 복구했습니다: %s", m.name)
         self.mods = mods
+
+    @staticmethod
+    def _has_payload(mod_dir: Path) -> bool:
+        return (mod_dir / "files").is_dir() or (mod_dir / "options").is_dir()
+
+    def _invalidate(self, mod_id: str) -> None:
+        self._entries_cache.pop(mod_id, None)
+        self._size_cache.pop(mod_id, None)
+        for key in [k for k in self._option_cache if k[0] == mod_id]:
+            del self._option_cache[key]
 
     def save(self) -> None:
         fsutil.atomic_write_json(self.state_path, {
@@ -368,22 +396,54 @@ class ModManager:
     def files_dir(self, mod_id: str) -> Path:
         return self.mods_dir / mod_id / "files"
 
+    def option_dir(self, mod_id: str, option_id: str) -> Path:
+        return self.mods_dir / mod_id / "options" / option_id
+
+    def option_files(self, mod_id: str, option_id: str) -> list[str]:
+        key = (mod_id, option_id)
+        if key not in self._option_cache:
+            self._option_cache[key] = list_files(self.option_dir(mod_id, option_id))
+        return self._option_cache[key]
+
+    def mod_entries(self, mod_id: str) -> dict[str, tuple[Path, str]]:
+        """Files the mod puts into the game: game path -> (stored file, source key).
+
+        For a mod with options these are the files of the selected options; when two
+        options contain the same path the later option wins."""
+        entries = self._entries_cache.get(mod_id)
+        if entries is not None:
+            return entries
+        mod = self.get(mod_id)
+        entries = {}
+        if not mod.options:
+            base = self.files_dir(mod_id)
+            entries = {rel: (base / rel, rel) for rel in list_files(base)}
+        else:
+            by_key: dict[str, str] = {}
+            for opt in mod.options:
+                if opt["id"] not in mod.selected:
+                    continue
+                base = self.option_dir(mod_id, opt["id"])
+                for rel in self.option_files(mod_id, opt["id"]):
+                    k = path_key(rel)
+                    if k in by_key:
+                        del entries[by_key[k]]
+                    by_key[k] = rel
+                    entries[rel] = (base / rel, f"{opt['id']}/{rel}")
+        self._entries_cache[mod_id] = entries
+        return entries
+
     def mod_files(self, mod_id: str) -> list[str]:
-        files = self._files_cache.get(mod_id)
-        if files is None:
-            files = list_files(self.files_dir(mod_id))
-            self._files_cache[mod_id] = files
-        return files
+        return list(self.mod_entries(mod_id))
 
     def mod_kinds(self, mod_id: str) -> set[str]:
         return classify(self.mod_files(mod_id))
 
     def mod_size(self, mod_id: str) -> int:
         if mod_id not in self._size_cache:
-            base = self.files_dir(mod_id)
             total = 0
-            for rel in self.mod_files(mod_id):
-                st = fsutil.stat_or_none(base / rel)
+            for path, _ in self.mod_entries(mod_id).values():
+                st = fsutil.stat_or_none(path)
                 total += st.st_size if st else 0
             self._size_cache[mod_id] = total
         return self._size_cache[mod_id]
@@ -418,6 +478,22 @@ class ModManager:
             mod.enabled = enabled
             self._changed()
 
+    def set_options(self, mod_id: str, selected: list[str]) -> None:
+        """Choose which options of a mod are used (kept in option order)."""
+        mod = self.get(mod_id)
+        wanted = set(selected)
+        new = [o["id"] for o in mod.options if o["id"] in wanted]
+        if new == mod.selected:
+            return
+        mod.selected = new
+        self._invalidate(mod_id)
+        self._write_mod_meta(mod)
+        if mod.enabled:
+            self._changed()
+        else:
+            self.revision += 1
+            self.save()
+
     def move_to(self, mod_id: str, index: int) -> None:
         mod = self.get(mod_id)
         old = self.mods.index(mod)
@@ -444,8 +520,7 @@ class ModManager:
         """Forget a mod and delete its stored files. Deployed copies go on the next deploy."""
         mod = self.get(mod_id)
         self.mods.remove(mod)
-        self._files_cache.pop(mod_id, None)
-        self._size_cache.pop(mod_id, None)
+        self._invalidate(mod_id)
         self.revision += 1
         if mod.enabled:
             self.dirty = True
@@ -494,39 +569,62 @@ class ModManager:
             raise
 
     def install_variant(self, session: InstallSession, variant: Variant, replace_id: str | None = None) -> Mod:
-        if not variant.files:
+        return self.install_package(session, [variant], replace_id)
+
+    def install_package(self, session: InstallSession, variants: list[Variant], replace_id: str | None = None,
+                        selected: list[int] | None = None) -> Mod:
+        """Install ``variants`` as one mod. Several variants become options of that mod.
+
+        ``selected`` lists the indexes of options to switch on; by default none are, and
+        an updated mod keeps the options (by name) that were on before."""
+        variants = [v for v in variants if v.files]
+        if not variants:
             raise InstallError("설치할 파일이 없습니다.")
+        multi = len(variants) > 1
         mod_id = replace_id or uuid.uuid4().hex[:10]
         stage = self.mods_dir / f".{mod_id}.staging-{uuid.uuid4().hex[:6]}"
-        files_dir = stage / "files"
+        options = [{"id": f"o{i + 1}", "name": v.option or v.name} for i, v in enumerate(variants)] if multi else []
         try:
-            seen = set()
-            for src_rel, dst_rel in variant.files:
-                key = path_key(dst_rel)
-                if key in seen:
-                    log.warning("같은 경로의 파일이 여러 개라 마지막 것을 사용합니다: %s", dst_rel)
-                seen.add(key)
-                src = session.base / src_rel
-                dst = files_dir / dst_rel
-                if session.owns_files:
-                    fsutil.move_file(src, dst)
-                else:
-                    fsutil.copy_file(src, dst)
-            fsutil.makedirs(files_dir)
+            for i, variant in enumerate(variants):
+                target = stage / "options" / options[i]["id"] if multi else stage / "files"
+                seen = set()
+                for src_rel, dst_rel in variant.files:
+                    key = path_key(dst_rel)
+                    if key in seen:
+                        log.warning("같은 경로의 파일이 여러 개라 마지막 것을 사용합니다: %s", dst_rel)
+                    seen.add(key)
+                    src = session.base / src_rel
+                    dst = target / dst_rel
+                    if session.owns_files:
+                        fsutil.move_file(src, dst)
+                    else:
+                        fsutil.copy_file(src, dst)
+                fsutil.makedirs(target)
             screenshot = ""
-            if variant.screenshot and (session.base / variant.screenshot).is_file():
-                screenshot = "preview" + Path(variant.screenshot).suffix.lower()
-                fsutil.copy_file(session.base / variant.screenshot, stage / screenshot)
+            shot = next((v.screenshot for v in variants
+                         if v.screenshot and (session.base / v.screenshot).is_file()), None)
+            if shot:
+                screenshot = "preview" + Path(shot).suffix.lower()
+                fsutil.copy_file(session.base / shot, stage / screenshot)
 
-            info = variant.info
+            info = next((v.info for v in variants if v.info), None)
+            version = next((v.version for v in variants if v.version), "")
             now = _now()
+            old_selected: set[str] = set()
             if replace_id:
                 mod = self.get(replace_id)
                 mod.updated_at = now
+                old_selected = {o["name"] for o in mod.options if o["id"] in mod.selected}
             else:
-                mod = Mod(id=mod_id, name=self._unique_name(variant.name),
+                name = package_name(variants) if multi else variants[0].name
+                mod = Mod(id=mod_id, name=self._unique_name(name),
                           enabled=self.settings.enable_on_install, installed_at=now)
-            mod.version = variant.version or (mod.version if replace_id else "")
+            mod.options = options
+            if selected is not None:
+                mod.selected = [options[i]["id"] for i in selected if 0 <= i < len(options)]
+            else:
+                mod.selected = [o["id"] for o in options if o["name"] in old_selected]
+            mod.version = version or (mod.version if replace_id else "")
             mod.author = (info.author if info else "") or (mod.author if replace_id else "")
             mod.description = (info.description if info else "") or (mod.description if replace_id else "")
             mod.category = (info.category if info else "") or (mod.category if replace_id else "")
@@ -546,15 +644,17 @@ class ModManager:
             fsutil.rmtree(stage)
             raise
 
-        self._files_cache.pop(mod_id, None)
-        self._size_cache.pop(mod_id, None)
+        self._invalidate(mod_id)
         if not replace_id:
             self.mods.append(mod)
         if mod.enabled:
             self.revision += 1
             self.dirty = True
         self.save()
-        log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
+        if mod.options:
+            log.info("설치 완료: %s (옵션 %d개, 사용할 옵션을 골라 주세요)", mod.name, len(mod.options))
+        else:
+            log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
         return mod
 
     def _unique_name(self, name: str) -> str:
@@ -569,10 +669,11 @@ class ModManager:
     # ------------------------------------------------------------- deploy
     def prepare_deploy(self) -> tuple[list[ModSource], int]:
         """Snapshot of what to deploy, taken on the caller's thread."""
-        sources = [
-            ModSource(m.id, m.name, self.files_dir(m.id), list(self.mod_files(m.id)))
-            for m in self.mods if m.enabled
-        ]
+        sources = []
+        for m in self.mods:
+            if m.enabled:
+                entries = self.mod_entries(m.id)
+                sources.append(ModSource(m.id, m.name, self.mod_dir(m.id), list(entries), dict(entries)))
         return sources, self.revision
 
     def run_deploy(self, sources: list[ModSource], progress: ProgressFn | None = None) -> DeployReport:

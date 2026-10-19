@@ -121,9 +121,10 @@ class Theme:
             self._images[key] = tk.PhotoImage(master=self.root, data=variants[best])
         return self._images[key]
 
-    def checkbutton(self, parent, text: str, variable: tk.Variable, **kwargs) -> ttk.Checkbutton:
+    def checkbutton(self, parent, text: str, variable: tk.Variable, card: bool = False, **kwargs) -> ttk.Checkbutton:
         """Checkbutton drawn with the same checkbox images as the mod list."""
-        return ttk.Checkbutton(parent, text="  " + text, variable=variable, style="Image.TCheckbutton",
+        return ttk.Checkbutton(parent, text="  " + text, variable=variable,
+                               style="CardImage.TCheckbutton" if card else "Image.TCheckbutton",
                                compound="left", image=(self.image("check_off", 18), "selected",
                                                        self.image("check_on", 18)), **kwargs)
 
@@ -206,6 +207,10 @@ class Theme:
         s.configure("Display.TLabel", background=p["surface"], foreground=p["accent"], font=f["display"])
         s.configure("EmptyTitle.TLabel", background=p["surface"], font=f["section"])
         s.configure("DialogTitle.TLabel", background=p["bg"], font=f["section"])
+        s.configure("CardTitle.TLabel", background=p["surface"], font=f["detail_title"])
+        s.configure("Callout.TFrame", background=p["warn_bg"])
+        s.configure("CalloutTitle.TLabel", background=p["warn_bg"], foreground=p["warn"], font=f["bold"])
+        s.configure("Callout.TLabel", background=p["warn_bg"], foreground=p["text"])
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
         for kind, fg, bg in (("Ok", "success", "success_bg"), ("Warn", "warn", "warn_bg"),
                              ("Bad", "danger", "danger_bg"), ("Neutral", "chip_text", "chip")):
@@ -261,10 +266,10 @@ class Theme:
             s.map(style, background=[("active", bg)],
                   indicatorbackground=[("selected", p["accent"]), ("active", p["hover"])],
                   upperbordercolor=[("selected", p["accent"])], lowerbordercolor=[("selected", p["accent"])])
-        for style in ("Switch.TCheckbutton", "Image.TCheckbutton"):
-            s.configure(style, background=p["bg"], foreground=p["text"], focuscolor=p["bg"],
-                        padding=(px(4), px(4)))
-            s.map(style, background=[("active", p["bg"])])
+        for style, bg in (("Switch.TCheckbutton", p["bg"]), ("Image.TCheckbutton", p["bg"]),
+                          ("CardImage.TCheckbutton", p["surface"])):
+            s.configure(style, background=bg, foreground=p["text"], focuscolor=bg, padding=(px(4), px(4)))
+            s.map(style, background=[("active", bg)])
             s.layout(style, [("Checkbutton.padding", {"sticky": "nswe", "children": [
                 ("Checkbutton.label", {"sticky": "nswe"})]})])
 

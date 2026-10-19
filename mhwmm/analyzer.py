@@ -10,7 +10,8 @@ Mods for Monster Hunter Wilds come in a handful of layouts:
 * Fluffy Mod Manager packages: one folder per option, each with a ``modinfo.ini``
 
 Archives often wrap these in one or more extra folders, and some contain several
-alternative options.  Every folder that holds mod content becomes a ``Variant``.
+options.  Every folder that holds mod content becomes a ``Variant``; an archive with
+several of them is installed as one mod whose options can be switched later.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -82,6 +84,8 @@ class Variant:
     info: ModInfo | None = None
     screenshot: str | None = None  # archive path of a preview image
     version: str = ""
+    package: str = ""  # name of the mod this variant belongs to
+    option: str = ""  # name of the variant as an option of that mod
 
     @property
     def targets(self) -> list[str]:
@@ -293,22 +297,32 @@ def _name_variants(variants: list[Variant], infos: dict[str, ModInfo], base_name
         v = variants[0]
         inherited = _inherited_info(v.root, infos)
         v.name = (v.info and v.info.name) or (inherited and inherited.name) or base_name
+        v.package = v.option = v.name
         return
     common = _common_dir([v.root for v in variants])
     for v in variants:
-        if v.info and v.info.name:
-            v.name = v.info.name
-            continue
         inherited = _inherited_info(v.root, infos)
         parent = (inherited and inherited.name) or base_name
         rel = _rel_to(v.root, common) if v.root != common else ""
-        v.name = f"{parent} - {rel.replace('/', ' / ')}" if rel else parent
-    seen: dict[str, int] = {}
-    for v in variants:
-        key = v.name.casefold()
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] > 1:
-            v.name = f"{v.name} ({seen[key]})"
+        v.package = parent
+        if v.info and v.info.name:
+            v.name = v.option = v.info.name
+        else:
+            v.option = rel.replace("/", " / ") if rel else parent
+            v.name = f"{parent} - {v.option}" if rel else parent
+    for attr in ("name", "option"):
+        seen: dict[str, int] = {}
+        for v in variants:
+            key = getattr(v, attr).casefold()
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > 1:
+                setattr(v, attr, f"{getattr(v, attr)} ({seen[key]})")
+
+
+def package_name(variants: list[Variant]) -> str:
+    """Name for the single mod that holds all ``variants`` as options."""
+    names = Counter(v.package or v.name for v in variants)
+    return names.most_common(1)[0][0] if names else ""
 
 
 def raw_variant(base, archive_name: str = "") -> Variant:
@@ -327,4 +341,6 @@ def raw_variant(base, archive_name: str = "") -> Variant:
         root=prefix.rstrip("/"),
         files=[(f, f[len(prefix):]) for f in files],
         version=version,
+        package=name,
+        option=name,
     )

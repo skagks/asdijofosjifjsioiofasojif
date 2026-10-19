@@ -1,4 +1,4 @@
-from mhwmm.analyzer import analyze, clean_archive_name, raw_variant
+from mhwmm.analyzer import analyze, clean_archive_name, package_name, raw_variant
 
 from conftest import make_tree
 
@@ -52,6 +52,8 @@ def test_fluffy_variants(tmp_path):
     assert red.version == "2.0"  # inherited from parent modinfo
     blue = by_name["Pack - Blue"]
     assert blue.version == "2.0"
+    assert (red.option, blue.option) == ("Red Option", "Blue")
+    assert package_name(variants) == "Pack"
     assert mapping(blue) == {"Pack/Blue/natives/STM/a.tex": "natives/STM/a.tex"}
 
 

@@ -11,7 +11,8 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
 - **압축 파일 그대로 설치**: zip / 7z / rar / 폴더 / 단일 `.pak`·`.lua`·`.dll` 파일
   - 압축 안의 폴더 구조를 분석해서 게임 폴더 기준 위치를 자동으로 찾습니다.
   - Fluffy Mod Manager 형식(`modinfo.ini`)의 이름·제작자·버전·설명·미리보기 이미지를 읽습니다.
-  - 옵션이 여러 개 들어 있는 모드는 설치할 옵션을 고르는 창이 뜹니다.
+  - 옵션이 여러 개 들어 있는 압축 파일은 **모드 하나로 설치**되고, 옵션은 설치한 뒤 언제든 **옵션** 탭에서
+    켜고 끌 수 있습니다. 처음에는 모든 옵션이 꺼져 있으니 사용할 옵션을 골라 주세요(여러 개 함께 켤 수 있음).
   - Nexus 파일 이름(`이름-123-1-2-1740000000.zip`)에서 모드 이름과 버전을 뽑아냅니다.
   - 한글 파일 이름이 들어 있는 zip(cp949)도 깨지지 않습니다.
 - **모든 모드 형식 지원**
@@ -111,7 +112,9 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
 ```
 python -m mhwmm list                         # 모드 목록
 python -m mhwmm game [경로]                  # 게임 폴더 설정 (생략 시 자동 감지)
-python -m mhwmm install 모드.zip [--variant 2 | --all] [--replace] [--disabled]
+python -m mhwmm install 모드.zip [--option 2 | --all] [--replace] [--disabled]
+python -m mhwmm options "모드 이름"             # 옵션 목록 보기
+python -m mhwmm options "모드 이름" --set 1 3   # 1번, 3번 옵션만 켜기
 python -m mhwmm enable 1 "모드 이름"          # 번호, 이름, id로 지정
 python -m mhwmm disable 3
 python -m mhwmm move "모드 이름" 5            # 로드 순서 변경 (아래일수록 우선)

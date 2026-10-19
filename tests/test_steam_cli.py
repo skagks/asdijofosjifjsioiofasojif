@@ -46,12 +46,16 @@ def test_cli_end_to_end(tmp_path, game_dir, capsys):
         "Opts/B/natives/STM/a.tex": "b",
     })
     assert main(["--data-dir", data, "game", str(game_dir)]) == 0
-    assert main(["--data-dir", data, "install", str(archive)]) == 1  # needs a variant choice
-    assert "[2]" in capsys.readouterr().out
-    assert main(["--data-dir", data, "install", str(archive), "--variant", "2"]) == 0
+    # one mod with two options, all switched off until the user picks one
+    assert main(["--data-dir", data, "install", str(archive)]) == 0
+    assert "옵션을 활성화해 주세요" in capsys.readouterr().out
+    assert not (game_dir / "natives").exists()
+    assert main(["--data-dir", data, "options", "1", "--set", "2"]) == 0
     assert (game_dir / "natives/STM/a.tex").read_text() == "b"
+    assert main(["--data-dir", data, "options", "Opts", "--set", "1"]) == 0
+    assert (game_dir / "natives/STM/a.tex").read_text() == "a"
     assert main(["--data-dir", data, "list"]) == 0
-    assert "Opts - B" in capsys.readouterr().out
+    assert "옵션 1/2" in capsys.readouterr().out
     assert main(["--data-dir", data, "disable", "1"]) == 0
     assert not (game_dir / "natives").exists()
     assert main(["--data-dir", data, "verify"]) == 0

@@ -64,8 +64,22 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     assert (game_dir / "natives/STM/a.tex").read_text() == "a"
     assert app.tree.item(b.id, "image")[0] == str(app.theme.image("check_off", 20))
 
+    # a mod with options starts with all of them off and is applied once one is chosen
+    with manager.prepare_install(make_zip(tmp_path / "Opts.zip", {
+            "Opts/One/natives/STM/o.tex": "1", "Opts/Two/natives/STM/o.tex": "2"})) as s:
+        opts = manager.install_package(s, s.variants)
+    app.refresh()
+    assert "옵션을 선택하세요" in app.tree.item(opts.id, "values")[1]
+    app.show_options(opts.id)
+    assert app.notebook.select() == str(app.options_tab)
+    app._option_vars[1][1].set(True)
+    app._on_options_changed(opts.id)
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    assert (game_dir / "natives/STM/o.tex").read_text() == "2"
+    assert "옵션 1/2" in app.tree.item(opts.id, "values")[1]
+
     app.apply_theme("light")  # switching themes repaints without errors
     app.search_var.set("zzz")
     assert app.tree.get_children() == ()
     app.search_var.set("")
-    assert len(app.tree.get_children()) == 2
+    assert len(app.tree.get_children()) == 3
