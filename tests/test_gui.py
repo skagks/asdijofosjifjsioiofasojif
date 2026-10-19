@@ -46,7 +46,7 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     app = gui.App(root, manager, queue.Queue())
     pump(root, lambda: True)
     assert list(app.tree.get_children()) == [a.id, b.id]
-    assert "밀림 1" in app.tree.item(a.id, "values")[5]
+    assert "밀림 1" in app.tree.item(a.id, "values")[6]
 
     app.tree.selection_set(a.id)
     app._update_details()
@@ -69,14 +69,15 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
             "Opts/One/natives/STM/o.tex": "1", "Opts/Two/natives/STM/o.tex": "2"})) as s:
         opts = manager.install_package(s, s.variants)
     app.refresh()
-    assert "옵션을 선택하세요" in app.tree.item(opts.id, "values")[1]
+    assert app.tree.item(opts.id, "values")[1] == "Opts"
+    assert app.tree.item(opts.id, "values")[4] == "선택 필요"
     app.show_options(opts.id)
     assert app.notebook.select() == str(app.options_tab)
     app._option_vars[1][1].set(True)
     app._on_options_changed(opts.id)
     pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
     assert (game_dir / "natives/STM/o.tex").read_text() == "2"
-    assert "옵션 1/2" in app.tree.item(opts.id, "values")[1]
+    assert app.tree.item(opts.id, "values")[4] == "1/2"
 
     # a newer release shows the update button and its dialog
     from mhwmm.updater import Release

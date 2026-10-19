@@ -510,7 +510,7 @@ class App:
 
         area = ttk.Frame(left, style="Card.TFrame")
         area.pack(fill="both", expand=True, padx=px(6), pady=(0, px(6)))
-        cols = ("order", "name", "kind", "version", "files", "conflict")
+        cols = ("order", "name", "kind", "version", "options", "files", "conflict")
         self.tree = ttk.Treeview(area, columns=cols, show="tree headings", selectmode="extended")
         self.tree.heading("#0", text="")
         self.tree.column("#0", width=px(46), minwidth=px(46), stretch=False)
@@ -519,6 +519,7 @@ class App:
             ("name", "이름", 190, "w", True),
             ("kind", "종류", 140, "w", False),
             ("version", "버전", 56, "w", False),
+            ("options", "옵션", 70, "center", False),
             ("files", "파일", 46, "e", False),
             ("conflict", "충돌", 118, "w", False),
         ):
@@ -694,11 +695,11 @@ class App:
                 tags.append("attention")
             elif losses and not wins and losses == sum(1 for f in files if not is_root_pak(f)):
                 tags.append("overridden")
-            name = mod.name
+            options = ""
             if mod.options:
-                name += ("   ·  옵션을 선택하세요" if mod.needs_option
-                         else f"   ·  옵션 {len(mod.selected)}/{len(mod.options)}")
-            values = (index + 1, name, kinds_short(self._display_kinds(mod)), mod.version, len(files), conflict)
+                options = "선택 필요" if mod.needs_option else f"{len(mod.selected)}/{len(mod.options)}"
+            values = (index + 1, mod.name, kinds_short(self._display_kinds(mod)), mod.version, options,
+                      len(files), conflict)
             image = on if mod.enabled else off
             if mod.id in existing:
                 self.tree.item(mod.id, image=image, values=values, tags=tags)
