@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from . import fsutil, steam
+from . import fsutil, nexus, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
 from .constants import DEFAULT_PAK_CHAIN, GAME_EXE, PAK_CHAIN_RE, REFRAMEWORK_DLL, REFW_ORIGIN
@@ -219,11 +219,15 @@ def _from_dict(cls, data: dict):
             continue
         if isinstance(default, str) and not isinstance(v, str):
             continue
+        if isinstance(default, int) and not isinstance(default, bool) and (isinstance(v, bool) or not isinstance(v, int)):
+            continue
         if isinstance(default, float):
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 continue
             v = float(v)
         if f.default_factory is list and not isinstance(v, list):
+            continue
+        if f.default_factory is dict and not isinstance(v, dict):
             continue
         kwargs[k] = v
     return cls(**kwargs)
@@ -238,6 +242,9 @@ class Settings:
     check_game_running: bool = True
     check_updates: bool = True
     check_refw_updates: bool = True
+    nexus_api_key: str = ""
+    check_mod_updates: bool = True
+    last_mod_check: float = 0.0
     confirm_remove: bool = True
     apply_before_launch: bool = True
     minimize_on_launch: bool = False
@@ -266,6 +273,17 @@ class Mod:
     options: list = field(default_factory=list)
     selected: list = field(default_factory=list)
     origin: str = ""  # "reframework" for the REFramework installed by the REFramework updater
+    # Nexus Mods page of the mod and the upload time of the installed file (0 = unknown)
+    nexus_id: int = 0
+    nexus_file_time: int = 0
+    nexus_exact: bool = True  # nexus_file_time is to the second (not only the minute)
+    nexus_checked: int = 0  # last time this mod was looked up on Nexus
+    nexus_unlinked: bool = False  # the user removed the link: don't guess it from the file name again
+    update: dict = field(default_factory=dict)  # newer file found on Nexus: {"version", "file", "uploaded"}
+
+    @property
+    def nexus_url(self) -> str:
+        return nexus.MOD_URL.format(self.nexus_id) if self.nexus_id else ""
 
     def __post_init__(self):
         self.options = [o for o in self.options
@@ -827,6 +845,13 @@ class ModManager:
                 name = package_name(variants) if multi else variants[0].name
                 mod = Mod(id=mod_id, name=self._unique_name(name),
                           enabled=self.settings.enable_on_install, installed_at=now)
+            ref = nexus.parse_source_name(session.source.name)
+            if ref:
+                mod.nexus_id, mod.nexus_file_time, mod.nexus_exact = ref.mod_id, ref.uploaded, ref.exact
+                mod.nexus_unlinked = False
+            else:
+                mod.nexus_file_time = 0  # keep a manually linked page, but the file is unknown
+            mod.update, mod.nexus_checked = {}, 0
             mod.options = options
             if selected is not None:
                 mod.selected = [options[i]["id"] for i in selected if 0 <= i < len(options)]
@@ -864,6 +889,62 @@ class ModManager:
         else:
             log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
         return mod
+
+    # ------------------------------------------------------------- Nexus
+    def link_nexus(self, mod_id: str, text: str) -> int:
+        """Connect a mod to its Nexus page (link or mod number). Returns the Nexus mod id."""
+        mod = self.get(mod_id)
+        nexus_id = nexus.parse_mod_ref(text)
+        if nexus_id != mod.nexus_id:
+            mod.nexus_id, mod.nexus_file_time, mod.nexus_checked, mod.update = nexus_id, 0, 0, {}
+            mod.nexus_unlinked = False
+            self._write_mod_meta(mod)
+            self.save()
+        return nexus_id
+
+    def unlink_nexus(self, mod_id: str) -> None:
+        mod = self.get(mod_id)
+        mod.nexus_id, mod.nexus_file_time, mod.nexus_checked, mod.update = 0, 0, 0, {}
+        mod.nexus_unlinked = True
+        self._write_mod_meta(mod)
+        self.save()
+
+    def nexus_items(self) -> list[nexus.CheckItem]:
+        """Mods connected to Nexus (reading older installs' original file names first)."""
+        changed = False
+        for m in self.mods:
+            if not m.nexus_id and not m.nexus_unlinked and m.origin != REFW_ORIGIN:
+                ref = nexus.parse_source_name(m.source)
+                if ref:
+                    m.nexus_id, m.nexus_file_time, m.nexus_exact = ref.mod_id, ref.uploaded, ref.exact
+                    changed = True
+        if changed:
+            self.save()
+        return [nexus.CheckItem(m.id, m.nexus_id, m.nexus_file_time, m.nexus_exact, m.version, m.nexus_checked)
+                for m in self.mods if m.nexus_id]
+
+    def find_existing(self, name: str, source: str = "") -> Mod | None:
+        """The installed mod a new download probably updates: same name, or else the same Nexus mod."""
+        mod = self.find_by_name(name)
+        ref = nexus.parse_source_name(source) if mod is None else None
+        if ref:
+            same = [m for m in self.mods if m.nexus_id == ref.mod_id and m.origin != REFW_ORIGIN]
+            mod = same[0] if len(same) == 1 else None
+        return mod
+
+    def set_update_results(self, results: dict[str, dict | None]) -> None:
+        """Store what a Nexus check found (None keeps the previous result: nothing new since)."""
+        now = int(time.time())
+        for mod_id, update in results.items():
+            try:
+                mod = self.get(mod_id)
+            except KeyError:
+                continue  # removed while checking
+            if update is not None:
+                mod.update = dict(update)
+            mod.nexus_checked = now
+        self.settings.last_mod_check = time.time()
+        self.save()
 
     def refw_mod(self) -> Mod | None:
         """The mod that provides REFramework's dinput8.dll, if one is installed here."""

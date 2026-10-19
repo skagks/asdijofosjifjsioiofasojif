@@ -31,10 +31,12 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
 - **게임 업데이트 대응**: 업데이트가 모드 PAK과 같은 번호의 공식 패치를 내려받아 덮어쓴 경우를 감지해서,
   그 파일은 게임 파일로 두고 모드 PAK만 새 번호로 다시 배치합니다.
 - **프로필**: 켜 둔 모드, 옵션, 로드 순서를 프로필별로 저장하고 한 번에 바꿉니다 (예: "기본", "사진 촬영용", "바닐라").
-- **검색과 필터**: 모드 이름 검색(Ctrl+F)과 활성 / 비활성 / 옵션 선택 필요 / 충돌 있음 필터.
+- **모드 업데이트 확인 (Nexus Mods)**: 내 Nexus API 키로 설치한 모드에 새 파일이 올라왔는지 확인하고,
+  버전 칸에 `1.0 → 1.2`처럼 보여 줍니다.
+- **검색과 필터**: 모드 이름 검색(Ctrl+F)과 활성 / 비활성 / 옵션 선택 필요 / 충돌 있음 / 업데이트 있음 필터.
 - **다크 / 라이트 테마**와 여러 설정: 창 크기·위치 기억, 게임 실행 전 자동 적용, 실행 후 창 최소화, 삭제 확인 등 (설정 ⚙).
 - **기타**: Steam 라이브러리에서 게임 폴더 자동 감지, REFramework 설치 여부 표시, 게임 실행 버튼,
-  모드 업데이트(같은 이름 모드 교체 시 순서·활성 상태 유지), 명령줄(CLI) 지원
+  모드 교체 설치(같은 이름이나 같은 Nexus 모드를 교체할 때 순서·활성 상태 유지), 명령줄(CLI) 지원
 
 ## 설치 및 실행
 
@@ -93,6 +95,25 @@ v1.2.0부터는 프로그램이 켜질 때 새 버전을 확인합니다. 새 �
 
 루스 파일 모드는 게임 안 REFramework 메뉴의 **LooseFileLoader → Enable Loose File Loader**가 켜져 있어야 합니다.
 
+### 모드 업데이트 확인 (Nexus Mods)
+
+설치한 모드에 새 버전이 나왔는지 [Nexus Mods](https://www.nexusmods.com/monsterhunterwilds)에서 확인합니다.
+
+1. Nexus에 로그인한 뒤 [API 키 화면](https://next.nexusmods.com/settings/api-keys) 맨 아래의 **Personal API Key**를 복사합니다.
+2. 모드 매니저의 **설정 ⚙ → Nexus Mods**에 키를 붙여 넣고 **확인**을 눌러 계정 이름이 나오는지 본 뒤 저장합니다.
+3. **☰ 메뉴 → 모드 업데이트 확인 (Nexus)**를 누릅니다. 프로그램을 켤 때도 6시간에 한 번씩 자동으로 확인합니다 (설정에서 끌 수 있음).
+
+- Nexus에서 받은 파일을 **이름 그대로** 설치하면(`이름-1234-1-0-1740000000.zip`) 어느 모드의 어느 파일인지 알아서 연결합니다.
+  이미 설치해 둔 모드도 원본 파일 이름으로 연결됩니다.
+- 파일 이름을 바꿨거나 다른 곳에서 받은 모드는 목록에서 **오른쪽 클릭 → Nexus 링크 설정**에 모드 페이지 주소를 넣으세요.
+  이 경우에는 모드에 적힌 버전과 Nexus의 최신 메인 파일 버전을 비교합니다.
+- 새 버전이 있으면 버전 칸에 `1.0 → 1.2`가 표시되고, 정보 탭의 **Nexus 파일 페이지 열기**(또는 오른쪽 클릭 → 새 버전 받기)로
+  파일 페이지를 엽니다. 받은 파일을 창에 끌어 놓고 **기존 모드를 새 파일로 교체**를 고르면 순서와 활성 상태가 유지됩니다.
+  모드 이름을 바꿔 두었어도 같은 Nexus 모드면 교체할지 묻습니다.
+- 다운로드 자체는 Nexus 정책상(프리미엄 회원이 아니면 API로 직접 받을 수 없음) 브라우저에서 합니다.
+- API 키는 데이터 폴더의 `state.json`에만 저장되며 Nexus 외에는 보내지 않습니다. 확인할 때 최근 한 달 사이 새 파일이 없는
+  모드는 건너뛰어서 Nexus 요청 한도를 거의 쓰지 않습니다.
+
 ### PAK 모드 번호는 어떻게 매기나요?
 
 게임은 `re_chunk_000.pak.sub_000.pak.patch_001.pak`, `_002`, `_003` … 순서로 읽다가 빈 번호에서 멈춥니다.
@@ -147,6 +168,10 @@ python -m mhwmm disable 3
 python -m mhwmm move "모드 이름" 5            # 로드 순서 변경 (아래일수록 우선)
 python -m mhwmm remove 2
 python -m mhwmm refw [--install]             # REFramework 버전 확인 / 설치·업데이트
+python -m mhwmm nexus key <API 키>           # Nexus API 키 확인 후 저장
+python -m mhwmm nexus check                  # 설치한 모드의 새 버전 확인
+python -m mhwmm nexus link "모드 이름" https://www.nexusmods.com/monsterhunterwilds/mods/1234
+python -m mhwmm nexus unlink "모드 이름"
 python -m mhwmm profile                      # 프로필 목록
 python -m mhwmm profile "사진 촬영용" --create [--empty]   # 새 프로필 (--empty: 모두 꺼진 상태)
 python -m mhwmm profile "기본"                # 프로필 전환

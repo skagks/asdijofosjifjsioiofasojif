@@ -217,3 +217,53 @@ def test_gui_refw_badge_and_install(root, manager, game_dir, monkeypatch):
     pump(root, lambda: app.busy is None and not manager.dirty and "최신" in app.refw_badge.cget("text"))
     assert manager.refw_mod().version == "nightly 01432"
     assert (game_dir / "dinput8.dll").read_bytes() == b"MZ" + new.commit.encode()
+
+
+def test_gui_nexus_updates(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui, nexus
+
+    from test_nexus import files_data
+
+    archive = make_zip(tmp_path / "Better Armor-1234-1-0-1740000000.zip", {"natives/STM/a.tex": "a"})
+    with manager.prepare_install(archive) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    with manager.prepare_install(make_zip(tmp_path / "Other.zip", {"natives/STM/b.tex": "b"})) as s:
+        other = manager.install_variant(s, s.variants[0])
+    monkeypatch.setattr(nexus.NexusClient, "validate", lambda self: {"name": "hunter", "is_premium": False})
+    monkeypatch.setattr(nexus.NexusClient, "files", lambda self, mod_id: files_data())
+    app = gui.App(root, manager, queue.Queue())
+
+    # the API key is checked and saved in the settings
+    dialog = gui.SettingsDialog(root, app.theme, manager)
+    dialog.key_var.set(" secret ")
+    dialog.validate_key()
+    pump(root, lambda: "hunter" in dialog.key_status.cget("text"))
+    dialog.ok()
+    assert manager.settings.nexus_api_key == "secret"
+
+    app.check_mod_updates(manual=True)
+    pump(root, lambda: not app._checking_mods)
+    assert mod.update["version"] == "1.2" and manager.settings.last_mod_check
+    assert app.filter_var.get() == gui.FILTER_UPDATES  # "show only those?" was answered yes
+    assert list(app.tree.get_children()) == [mod.id]
+    assert app.tree.item(mod.id, "values")[3] == "1.0 → 1.2" and "update" in app.tree.item(mod.id, "tags")
+    assert "업데이트 1개" in app.count_label.cget("text")
+    app.tree.selection_set(mod.id)
+    app._update_details()
+    shown = app.info_text.get("1.0", "end")
+    assert "새 버전이 있습니다" in shown and "모드 페이지 #1234" in shown
+    opened = []
+    monkeypatch.setattr(gui.webbrowser, "open", opened.append)
+    app._open_nexus(lambda m: nexus.FILES_URL.format(m.nexus_id))
+    assert opened == ["https://www.nexusmods.com/monsterhunterwilds/mods/1234?tab=files"]
+
+    # linking a mod by hand, and removing the link again
+    app.filter_var.set(gui.FILTER_ALL)
+    app.refresh()
+    app.tree.selection_set(other.id)
+    monkeypatch.setattr(gui.TextDialog, "show", lambda self: "https://www.nexusmods.com/monsterhunterwilds/mods/77")
+    app.link_nexus()
+    assert other.nexus_id == 77
+    monkeypatch.setattr(gui.TextDialog, "show", lambda self: "")
+    app.link_nexus()
+    assert other.nexus_id == 0 and other.nexus_unlinked

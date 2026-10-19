@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import posixpath
-import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +25,7 @@ from typing import Iterable
 
 from . import fsutil
 from .modinfo import ModInfo, parse_modinfo
+from .nexus import parse_source_name
 
 JUNK_DIRS = {"__macosx", ".git", ".svn", "fomod"}
 JUNK_FILES = {".ds_store", "thumbs.db", "desktop.ini"}
@@ -39,16 +39,12 @@ ROOT_MARKER_EXTS = {".pak", ".dll", ".asi"}
 ROOT_FILE_EXTS = ROOT_MARKER_EXTS | {".ini"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
-_NEXUS_NAME = re.compile(r"^(?P<name>.+?)-(?P<id>\d+)-(?P<ver>\d+(?:-\d+)*)-(?P<ts>\d{9,11})$")
-
 
 def clean_archive_name(stem: str) -> tuple[str, str]:
     """Strip the Nexus Mods download suffix: ``Name-123-1-2-1740000000`` -> (``Name``, ``1.2``)."""
-    m = _NEXUS_NAME.match(stem)
-    if m:
-        name = m.group("name").strip(" _-")
-        if name:
-            return name, m.group("ver").replace("-", ".")
+    ref = parse_source_name(stem)
+    if ref and ref.name:
+        return ref.name, ref.version
     return stem, ""
 
 

@@ -64,6 +64,8 @@ def cmd_list(manager: ModManager, args) -> int:
         flag = "[x]" if m.enabled else "[ ]"
         extra = f"  충돌 +{wins}/-{losses}" if wins or losses else ""
         version = f" v{m.version}" if m.version else ""
+        if m.update:
+            version += f" (새 버전 {m.update.get('version') or '있음'})"
         if m.options:
             extra += "  옵션 선택 필요" if m.needs_option else f"  옵션 {len(m.selected)}/{len(m.options)}"
         print(f"{i:3d}. {flag} {m.name}{version}  ({_kinds(manager.mod_kinds(m.id))}, id={m.id}){extra}")
@@ -88,7 +90,7 @@ def cmd_install(manager: ModManager, args) -> int:
         elif args.option:
             selected = [i - 1 for i in args.option]
         name = package_name(variants) if len(variants) > 1 else variants[0].name
-        existing = manager.find_by_name(name)
+        existing = manager.find_existing(name, session.source.name)
         replace_id = existing.id if existing and args.replace else None
         mod = manager.install_package(session, variants, replace_id, selected)
         if args.disabled and mod.enabled:
@@ -159,6 +161,54 @@ def cmd_refw(manager: ModManager, args) -> int:
         fsutil.remove_file(archive)
     print(f"설치: {mod.name} {mod.version}")
     return _maybe_deploy(manager, args)
+
+
+def cmd_nexus(manager: ModManager, args) -> int:
+    from . import nexus
+
+    try:
+        if args.action == "key":
+            if not args.value:
+                key = manager.settings.nexus_api_key
+                print(f"API 키: {'설정됨 (' + key[:4] + '…)' if key else '없음'}")
+                return 0
+            user = nexus.NexusClient(args.value[0]).validate()
+            manager.update_settings(nexus_api_key=args.value[0].strip())
+            print(f"API 키 저장: {user.get('name') or '이름 없음'} ({'프리미엄' if user.get('is_premium') else '일반'})")
+            return 0
+        if args.action in ("link", "unlink"):
+            if len(args.value) != (2 if args.action == "link" else 1):
+                raise SystemExit("사용법: nexus link <모드> <Nexus 주소 또는 번호> / nexus unlink <모드>")
+            (mod,) = _resolve(manager, args.value[:1])
+            if args.action == "unlink":
+                manager.unlink_nexus(mod.id)
+                print(f"Nexus 연결 해제: {mod.name}")
+            else:
+                print(f"Nexus 연결: {mod.name} -> {nexus.MOD_URL.format(manager.link_nexus(mod.id, args.value[1]))}")
+            return 0
+        # check
+        items = manager.nexus_items()
+        if not items:
+            print("Nexus와 연결된 모드가 없습니다. 'nexus link <모드> <주소>'로 연결하세요.")
+            return 0
+        client = nexus.NexusClient(manager.settings.nexus_api_key)
+        results, problems = nexus.check_mods(client, items, lambda done, total, msg: print(msg, file=sys.stderr))
+    except nexus.NexusError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    manager.set_update_results(results)
+    for problem in problems:
+        print(f"경고: {problem}", file=sys.stderr)
+    updates = [m for m in manager.mods if m.update]
+    for m in updates:
+        print(f"새 버전: {m.name}  {m.version or '?'} -> {m.update.get('version') or '새 파일'}  "
+              f"{nexus.FILES_URL.format(m.nexus_id)}")
+    if not updates:
+        print(f"Nexus와 연결된 모드 {len(items)}개가 모두 최신입니다.")
+    return 0
 
 
 def cmd_options(manager: ModManager, args) -> int:
@@ -279,6 +329,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="최신이어도 다시 설치")
     p.add_argument("--no-deploy", action="store_true")
 
+    p = sub.add_parser("nexus", help="Nexus Mods API 키 설정, 모드 연결, 업데이트 확인")
+    p.add_argument("action", choices=("check", "key", "link", "unlink"),
+                   help="check: 업데이트 확인 · key [키]: API 키 저장 · link <모드> <주소>: 모드 페이지 연결 · unlink <모드>")
+    p.add_argument("value", nargs="*")
+
     p = sub.add_parser("profile", help="프로필 목록/전환/만들기/삭제")
     p.add_argument("name", nargs="?", help="프로필 이름 (생략하면 목록)")
     p.add_argument("--create", action="store_true", help="현재 상태를 복사해 새 프로필 만들기")
@@ -299,7 +354,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 READ_ONLY_COMMANDS = ("list", "verify")
 COMMANDS = {
-    "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw, "enable": cmd_toggle, "disable": cmd_toggle,
+    "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw,
+    "nexus": cmd_nexus, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game,
 }

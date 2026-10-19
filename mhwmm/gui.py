@@ -15,7 +15,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, fsutil, refw, steam, updater
+from . import __version__, fsutil, nexus, refw, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_CHAINS,
@@ -59,8 +59,11 @@ FILTERS = {
     "비활성": lambda mod, conflicts: not mod.enabled,
     "옵션 선택 필요": lambda mod, conflicts: mod.needs_option,
     "충돌 있음": lambda mod, conflicts: any(conflicts.counts(mod.id)),
+    "업데이트 있음": lambda mod, conflicts: bool(mod.update),
 }
 FILTER_ALL = "전체"
+FILTER_UPDATES = "업데이트 있음"
+MOD_CHECK_INTERVAL = 6 * 3600  # automatic Nexus checks at most this often
 # Errors that are shown to the user without a traceback in the log.
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
 
@@ -359,6 +362,25 @@ class SettingsDialog(Dialog):
                   font=theme.fonts["small"], wraplength=px(300), justify="left").pack(anchor="w", padx=(px(4), 0),
                                                                                    pady=(px(4), 0))
 
+        section(self.body, "Nexus Mods")
+        ttk.Label(self.body, text="설치한 모드의 새 버전을 Nexus에서 확인합니다. Nexus 계정 설정의 API 키 화면에서 "
+                                  "개인 API 키(Personal API Key)를 복사해 넣으세요.",
+                  style="Muted.TLabel", font=theme.fonts["small"], wraplength=px(560),
+                  justify="left").pack(anchor="w", padx=(px(4), 0), pady=(0, px(6)))
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", padx=(px(4), 0))
+        ttk.Label(row, text="API 키").pack(side="left", padx=(0, px(12)))
+        self.key_var = tk.StringVar(value=s.nexus_api_key)
+        ttk.Entry(row, textvariable=self.key_var, show="•", width=40).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="키 받기", style="Compact.TButton",
+                   command=lambda: webbrowser.open(nexus.API_KEY_URL)).pack(side="right", padx=(px(6), 0))
+        ttk.Button(row, text="확인", style="Compact.TButton", command=self.validate_key).pack(side="right",
+                                                                                         padx=(px(6), 0))
+        self.key_status = ttk.Label(self.body, text="", style="Muted.TLabel", font=theme.fonts["small"])
+        self.key_status.pack(anchor="w", padx=(px(4), 0), pady=(px(4), 0))
+        check(self.body, "check_mod_updates", "시작할 때 설치한 모드의 업데이트 확인")
+        self._key_events: queue.Queue = queue.Queue()
+
         section(self.body, "데이터 폴더")
         row = ttk.Frame(self.body)
         row.pack(fill="x")
@@ -367,12 +389,42 @@ class SettingsDialog(Dialog):
                    command=lambda: fsutil.open_in_explorer(manager.data_dir)).pack(side="right")
         self.buttons("저장", self.ok)
 
+    def validate_key(self):
+        """Ask Nexus whose key this is, without blocking the dialog."""
+        key = self.key_var.get().strip()
+        if not key:
+            self.key_status.configure(text="API 키를 넣으세요.")
+            return
+        self.key_status.configure(text="확인 중...")
+
+        def worker():
+            try:
+                self._key_events.put(nexus.NexusClient(key).validate())
+            except nexus.NexusError as exc:
+                self._key_events.put(exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_key)
+
+    def _poll_key(self):
+        try:
+            result = self._key_events.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_key)
+            return
+        if isinstance(result, Exception):
+            self.key_status.configure(text=f"✕  {result}")
+        else:
+            kind = "프리미엄" if result.get("is_premium") else "일반"
+            self.key_status.configure(text=f"✓  {result.get('name') or '이름 없음'} 계정 ({kind}) 키입니다.")
+
     def ok(self):
         theme_name = next((k for k, v in THEME_NAMES.items() if v == self.theme_var.get()), "dark")
         try:
             self.manager.update_settings(
                 theme=theme_name,
                 pak_chain=self.chain.get().strip().lower(),
+                nexus_api_key=self.key_var.get().strip(),
                 **{key: var.get() for key, var in self.vars.items()},
             )
         except ValueError as exc:
@@ -402,6 +454,7 @@ class App:
         self._update: Release | None = None
         self._launch_after_apply = False
         self._refw_status: refw.Status | None = None
+        self._checking_mods = False
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -435,6 +488,9 @@ class App:
             root.after(2500, lambda: self.check_updates(manual=False))
         if manager.settings.check_refw_updates:
             root.after(3500, lambda: self.check_refw(manual=False))
+        s = manager.settings
+        if s.check_mod_updates and s.nexus_api_key and time.time() - s.last_mod_check > MOD_CHECK_INTERVAL:
+            root.after(4500, lambda: self.check_mod_updates(manual=False))
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -544,6 +600,7 @@ class App:
         m.add_separator()
         m.add_command(label="업데이트 확인", command=lambda: self.check_updates(manual=True))
         m.add_command(label="REFramework 업데이트 확인", command=lambda: self.check_refw(manual=True))
+        m.add_command(label="모드 업데이트 확인 (Nexus)", command=lambda: self.check_mod_updates(manual=True))
         m.add_command(label="사용법", command=self.show_help)
         m.add_command(label="정보", command=self.show_about)
         m.add_separator()
@@ -654,7 +711,7 @@ class App:
             ("order", "#", 34, "center", False),
             ("name", "이름", 190, "w", True),
             ("kind", "종류", 140, "w", False),
-            ("version", "버전", 56, "w", False),
+            ("version", "버전", 78, "w", False),
             ("options", "옵션", 70, "center", False),
             ("files", "파일", 46, "e", False),
             ("conflict", "충돌", 118, "w", False),
@@ -736,17 +793,19 @@ class App:
             tree.tag_configure("overridden", foreground=p["warn"])
             tree.tag_configure("pending", foreground=p["subtle"])
             tree.tag_configure("attention", foreground=p["warn"])
+            tree.tag_configure("update", foreground=p["info"])
         info = self.info_text
         info.tag_configure("title", font=f["detail_title"], spacing3=px(8))
         info.tag_configure("chip", background=p["chip"], foreground=p["chip_text"], font=f["small_bold"])
         info.tag_configure("chip_ok", background=p["success_bg"], foreground=p["success"], font=f["small_bold"])
         info.tag_configure("chip_off", background=p["raised"], foreground=p["muted"], font=f["small_bold"])
         info.tag_configure("chip_warn", background=p["warn_bg"], foreground=p["warn"], font=f["small_bold"])
+        info.tag_configure("chip_info", background=p["info_bg"], foreground=p["info"], font=f["small_bold"])
         info.tag_configure("key", foreground=p["muted"], spacing1=px(3), spacing3=px(3))
         info.tag_configure("value", foreground=p["text"], spacing1=px(3), spacing3=px(3))
         info.tag_configure("muted", foreground=p["muted"])
         info.tag_configure("desc", spacing1=px(4), spacing2=px(3))
-        for tag, fg_key, bg_key in (("warn", "warn", "warn_bg"),):
+        for tag, fg_key, bg_key in (("warn", "warn", "warn_bg"), ("note", "info", "info_bg")):
             info.tag_configure(tag, background=p[bg_key], foreground=p[fg_key], lmargin1=px(12), lmargin2=px(12),
                                rmargin=px(12), spacing1=px(8), spacing3=px(8))
             try:
@@ -754,6 +813,11 @@ class App:
             except tk.TclError:  # Tk < 8.6.6
                 pass
         info.tag_configure("warn_title", font=f["bold"])
+        info.tag_configure("link", foreground=p["info"], underline=True)
+        for tag, action in (("nexus_page", lambda m: m.nexus_url), ("nexus_files", lambda m: nexus.FILES_URL.format(m.nexus_id))):
+            info.tag_bind(tag, "<Button-1>", lambda e, action=action: self._open_nexus(action))
+        info.tag_bind("link", "<Enter>", lambda e: info.configure(cursor="hand2"))
+        info.tag_bind("link", "<Leave>", lambda e: info.configure(cursor="arrow"))
         ct = self.conflict_text
         ct.tag_configure("title", font=f["detail_title"], spacing3=px(8))
         ct.tag_configure("head", font=f["bold"], spacing1=px(10), spacing3=px(4))
@@ -831,12 +895,17 @@ class App:
                 tags.append("disabled")
             elif mod.needs_option:
                 tags.append("attention")
+            elif mod.update:
+                tags.append("update")
             elif losses and not wins and losses == sum(1 for f in files if not is_root_pak(f)):
                 tags.append("overridden")
             options = ""
             if mod.options:
                 options = "선택 필요" if mod.needs_option else f"{len(mod.selected)}/{len(mod.options)}"
-            values = (index + 1, mod.name, kinds_short(self._display_kinds(mod)), mod.version, options,
+            version = mod.version
+            if mod.update:
+                version = f"{mod.version or '?'} → {mod.update.get('version') or '새 파일'}"
+            values = (index + 1, mod.name, kinds_short(self._display_kinds(mod)), version, options,
                       len(files), conflict)
             image = on if mod.enabled else off
             if mod.id in existing:
@@ -853,7 +922,9 @@ class App:
             self.tree.see(select)
 
         enabled = sum(1 for mod in m.mods if mod.enabled)
-        self.count_label.configure(text=f"{len(m.mods)}개 · 활성 {enabled}개" if m.mods else "")
+        updates = sum(1 for mod in m.mods if mod.update)
+        count = f"{len(m.mods)}개 · 활성 {enabled}개" + (f" · 업데이트 {updates}개" if updates else "")
+        self.count_label.configure(text=count if m.mods else "")
         if not m.mods:
             self.empty_title.configure(text="아직 설치된 모드가 없습니다")
             self.empty_sub.configure(text="Nexus Mods 등에서 받은 zip · 7z · rar · pak 파일을\n이곳에 끌어 놓거나 아래 버튼을 누르세요.")
@@ -1067,6 +1138,105 @@ class App:
         self.run_task("refw", f"REFramework {build.label} 내려받는 중...", work, on_done=done,
                       on_error=lambda exc: self.show_error("REFramework", str(exc)))
 
+    # ------------------------------------------------------------------ Nexus mod updates
+    def check_mod_updates(self, manual: bool):
+        """Look the mods that came from Nexus up there in the background."""
+        if self._checking_mods:
+            return
+        key = self.manager.settings.nexus_api_key
+        if not key:
+            if manual and messagebox.askyesno(
+                    "모드 업데이트 확인", "모드 업데이트를 확인하려면 Nexus API 키가 필요합니다.\n설정에서 키를 넣을까요?",
+                    parent=self.root):
+                self.open_settings()
+            return
+        items = self.manager.nexus_items()
+        if not items:
+            if manual:
+                messagebox.showinfo("모드 업데이트 확인", (
+                    "Nexus와 연결된 모드가 없습니다.\n\n"
+                    "Nexus에서 받은 파일을 이름 그대로 설치하면 자동으로 연결됩니다. 다른 모드는 목록에서 "
+                    "오른쪽 클릭 > 'Nexus 링크 설정'으로 모드 페이지 주소를 넣어 주세요."), parent=self.root)
+            return
+        self._checking_mods = True
+
+        def status(msg):
+            if self.busy is None:
+                self.status_var.set(msg)
+
+        def worker():
+            try:
+                results, problems = nexus.check_mods(
+                    nexus.NexusClient(key), items, lambda done, total, msg: self.events.put(("call", status, msg)))
+            except Exception as exc:  # reported to the user, never fatal
+                self.events.put(("call", self._on_mods_checked, None, [], exc, manual))
+            else:
+                self.events.put(("call", self._on_mods_checked, results, problems, None, manual))
+
+        status("모드 업데이트 확인 중...")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mods_checked(self, results: dict | None, problems: list[str], error: Exception | None, manual: bool):
+        self._checking_mods = False
+        if self.busy is None:
+            self.status_var.set("준비")
+        if error is not None:
+            if not isinstance(error, nexus.NexusError):
+                log.error("모드 업데이트 확인 중 오류", exc_info=error)
+            log.warning("모드 업데이트 확인 실패: %s", error)
+            if manual:
+                messagebox.showwarning("모드 업데이트 확인", str(error), parent=self.root)
+            return
+        self.manager.set_update_results(results)
+        for problem in problems:
+            log.warning(problem)
+        self.refresh()
+        self._update_details()
+        updates = [m for m in self.manager.mods if m.update]
+        lines = [f"• {m.name}  {m.version or '?'} → {m.update.get('version') or '새 파일'}" for m in updates]
+        if updates:
+            log.info("새 버전이 있는 모드 %d개:\n%s", len(updates), "\n".join(lines))
+        else:
+            log.info("Nexus와 연결된 모드 %d개가 모두 최신입니다.", len(results))
+        if not manual:
+            return
+        note = ("\n\n" + "\n".join(problems)) if problems else ""
+        if not updates:
+            messagebox.showinfo("모드 업데이트 확인", f"Nexus와 연결된 모드 {len(results)}개가 모두 최신입니다.{note}",
+                                parent=self.root)
+            return
+        shown = "\n".join(lines[:15]) + (f"\n… 외 {len(lines) - 15}개" if len(lines) > 15 else "")
+        if messagebox.askyesno("모드 업데이트 확인", f"{len(updates)}개 모드에 새 버전이 있습니다.\n\n{shown}{note}\n\n"
+                                                 "업데이트가 있는 모드만 볼까요?", parent=self.root):
+            self.filter_var.set(FILTER_UPDATES)
+            self.refresh()
+
+    def _open_nexus(self, url_of):
+        mod = self._selected_mod()
+        if mod is not None and mod.nexus_id:
+            webbrowser.open(url_of(mod))
+
+    def link_nexus(self):
+        mod = self._selected_mod()
+        if mod is None:
+            return
+        text = TextDialog(self.root, self.theme, "Nexus 링크 설정",
+                          "Nexus 모드 페이지 주소나 모드 번호 (비우면 연결 해제)", mod.nexus_url).show()
+        if text is None:
+            return
+        try:
+            if text.strip():
+                nexus_id = self.manager.link_nexus(mod.id, text)
+                log.info("'%s'을(를) Nexus 모드 #%d에 연결했습니다.", mod.name, nexus_id)
+            elif mod.nexus_id:
+                self.manager.unlink_nexus(mod.id)
+                log.info("'%s'의 Nexus 연결을 해제했습니다.", mod.name)
+        except ValueError as exc:
+            messagebox.showwarning("Nexus 링크 설정", str(exc), parent=self.root)
+            return
+        self.refresh()
+        self._update_details()
+
     def _fill_game_menu(self):
         menu = self.game_menu
         menu.delete(0, "end")
@@ -1122,6 +1292,8 @@ class App:
         chips = [("활성" if mod.enabled else "비활성", "chip_ok" if mod.enabled else "chip_off")]
         if mod.needs_option:
             chips.append(("옵션 선택 필요", "chip_warn"))
+        if mod.update:
+            chips.append(("새 버전 있음", "chip_info"))
         chips += [(KIND_LABELS[k], "chip") for k in KIND_LABELS if k in self._display_kinds(mod)]
         if mod.version:
             chips.append((f"v{mod.version}" if mod.version[:1].isdigit() else mod.version, "chip"))
@@ -1139,6 +1311,20 @@ class App:
         ):
             if value:
                 chunks += [(f"{label}\t", "key"), (f"{value}\n", "value")]
+        if mod.nexus_id:
+            chunks += [("Nexus\t", "key"), (f"모드 페이지 #{mod.nexus_id}", ("value", "link", "nexus_page"))]
+            if mod.nexus_checked:
+                checked = time.strftime("%Y-%m-%d %H:%M", time.localtime(mod.nexus_checked))
+                chunks.append((f"   {checked} 확인", ("value", "muted")))
+            chunks.append(("\n", "value"))
+        if mod.update:
+            new = mod.update
+            what = " · ".join(x for x in (str(new.get("version") or ""), str(new.get("file") or ""),
+                                         str(new.get("uploaded") or "")) if x)
+            chunks += [("\n", None), ("새 버전이 있습니다\n", ("note", "warn_title")),
+                       (f"Nexus에 새 파일이 올라왔습니다{f' ({what})' if what else ''}. 받은 파일을 이 창에 끌어 놓고 "
+                        "'기존 모드를 새 파일로 교체'를 고르면 순서와 활성 상태를 유지한 채 바뀝니다.\n", "note"),
+                       ("Nexus 파일 페이지 열기", ("note", "link", "nexus_files")), ("\n", "note")]
         if mod.needs_option:
             chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
                        ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
@@ -1562,7 +1748,7 @@ class App:
             variants = [raw]
 
         package = package_name(variants) if len(variants) > 1 else variants[0].name
-        existing = self.manager.find_by_name(package)
+        existing = self.manager.find_existing(package, session.source.name)
         replace_id = None
         if existing:
             answer = messagebox.askyesnocancel(
@@ -1812,7 +1998,7 @@ class App:
             fsutil.open_in_explorer(self.manager.mod_dir(mod.id) if mod.options else self.manager.files_dir(mod.id))
 
     def open_settings(self):
-        old_theme = self.manager.settings.theme
+        old_theme, old_key = self.manager.settings.theme, self.manager.settings.nexus_api_key
         if SettingsDialog(self.root, self.theme, self.manager).show():
             self.auto_var.set(self.manager.settings.auto_apply)
             if self.manager.settings.theme != old_theme:
@@ -1821,6 +2007,8 @@ class App:
                 self.refresh()
             if self.manager.dirty:
                 self.request_apply()
+            if self.manager.settings.nexus_api_key and self.manager.settings.nexus_api_key != old_key:
+                self.check_mod_updates(manual=False)  # a new key: look for updates right away
 
     def show_help(self):
         messagebox.showinfo("사용법", (
@@ -1831,6 +2019,7 @@ class App:
             "• PAK 모드는 re_chunk_000.pak.sub_000.pak.patch_XXX.pak 번호를 자동으로 매깁니다.\n"
             "• 게임 업데이트 후에는 '☰ > 적용 상태 점검'을 실행하세요. 업데이트가 덮어쓴 번호를 피해서 다시 배치합니다.\n"
             "• natives 폴더(루스 파일) 모드와 Lua 스크립트는 REFramework가 필요합니다. REFramework도 이 프로그램으로 설치할 수 있습니다.\n"
+            "• 설정에서 Nexus API 키를 넣으면 '☰ > 모드 업데이트 확인'으로 새 버전이 나온 모드를 찾습니다.\n"
             "• 7z/rar 파일은 PC에 설치된 반디집이나 7-Zip으로 풉니다."), parent=self.root)
 
     # ------------------------------------------------------------------ updates
@@ -1965,6 +2154,14 @@ class App:
                 menu.add_command(label="맨 아래로 (최우선)", command=lambda: self.move_to_edge(False))
                 menu.add_command(label="이름 변경", command=self.rename_selected)
                 menu.add_command(label="저장된 모드 폴더 열기", command=self.open_mod_folder)
+                if mods[0].origin != refw.ORIGIN:
+                    menu.add_separator()
+                    if mods[0].update:
+                        menu.add_command(label="새 버전 받기 (Nexus 파일 페이지)",
+                                         command=lambda: self._open_nexus(lambda m: nexus.FILES_URL.format(m.nexus_id)))
+                    if mods[0].nexus_id:
+                        menu.add_command(label="Nexus 페이지 열기", command=lambda: self._open_nexus(lambda m: m.nexus_url))
+                    menu.add_command(label="Nexus 링크 설정...", command=self.link_nexus)
             menu.add_separator()
             menu.add_command(label="삭제", command=self.remove_selected)
         else:

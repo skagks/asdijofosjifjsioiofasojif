@@ -25,6 +25,7 @@ PALETTES = {
         "scroll": "#353a45", "scroll_hover": "#4a505d",
         "success": "#63c98d", "success_bg": "#1c2c24", "warn": "#eaa646", "warn_bg": "#30271a",
         "danger": "#f0736a", "danger_bg": "#33201f", "chip": "#2a2720", "chip_text": "#e6c48f",
+        "info": "#62b6c4", "info_bg": "#1a2a2e",
     },
     "light": {
         "bg": "#efece6", "surface": "#fbfaf8", "raised": "#ffffff", "hover": "#f3eee5",
@@ -35,6 +36,7 @@ PALETTES = {
         "scroll": "#d6cfc2", "scroll_hover": "#bfb7a8",
         "success": "#2e8f57", "success_bg": "#e3f2e8", "warn": "#a8650f", "warn_bg": "#f8ecd6",
         "danger": "#c93c33", "danger_bg": "#f8e1df", "chip": "#f3e7d2", "chip_text": "#8a5a12",
+        "info": "#237785", "info_bg": "#dff0f2",
     },
 }
 THEME_NAMES = {"dark": "다크", "light": "라이트"}
