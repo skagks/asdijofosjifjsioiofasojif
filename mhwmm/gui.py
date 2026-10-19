@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -51,6 +52,15 @@ INSTALL_FILETYPES = [
     ("모드 파일", " ".join(f"*{e}" for e in (*ARCHIVE_EXTS, ".pak", ".lua", ".dll"))),
     ("모든 파일", "*.*"),
 ]
+# Mod list filters: label -> predicate(mod, conflicts)
+FILTERS = {
+    "전체": None,
+    "활성": lambda mod, conflicts: mod.enabled,
+    "비활성": lambda mod, conflicts: not mod.enabled,
+    "옵션 선택 필요": lambda mod, conflicts: mod.needs_option,
+    "충돌 있음": lambda mod, conflicts: any(conflicts.counts(mod.id)),
+}
+FILTER_ALL = "전체"
 # Errors that are shown to the user without a traceback in the log.
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
 
@@ -80,6 +90,20 @@ def shorten_middle(text: str, limit: int) -> str:
         return text
     keep = limit - 1
     return text[: keep // 2] + "…" + text[-(keep - keep // 2):]
+
+
+def _virtual_screen(root: tk.Misc) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the desktop across all monitors."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            metric = ctypes.windll.user32.GetSystemMetrics  # type: ignore[attr-defined]
+            left, top = metric(76), metric(77)  # SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN
+            return left, top, left + metric(78), top + metric(79)
+        except Exception:
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
 def autohide(scrollbar: ttk.Scrollbar, **pack_options):
@@ -254,42 +278,53 @@ class SettingsDialog(Dialog):
         px = theme.px
         self.manager = manager
         s = manager.settings
-        ttk.Label(self.body, text="설정", style="DialogTitle.TLabel").pack(anchor="w", pady=(0, px(14)))
-        grid = ttk.Frame(self.body)
-        grid.pack(fill="x")
-        grid.columnconfigure(1, weight=1)
+        self.vars: dict[str, tk.BooleanVar] = {}
+        ttk.Label(self.body, text="설정", style="DialogTitle.TLabel").pack(anchor="w")
+        columns = ttk.Frame(self.body)
+        columns.pack(fill="x")
+        left = ttk.Frame(columns)
+        left.pack(side="left", fill="y", anchor="n", padx=(0, px(28)))
+        right = ttk.Frame(columns)
+        right.pack(side="left", fill="y", anchor="n")
 
-        ttk.Label(grid, text="테마").grid(row=0, column=0, sticky="w", pady=px(6), padx=(0, px(16)))
+        def section(parent, title):
+            ttk.Label(parent, text=title, style="DialogSection.TLabel").pack(anchor="w", pady=(px(16), px(4)))
+
+        def check(parent, key, text):
+            var = tk.BooleanVar(value=getattr(s, key))
+            self.vars[key] = var
+            theme.checkbutton(parent, text, var).pack(anchor="w", pady=px(1))
+
+        section(left, "화면")
+        row = ttk.Frame(left)
+        row.pack(anchor="w", pady=(0, px(4)))
+        ttk.Label(row, text="테마").pack(side="left", padx=(px(4), px(12)))
         self.theme_var = tk.StringVar(value=THEME_NAMES.get(s.theme, THEME_NAMES["dark"]))
-        ttk.Combobox(grid, textvariable=self.theme_var, values=list(THEME_NAMES.values()), state="readonly",
-                     width=12).grid(row=0, column=1, sticky="w", pady=px(6))
+        ttk.Combobox(row, textvariable=self.theme_var, values=list(THEME_NAMES.values()), state="readonly",
+                     width=10).pack(side="left")
+        check(left, "remember_window", "창 크기와 위치 기억")
+        section(left, "게임 실행")
+        check(left, "apply_before_launch", "실행 전에 남은 변경사항 먼저 적용")
+        check(left, "minimize_on_launch", "게임을 실행하면 이 창 최소화")
+        section(left, "업데이트")
+        check(left, "check_updates", "시작할 때 새 버전 확인")
 
-        ttk.Label(grid, text="PAK 대상 파일").grid(row=1, column=0, sticky="w", pady=px(6), padx=(0, px(16)))
+        section(right, "모드 적용")
+        check(right, "auto_apply", "변경 즉시 게임 폴더에 적용")
+        check(right, "enable_on_install", "설치한 모드를 바로 활성화")
+        check(right, "confirm_remove", "모드를 삭제하기 전에 확인")
+        check(right, "check_game_running", "적용 전에 게임 실행 여부 확인")
+        ttk.Label(right, text="PAK 대상 파일").pack(anchor="w", padx=(px(4), 0), pady=(px(10), px(4)))
         self.chain = tk.StringVar(value=s.pak_chain)
-        ttk.Combobox(grid, textvariable=self.chain, values=PAK_CHAINS, width=34).grid(
-            row=1, column=1, sticky="ew", pady=px(6))
-        ttk.Label(grid, text=f"기본값 {DEFAULT_PAK_CHAIN}. 파일 이름에 번호가 들어 있는 PAK은 그 이름을 따릅니다.",
-                  style="Muted.TLabel", font=theme.fonts["small"], wraplength=px(420), justify="left").grid(
-            row=2, column=1, sticky="w")
+        ttk.Combobox(right, textvariable=self.chain, values=PAK_CHAINS, width=32).pack(anchor="w", padx=(px(4), 0))
+        ttk.Label(right, text="파일 이름에 번호가 들어 있는 PAK은 그 이름을 따릅니다.", style="Muted.TLabel",
+                  font=theme.fonts["small"], wraplength=px(300), justify="left").pack(anchor="w", padx=(px(4), 0),
+                                                                                   pady=(px(4), 0))
 
-        self.auto_apply = tk.BooleanVar(value=s.auto_apply)
-        self.enable_on_install = tk.BooleanVar(value=s.enable_on_install)
-        self.check_running = tk.BooleanVar(value=s.check_game_running)
-        self.check_updates = tk.BooleanVar(value=s.check_updates)
-        checks = ttk.Frame(self.body)
-        checks.pack(fill="x", pady=(px(14), 0))
-        for text, var in (("변경 즉시 게임 폴더에 적용", self.auto_apply),
-                          ("설치한 모드를 바로 활성화", self.enable_on_install),
-                          ("적용 전에 게임 실행 여부 확인", self.check_running),
-                          ("시작할 때 새 버전 확인", self.check_updates)):
-            theme.checkbutton(checks, text, var).pack(anchor="w", pady=px(1))
-
-        data = ttk.Frame(self.body)
-        data.pack(fill="x", pady=(px(14), 0))
-        ttk.Label(data, text="데이터 폴더").pack(anchor="w")
-        row = ttk.Frame(data)
-        row.pack(fill="x", pady=(px(4), 0))
-        ttk.Label(row, text=shorten_middle(str(manager.data_dir), 60), style="Muted.TLabel").pack(side="left")
+        section(self.body, "데이터 폴더")
+        row = ttk.Frame(self.body)
+        row.pack(fill="x")
+        ttk.Label(row, text=shorten_middle(str(manager.data_dir), 64), style="Muted.TLabel").pack(side="left")
         ttk.Button(row, text="열기", style="Compact.TButton",
                    command=lambda: fsutil.open_in_explorer(manager.data_dir)).pack(side="right")
         self.buttons("저장", self.ok)
@@ -300,10 +335,7 @@ class SettingsDialog(Dialog):
             self.manager.update_settings(
                 theme=theme_name,
                 pak_chain=self.chain.get().strip().lower(),
-                auto_apply=self.auto_apply.get(),
-                enable_on_install=self.enable_on_install.get(),
-                check_game_running=self.check_running.get(),
-                check_updates=self.check_updates.get(),
+                **{key: var.get() for key, var in self.vars.items()},
             )
         except ValueError as exc:
             messagebox.showerror("설정", str(exc), parent=self)
@@ -330,6 +362,7 @@ class App:
         self._conflicts = None
         self._log_visible = True
         self._update: Release | None = None
+        self._launch_after_apply = False
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -338,6 +371,7 @@ class App:
         root.title(f"{APP_TITLE} {__version__}")
         root.geometry(f"{px(1240)}x{px(800)}")
         root.minsize(px(980), px(620))
+        self._restore_window()
         self._set_icon()
 
         self._build_header()
@@ -350,6 +384,8 @@ class App:
         self._setup_dnd()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         set_dark_titlebar(root, self.theme.name == "dark")
+        if not manager.settings.log_visible:
+            self.toggle_log()
 
         self.refresh()
         self._update_search_hint()
@@ -361,8 +397,46 @@ class App:
 
     def _place_sash(self):
         width = self.paned.winfo_width()
+        s = self.manager.settings
+        ratio = min(0.8, max(0.3, s.sash_ratio)) if s.remember_window else 0.58
         if width > 1:
-            self.paned.sashpos(0, int(width * 0.58))
+            self.paned.sashpos(0, int(width * ratio))
+
+    def _restore_window(self):
+        s = self.manager.settings
+        if not s.remember_window or not s.window_geometry:
+            return
+        m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", s.window_geometry)
+        if not m:
+            return
+        min_w, min_h = self.root.minsize()
+        w, h, x, y = max(int(m[1]), min_w), max(int(m[2]), min_h), int(m[3]), int(m[4])
+        left, top, right, bottom = _virtual_screen(self.root)
+        geometry = f"{w}x{h}"
+        if left - 50 <= x <= right - 120 and top - 10 <= y <= bottom - 80:  # monitor still there
+            geometry += f"+{x}+{y}"
+        self.root.geometry(geometry)
+        if s.window_zoomed:
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
+
+    def _save_window_state(self):
+        s = self.manager.settings
+        try:
+            changes: dict = {"log_visible": self._log_visible}
+            if s.remember_window:
+                zoomed = self.root.state() == "zoomed"
+                changes["window_zoomed"] = zoomed
+                if not zoomed:
+                    changes["window_geometry"] = self.root.geometry()
+                width = self.paned.winfo_width()
+                if width > 1:
+                    changes["sash_ratio"] = round(min(0.8, max(0.3, self.paned.sashpos(0) / width)), 3)
+            self.manager.update_settings(**changes)
+        except (tk.TclError, OSError, ValueError) as exc:
+            log.debug("창 상태를 저장하지 못했습니다: %s", exc)
 
     # ------------------------------------------------------------------ layout
     def _set_icon(self):
@@ -463,6 +537,13 @@ class App:
                                  image=(t.image("switch_off", 20), "selected", t.image("switch_on", 20)))
         switch.pack(side="right")
         Tooltip(t, switch, "켜 두면 모드를 켜고 끄거나 순서를 바꿀 때 바로 게임 폴더에 반영합니다")
+        self.profile_var = tk.StringVar(value=self.manager.profile)
+        self.profile_button = ttk.Menubutton(bar, text="", style="Chip.TMenubutton")
+        self.profile_button.pack(side="right", padx=(0, px(14)))
+        self.profile_menu = t.mark(tk.Menu(self.profile_button, tearoff=False, postcommand=self._fill_profile_menu),
+                                   "menu")
+        self.profile_button.configure(menu=self.profile_menu)
+        Tooltip(t, self.profile_button, "프로필마다 켜 둔 모드, 옵션, 로드 순서를 따로 저장합니다")
 
     def _build_statusbar(self):
         px = self.theme.px
@@ -513,6 +594,11 @@ class App:
         self.search_entry.bind("<FocusOut>", lambda e: self._update_search_hint(), add="+")
         self.search_entry.bind("<Escape>", lambda e: self.search_var.set(""))
         self.search_var.trace_add("write", lambda *a: (self._update_search_hint(), self.refresh()))
+        self.filter_var = tk.StringVar(value=FILTER_ALL)
+        filter_box = ttk.Combobox(head, textvariable=self.filter_var, values=list(FILTERS), state="readonly", width=12)
+        filter_box.pack(side="right", padx=(0, px(8)))
+        filter_box.bind("<<ComboboxSelected>>", lambda e: (filter_box.selection_clear(), self.refresh()))
+        Tooltip(t, filter_box, "목록에 보일 모드 고르기")
         ttk.Label(left, text="아래쪽 모드일수록 우선 적용됩니다 · 드래그해서 순서를 바꾸세요",
                   style="Hint.TLabel", padding=(px(18), px(2), px(18), px(10))).pack(fill="x")
 
@@ -688,8 +774,10 @@ class App:
         t = self.theme
         self._conflicts = m.conflicts()
         query = self._query()
+        keep = FILTERS.get(self.filter_var.get())
         visible = [(i, mod) for i, mod in enumerate(m.mods)
-                   if not query or query in mod.name.casefold() or query in mod.author.casefold()]
+                   if (not query or query in mod.name.casefold() or query in mod.author.casefold())
+                   and (keep is None or keep(mod, self._conflicts))]
         existing = set(self.tree.get_children())
         on, off = t.image("check_on", 20), t.image("check_off", 20)
         for pos, (index, mod) in enumerate(visible):
@@ -730,8 +818,11 @@ class App:
             self.empty_button.pack(pady=(self.theme.px(16), 0))
             self.empty.place(relx=0.5, rely=0.42, anchor="center")
         elif not visible:
-            self.empty_title.configure(text="검색 결과가 없습니다")
-            self.empty_sub.configure(text=f"'{self.search_var.get().strip()}'와(과) 일치하는 모드가 없습니다.")
+            conditions = [f"검색어 '{self.search_var.get().strip()}'"] if query else []
+            if keep is not None:
+                conditions.append(f"'{self.filter_var.get()}' 필터")
+            self.empty_title.configure(text="조건에 맞는 모드가 없습니다")
+            self.empty_sub.configure(text=", ".join(conditions) + "에 해당하는 모드가 없습니다.")
             self.empty_button.pack_forget()
             self.empty.place(relx=0.5, rely=0.42, anchor="center")
         else:
@@ -769,6 +860,71 @@ class App:
         else:
             self.state_badge.configure(text="● 게임에 적용됨", style="BadgeOk.TLabel")
         self.buttons["apply"].configure(style="Accent.TButton" if m.dirty and m.game_dir else "TButton")
+        self.profile_button.configure(text=f"프로필 · {shorten_middle(m.profile, 16)}")
+
+    # ------------------------------------------------------------------ profiles
+    def _fill_profile_menu(self):
+        menu = self.profile_menu
+        menu.delete(0, "end")
+        self.profile_var.set(self.manager.profile)
+        for name in self.manager.profiles:
+            menu.add_radiobutton(label=name, value=name, variable=self.profile_var,
+                                 command=lambda n=name: self.switch_profile(n))
+        menu.add_separator()
+        menu.add_command(label="새 프로필 (모든 모드 꺼짐)...", command=lambda: self.new_profile(copy_current=False))
+        menu.add_command(label="현재 프로필 복제...", command=lambda: self.new_profile(copy_current=True))
+        menu.add_command(label="이름 변경...", command=self.rename_profile)
+        menu.add_command(label="현재 프로필 삭제...", command=self.delete_profile,
+                         state="normal" if len(self.manager.profiles) > 1 else "disabled")
+
+    def switch_profile(self, name: str):
+        if name == self.manager.profile or not self.can_mutate():
+            self.profile_var.set(self.manager.profile)
+            return
+        self.manager.switch_profile(name)
+        log.info("프로필 전환: %s", name)
+        self._changed()
+
+    def new_profile(self, copy_current: bool):
+        if not self.can_mutate():
+            return
+        title = "현재 프로필 복제" if copy_current else "새 프로필"
+        initial = f"{self.manager.profile} 복사본" if copy_current else ""
+        name = TextDialog(self.root, self.theme, title, "새 프로필 이름", initial).show()
+        if name is None:
+            return
+        try:
+            self.manager.create_profile(name, copy_current)
+        except ValueError as exc:
+            messagebox.showerror(title, str(exc), parent=self.root)
+            return
+        log.info("새 프로필: %s", self.manager.profile)
+        self._changed()
+
+    def rename_profile(self):
+        old = self.manager.profile
+        name = TextDialog(self.root, self.theme, "프로필 이름 변경", "새 이름", old).show()
+        if not name or name.strip() == old:
+            return
+        try:
+            self.manager.rename_profile(old, name)
+        except ValueError as exc:
+            messagebox.showerror("프로필 이름 변경", str(exc), parent=self.root)
+            return
+        self._update_header()
+
+    def delete_profile(self):
+        name = self.manager.profile
+        if not self.can_mutate() or not messagebox.askyesno(
+                "프로필 삭제", f"'{name}' 프로필을 삭제할까요?\n설치된 모드는 지워지지 않습니다.", parent=self.root):
+            return
+        try:
+            self.manager.delete_profile(name)
+        except ValueError as exc:
+            messagebox.showerror("프로필 삭제", str(exc), parent=self.root)
+            return
+        log.info("프로필 삭제: %s (현재: %s)", name, self.manager.profile)
+        self._changed()
 
     def _refw_tooltip(self) -> str:
         m = self.manager
@@ -1365,7 +1521,8 @@ class App:
             return
         mods = [self.manager.get(i) for i in ids]
         names = "\n".join(f"  • {m.name}" for m in mods[:10]) + ("\n  ..." if len(mods) > 10 else "")
-        if not messagebox.askyesno("모드 삭제", f"다음 모드를 삭제할까요? 저장된 모드 파일도 지워집니다.\n\n{names}", parent=self.root):
+        if self.manager.settings.confirm_remove and not messagebox.askyesno(
+                "모드 삭제", f"다음 모드를 삭제할까요? 저장된 모드 파일도 지워집니다.\n\n{names}", parent=self.root):
             return
         any_enabled = any(m.enabled for m in mods)
 
@@ -1423,12 +1580,17 @@ class App:
             self._log_report(report)
             self.refresh(select=(self._selected_ids() or [None])[0])
             if report.errors:
+                self._launch_after_apply = False
                 more = f"\n... 외 {len(report.errors) - 8}개" if len(report.errors) > 8 else ""
                 self.show_error("일부 파일을 적용하지 못했습니다",
                                 "\n".join(report.errors[:8]) + more +
                                 "\n\n게임이 실행 중이라면 종료한 뒤 다시 '게임에 적용'을 누르세요.")
+            elif self._launch_after_apply and not self._apply_pending and not m.dirty:
+                self._launch_after_apply = False
+                self._start_game()
 
         def failed(exc):
+            self._launch_after_apply = False
             self.show_error("게임에 적용", str(exc))
             self._update_header()
 
@@ -1482,9 +1644,19 @@ class App:
 
     # ------------------------------------------------------------------ misc actions
     def launch_game(self):
-        if self.manager.dirty and self.manager.game_dir and not messagebox.askyesno(
-                "게임 실행", "아직 게임에 적용하지 않은 변경사항이 있습니다.\n그대로 실행할까요?", parent=self.root):
-            return
+        m = self.manager
+        if m.dirty and m.game_dir:
+            if m.settings.apply_before_launch:
+                log.info("남은 변경사항을 적용한 뒤 게임을 실행합니다.")
+                self._launch_after_apply = True
+                self.apply()
+                return
+            if not messagebox.askyesno("게임 실행", "아직 게임에 적용하지 않은 변경사항이 있습니다.\n그대로 실행할까요?",
+                                       parent=self.root):
+                return
+        self._start_game()
+
+    def _start_game(self):
         url = f"steam://rungameid/{STEAM_APP_ID}"
         try:
             if sys.platform == "win32":
@@ -1498,6 +1670,9 @@ class App:
                 os.startfile(str(exe))  # type: ignore[attr-defined]
             else:
                 self.show_error("게임 실행", "Steam을 실행할 수 없습니다.")
+                return
+        if self.manager.settings.minimize_on_launch:
+            self.root.iconify()
 
     def open_game_folder(self):
         if self.manager.game_dir and self.manager.game_dir.is_dir():
@@ -1617,7 +1792,7 @@ class App:
 
     def _on_motion(self, event):
         d = self._drag
-        if not d or len(self.tree.selection()) > 1 or self._query():
+        if not d or len(self.tree.selection()) > 1 or self._query() or self.filter_var.get() != FILTER_ALL:
             return
         if not d["moved"] and abs(event.y - d["y"]) < 8:
             return
@@ -1685,6 +1860,8 @@ class App:
         self._destroy()
 
     def _destroy(self):
+        if not self._closed:
+            self._save_window_state()
         self._closed = True
         self.root.destroy()
 

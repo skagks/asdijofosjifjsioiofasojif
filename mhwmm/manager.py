@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import logging.handlers
 import os
@@ -26,6 +27,8 @@ STATE_VERSION = 1
 SINGLE_FILE_EXTS = (".pak", ".lua", ".dll", ".asi")
 STALE_TEMP_SECONDS = 2 * 3600
 DATA_DIR_NAME = "MHWildsModManager_data"  # next to the exe
+DEFAULT_PROFILE = "기본"
+MAX_PROFILE_NAME = 40
 
 
 class InstallError(Exception):
@@ -216,6 +219,10 @@ def _from_dict(cls, data: dict):
             continue
         if isinstance(default, str) and not isinstance(v, str):
             continue
+        if isinstance(default, float):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            v = float(v)
         if f.default_factory is list and not isinstance(v, list):
             continue
         kwargs[k] = v
@@ -230,6 +237,14 @@ class Settings:
     enable_on_install: bool = True
     check_game_running: bool = True
     check_updates: bool = True
+    confirm_remove: bool = True
+    apply_before_launch: bool = True
+    minimize_on_launch: bool = False
+    remember_window: bool = True
+    window_geometry: str = ""
+    window_zoomed: bool = False
+    sash_ratio: float = 0.58
+    log_visible: bool = True
 
 
 @dataclass
@@ -349,6 +364,10 @@ class ModManager:
         self.settings = Settings()
         self.dirty = False
         self.revision = 0  # bumped on every change that affects deployment
+        # Profiles remember which mods are on, their options and the load order.
+        # The active profile's state lives in self.mods; the others are snapshots.
+        self.profiles: dict[str, dict] = {}
+        self.profile = DEFAULT_PROFILE
         self._entries_cache: dict[str, dict[str, tuple[Path, str]]] = {}
         self._option_cache: dict[tuple[str, str], list[str]] = {}
         self._size_cache: dict[str, int] = {}
@@ -384,6 +403,14 @@ class ModManager:
             mods.append(m)
             log.warning("목록에 없던 모드를 복구했습니다: %s", m.name)
         self.mods = mods
+        raw_profiles = data.get("profiles")
+        self.profiles = {k: v for k, v in raw_profiles.items()
+                         if isinstance(k, str) and k.strip() and isinstance(v, dict)} if isinstance(raw_profiles, dict) else {}
+        profile = data.get("profile")
+        if not isinstance(profile, str) or profile not in self.profiles:
+            profile = next(iter(self.profiles), DEFAULT_PROFILE)
+        self.profile = profile
+        self.profiles[profile] = self._snapshot()
 
     @staticmethod
     def _has_payload(mod_dir: Path) -> bool:
@@ -396,13 +423,96 @@ class ModManager:
             del self._option_cache[key]
 
     def save(self) -> None:
+        self.profiles[self.profile] = self._snapshot()
+        known = {m.id for m in self.mods}
+        for snap in self.profiles.values():  # forget removed mods
+            snap["order"] = [i for i in snap.get("order") or [] if i in known]
+            snap["enabled"] = [i for i in snap.get("enabled") or [] if i in known]
+            snap["options"] = {k: v for k, v in (snap.get("options") or {}).items() if k in known}
         fsutil.atomic_write_json(self.state_path, {
             "version": STATE_VERSION,
             "game_dir": str(self.game_dir) if self.game_dir else "",
             "dirty": self.dirty,
             "settings": asdict(self.settings),
+            "profile": self.profile,
+            "profiles": self.profiles,
             "mods": [m.to_dict() for m in self.mods],
         })
+
+    # ------------------------------------------------------------- profiles
+    def _snapshot(self) -> dict:
+        """Enabled mods, chosen options (by name, so updates keep them) and load order."""
+        return {
+            "order": [m.id for m in self.mods],
+            "enabled": [m.id for m in self.mods if m.enabled],
+            "options": {m.id: [o["name"] for o in m.options if o["id"] in m.selected]
+                        for m in self.mods if m.options},
+        }
+
+    def _restore(self, snap: dict) -> None:
+        position = {mod_id: i for i, mod_id in enumerate(snap.get("order") or []) if isinstance(mod_id, str)}
+        current = {m.id: i for i, m in enumerate(self.mods)}
+        # mods the profile has not seen yet (installed later) go to the end, switched off
+        self.mods.sort(key=lambda m: (0, position[m.id]) if m.id in position else (1, current[m.id]))
+        enabled = set(snap.get("enabled") or [])
+        options = snap.get("options") or {}
+        for m in self.mods:
+            m.enabled = m.id in enabled
+            if m.options:
+                names = options.get(m.id) or []
+                m.selected = [o["id"] for o in m.options if o["name"] in names]
+            self._invalidate(m.id)
+
+    def _check_profile_name(self, name: str, keep: str | None = None) -> str:
+        name = name.strip()
+        if not name:
+            raise ValueError("프로필 이름이 비어 있습니다.")
+        if len(name) > MAX_PROFILE_NAME:
+            raise ValueError(f"프로필 이름은 {MAX_PROFILE_NAME}자까지 쓸 수 있습니다.")
+        for existing in self.profiles:
+            if existing != keep and existing.casefold() == name.casefold():
+                raise ValueError(f"'{existing}' 프로필이 이미 있습니다.")
+        return name
+
+    def switch_profile(self, name: str) -> None:
+        if name not in self.profiles:
+            raise KeyError(name)
+        if name == self.profile:
+            return
+        self.profiles[self.profile] = self._snapshot()
+        self.profile = name
+        self._restore(self.profiles[name])
+        self._changed()
+
+    def create_profile(self, name: str, copy_current: bool = True) -> str:
+        """Add a profile (a copy of the current one, or with every mod off) and switch to it."""
+        name = self._check_profile_name(name)
+        snap = self._snapshot()
+        if not copy_current:
+            snap = {"order": snap["order"], "enabled": [], "options": {}}
+        self.profiles[name] = copy.deepcopy(snap)
+        self.switch_profile(name)
+        return name
+
+    def rename_profile(self, old: str, new: str) -> str:
+        if old not in self.profiles:
+            raise KeyError(old)
+        new = self._check_profile_name(new, keep=old)
+        self.profiles = {(new if k == old else k): v for k, v in self.profiles.items()}
+        if self.profile == old:
+            self.profile = new
+        self.save()
+        return new
+
+    def delete_profile(self, name: str) -> None:
+        if name not in self.profiles:
+            raise KeyError(name)
+        if len(self.profiles) <= 1:
+            raise ValueError("마지막 남은 프로필은 지울 수 없습니다.")
+        if name == self.profile:
+            self.switch_profile(next(n for n in self.profiles if n != name))
+        del self.profiles[name]
+        self.save()
 
     def _write_mod_meta(self, mod: Mod, mod_dir: Path | None = None) -> None:
         fsutil.atomic_write_json((mod_dir or self.mods_dir / mod.id) / "mod.json", mod.to_dict())

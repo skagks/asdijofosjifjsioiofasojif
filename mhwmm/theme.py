@@ -207,6 +207,7 @@ class Theme:
         s.configure("Display.TLabel", background=p["surface"], foreground=p["accent"], font=f["display"])
         s.configure("EmptyTitle.TLabel", background=p["surface"], font=f["section"])
         s.configure("DialogTitle.TLabel", background=p["bg"], font=f["section"])
+        s.configure("DialogSection.TLabel", background=p["bg"], foreground=p["accent"], font=f["small_bold"])
         s.configure("CardTitle.TLabel", background=p["surface"], font=f["detail_title"])
         s.configure("Callout.TFrame", background=p["warn_bg"])
         s.configure("CalloutTitle.TLabel", background=p["warn_bg"], foreground=p["warn"], font=f["bold"])

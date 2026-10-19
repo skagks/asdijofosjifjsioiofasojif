@@ -54,6 +54,7 @@ def _print_options(manager: ModManager, mod) -> None:
 def cmd_list(manager: ModManager, args) -> int:
     print(f"게임 폴더: {manager.game_dir or '(설정 안 됨)'}")
     print(f"REFramework: {'설치됨' if manager.refw_installed() else '없음'}")
+    print(f"프로필: {manager.profile}")
     if not manager.mods:
         print("설치된 모드가 없습니다.")
         return 0
@@ -95,6 +96,34 @@ def cmd_install(manager: ModManager, args) -> int:
         print(f"설치: {mod.name}  ({_kinds(manager.mod_kinds(mod.id))}, {len(manager.mod_files(mod.id))}개 파일)")
         if mod.options:
             _print_options(manager, mod)
+    return _maybe_deploy(manager, args)
+
+
+def cmd_profile(manager: ModManager, args) -> int:
+    try:
+        if not args.name:
+            for name in manager.profiles:
+                print(f"{'*' if name == manager.profile else ' '} {name}")
+            return 0
+        if args.delete:
+            manager.delete_profile(args.name)
+            print(f"프로필 삭제: {args.name} (현재: {manager.profile})")
+        elif args.rename:
+            new = manager.rename_profile(args.name, args.rename)
+            print(f"프로필 이름 변경: {args.name} -> {new}")
+            return 0
+        elif args.create:
+            manager.create_profile(args.name, copy_current=not args.empty)
+            print(f"프로필 만들기: {manager.profile}")
+        else:
+            manager.switch_profile(args.name)
+            print(f"프로필 전환: {manager.profile}")
+    except KeyError:
+        print(f"프로필이 없습니다: {args.name}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
     return _maybe_deploy(manager, args)
 
 
@@ -211,6 +240,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", type=int, nargs="*", metavar="번호", help="켤 옵션 번호들 (나머지는 꺼짐, 비우면 모두 끔)")
     p.add_argument("--no-deploy", action="store_true")
 
+    p = sub.add_parser("profile", help="프로필 목록/전환/만들기/삭제")
+    p.add_argument("name", nargs="?", help="프로필 이름 (생략하면 목록)")
+    p.add_argument("--create", action="store_true", help="현재 상태를 복사해 새 프로필 만들기")
+    p.add_argument("--empty", action="store_true", help="--create와 함께: 모든 모드가 꺼진 프로필")
+    p.add_argument("--rename", metavar="새이름", help="프로필 이름 바꾸기")
+    p.add_argument("--delete", action="store_true", help="프로필 삭제")
+    p.add_argument("--no-deploy", action="store_true")
+
     sub.add_parser("deploy", help="활성화된 모드를 게임 폴더에 적용")
     sub.add_parser("purge", help="게임 폴더에서 모든 모드 파일 제거")
     sub.add_parser("verify", help="적용된 파일 점검")
@@ -223,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 READ_ONLY_COMMANDS = ("list", "verify")
 COMMANDS = {
-    "list": cmd_list, "install": cmd_install, "options": cmd_options, "enable": cmd_toggle, "disable": cmd_toggle,
+    "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game,
 }

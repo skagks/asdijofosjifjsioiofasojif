@@ -59,3 +59,19 @@ def test_cli_end_to_end(tmp_path, game_dir, capsys):
     assert main(["--data-dir", data, "disable", "1"]) == 0
     assert not (game_dir / "natives").exists()
     assert main(["--data-dir", data, "verify"]) == 0
+
+
+def test_cli_profiles(tmp_path, game_dir, capsys):
+    data = str(tmp_path / "cli-data")
+    archive = make_zip(tmp_path / "A.zip", {"natives/STM/a.tex": "a"})
+    assert main(["--data-dir", data, "game", str(game_dir)]) == 0
+    assert main(["--data-dir", data, "install", str(archive)]) == 0
+    assert (game_dir / "natives/STM/a.tex").exists()
+    assert main(["--data-dir", data, "profile", "바닐라", "--create", "--empty"]) == 0
+    assert not (game_dir / "natives").exists()
+    assert main(["--data-dir", data, "profile", "기본"]) == 0
+    assert (game_dir / "natives/STM/a.tex").exists()
+    capsys.readouterr()
+    assert main(["--data-dir", data, "profile"]) == 0
+    assert capsys.readouterr().out.split() == ["*", "기본", "바닐라"]
+    assert main(["--data-dir", data, "profile", "없는것"]) == 1

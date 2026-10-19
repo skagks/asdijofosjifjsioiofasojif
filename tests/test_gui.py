@@ -118,3 +118,59 @@ def test_gui_moves_old_data_with_progress(root, tmp_path, monkeypatch):
     path, problem = gui._prepare_data_dir(root, None)
     assert problem is None and path == app_dir / "MHWildsModManager_data"
     assert (path / "mods" / "m1" / "files" / "a.pak").exists() and not legacy.exists()
+
+
+def test_gui_profiles_filter_settings_and_launch(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import gui
+
+    for name in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(gui.messagebox, name, lambda *a, **k: None)
+    with manager.prepare_install(make_zip(tmp_path / "A.zip", {"natives/STM/a.tex": "a"})) as s:
+        a = manager.install_variant(s, s.variants[0])
+    with manager.prepare_install(make_zip(tmp_path / "B.zip", {"natives/STM/a.tex": "b"})) as s:
+        b = manager.install_variant(s, s.variants[0])
+    manager.set_enabled(b.id, False)
+    app = gui.App(root, manager, queue.Queue())
+    app.apply()
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+
+    # filter
+    app.filter_var.set("비활성")
+    app.refresh()
+    assert list(app.tree.get_children()) == [b.id]
+    app.filter_var.set("충돌 있음")
+    app.refresh()
+    assert list(app.tree.get_children()) == []
+    app.filter_var.set(gui.FILTER_ALL)
+    app.refresh()
+
+    # a new empty profile turns everything off in the game folder
+    monkeypatch.setattr(gui.TextDialog, "show", lambda self: "바닐라")
+    app.new_profile(copy_current=False)
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    assert manager.profile == "바닐라" and not (game_dir / "natives").exists()
+    assert "바닐라" in app.profile_button.cget("text")
+    app.switch_profile("기본")
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    assert (game_dir / "natives/STM/a.tex").read_text() == "a"
+
+    # launching with pending changes applies them first
+    started = []
+    monkeypatch.setattr(app, "_start_game", lambda: started.append(True))
+    manager.update_settings(auto_apply=False)
+    manager.set_enabled(b.id, True)
+    app.launch_game()
+    pump(root, lambda: bool(started))
+    assert (game_dir / "natives/STM/a.tex").read_text() == "b" and not manager.dirty
+
+    # settings dialog saves the new options
+    dialog = gui.SettingsDialog(root, app.theme, manager)
+    dialog.vars["confirm_remove"].set(False)
+    dialog.vars["minimize_on_launch"].set(True)
+    dialog.ok()
+    assert not manager.settings.confirm_remove and manager.settings.minimize_on_launch
+
+    # window state is remembered
+    app.toggle_log()
+    app._save_window_state()
+    assert manager.settings.window_geometry and not manager.settings.log_visible

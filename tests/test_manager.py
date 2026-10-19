@@ -278,3 +278,62 @@ def test_failed_move_keeps_old_data(frozen_exe, tmp_path, monkeypatch):
     assert path == legacy and "disk full" in problem
     assert (legacy / "mods" / "m1" / "files" / "a.pak").exists()
     assert not (frozen_exe / "MHWildsModManager_data.partial").exists()
+
+
+def test_profiles_remember_enabled_options_and_order(manager, game_dir, tmp_path):
+    (a,) = install(manager, make_zip(tmp_path / "A.zip", {"natives/STM/a.tex": "a"}))
+    (b,) = install(manager, make_zip(tmp_path / "B.zip", {"natives/STM/a.tex": "b"}))
+    with manager.prepare_install(make_zip(tmp_path / "Opts.zip", {
+            "Opts/One/natives/STM/o.tex": "1", "Opts/Two/natives/STM/o.tex": "2"})) as s:
+        opts = manager.install_package(s, s.variants, None, [0])
+    manager.deploy()
+    assert manager.profile == "기본" and list(manager.profiles) == ["기본"]
+    assert (game_dir / "natives/STM/a.tex").read_text() == "b"
+
+    manager.create_profile("사진용")  # copy of the current setup
+    manager.move_to(b.id, 0)  # now A wins
+    manager.set_enabled(opts.id, True)
+    manager.set_options(opts.id, [opts.options[1]["id"]])
+    manager.deploy()
+    assert (game_dir / "natives/STM/a.tex").read_text() == "a"
+    assert (game_dir / "natives/STM/o.tex").read_text() == "2"
+
+    manager.switch_profile("기본")
+    assert [m.id for m in manager.mods] == [a.id, b.id, opts.id]
+    assert manager.get(opts.id).selected == [opts.options[0]["id"]]
+    manager.deploy()
+    assert (game_dir / "natives/STM/a.tex").read_text() == "b"
+    assert (game_dir / "natives/STM/o.tex").read_text() == "1"
+
+    # a mod installed now is off (and last) in the other profile
+    (c,) = install(manager, make_zip(tmp_path / "C.zip", {"natives/STM/c.tex": "c"}))
+    assert c.enabled
+    manager.switch_profile("사진용")
+    assert not manager.get(c.id).enabled and manager.mods[-1].id == c.id
+
+    reloaded = ModManager(manager.data_dir)
+    assert reloaded.profile == "사진용" and list(reloaded.profiles) == ["기본", "사진용"]
+    assert [m.id for m in reloaded.mods][:2] == [b.id, a.id]
+
+
+def test_profile_management_rules(manager, tmp_path):
+    (a,) = install(manager, make_zip(tmp_path / "A.zip", {"natives/a.tex": "a"}))
+    manager.create_profile("빈 프로필", copy_current=False)
+    assert not manager.get(a.id).enabled
+    with pytest.raises(ValueError):
+        manager.create_profile("빈 프로필")
+    with pytest.raises(ValueError):
+        manager.create_profile("   ")
+    manager.rename_profile("빈 프로필", "테스트")
+    assert manager.profile == "테스트"
+    manager.delete_profile("테스트")  # deleting the active profile switches back
+    assert manager.profile == "기본" and manager.get(a.id).enabled
+    with pytest.raises(ValueError):
+        manager.delete_profile("기본")
+
+
+def test_settings_type_checks(manager):
+    from mhwmm.manager import Settings, _from_dict
+
+    s = _from_dict(Settings, {"sash_ratio": 1, "remember_window": "yes", "window_geometry": 5})
+    assert s.sash_ratio == 1.0 and s.remember_window is True and s.window_geometry == ""
