@@ -216,7 +216,8 @@ class Theme:
         s.configure("Callout.TLabel", background=p["warn_bg"], foreground=p["text"])
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
         for kind, fg, bg in (("Ok", "success", "success_bg"), ("Warn", "warn", "warn_bg"),
-                             ("Bad", "danger", "danger_bg"), ("Neutral", "chip_text", "chip")):
+                             ("Bad", "danger", "danger_bg"), ("Neutral", "chip_text", "chip"),
+                             ("Info", "info", "info_bg")):
             s.configure(f"Badge{kind}.TLabel", background=p[bg], foreground=p[fg], font=f["small_bold"],
                         padding=(px(10), px(4)))
 

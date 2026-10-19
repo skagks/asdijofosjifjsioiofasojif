@@ -232,6 +232,7 @@ def test_gui_nexus_updates(root, manager, tmp_path, monkeypatch):
     monkeypatch.setattr(nexus.NexusClient, "validate", lambda self: {"name": "hunter", "is_premium": False})
     monkeypatch.setattr(nexus.NexusClient, "files", lambda self, mod_id: files_data())
     app = gui.App(root, manager, queue.Queue())
+    assert "Nexus 키 필요" in app.mods_badge.cget("text")  # no key yet: the badge points to the settings
 
     # the API key is checked and saved in the settings
     dialog = gui.SettingsDialog(root, app.theme, manager)
@@ -287,3 +288,32 @@ def test_gui_help_window(root, manager):
     assert str(dialog.nav_buttons[0].cget("style")) == "NavActive.TButton"
     assert str(dialog.nav_buttons[1].cget("style")) == "Nav.TButton"
     dialog.destroy()
+
+
+def test_gui_checks_mod_updates_at_startup(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui, nexus
+
+    from test_nexus import files_data
+
+    archive = make_zip(tmp_path / "Better Armor-1234-1-0-1740000000.zip", {"natives/STM/a.tex": "a"})
+    with manager.prepare_install(archive) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    manager.update_settings(nexus_api_key="secret", last_mod_check=time.time())  # checked a moment ago
+    monkeypatch.setattr(nexus.NexusClient, "files", lambda self, mod_id: files_data())
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: mod.update and not app._checking_mods)
+    assert app.mods_badge.cget("text") == "● 모드 업데이트 1개" and app.mods_badge.winfo_manager()
+    assert "1.0 → 1.2" in app._mods_tooltip()
+    app._on_mods_badge_click()
+    assert app.filter_var.get() == gui.FILTER_UPDATES and list(app.tree.get_children()) == [mod.id]
+
+    # nothing new: the badge says so, and a failed check is shown too
+    manager.set_update_results({mod.id: {}})
+    app.refresh()
+    assert app.mods_badge.cget("text") == "● 모드 최신"
+    app._on_mods_checked(None, [], nexus.NexusError("Nexus 요청 한도를 넘었습니다."), False)
+    assert "실패" in app.mods_badge.cget("text") and "한도" in app._mods_tooltip()
+    manager.update_settings(check_mod_updates=False)
+    app._mod_check_error = None
+    app.refresh()
+    assert not app.mods_badge.winfo_manager()

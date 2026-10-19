@@ -1,6 +1,6 @@
 [project]
 name = "mhwilds-mod-manager"
-version = "1.6.1"
+version = "1.6.2"
 description = "Monster Hunter Wilds mod manager (몬스터 헌터 와일즈 모드 매니저)"
 readme = "README.md"
 requires-python = ">=3.10"

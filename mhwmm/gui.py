@@ -64,7 +64,6 @@ FILTERS = {
 }
 FILTER_ALL = "전체"
 FILTER_UPDATES = "업데이트 있음"
-MOD_CHECK_INTERVAL = 6 * 3600  # automatic Nexus checks at most this often
 # Errors that are shown to the user without a traceback in the log.
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
 
@@ -595,6 +594,7 @@ class App:
         self._launch_after_apply = False
         self._refw_status: refw.Status | None = None
         self._checking_mods = False
+        self._mod_check_error: str | None = None
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -628,9 +628,8 @@ class App:
             root.after(2500, lambda: self.check_updates(manual=False))
         if manager.settings.check_refw_updates:
             root.after(3500, lambda: self.check_refw(manual=False))
-        s = manager.settings
-        if s.check_mod_updates and s.nexus_api_key and time.time() - s.last_mod_check > MOD_CHECK_INTERVAL:
-            root.after(4500, lambda: self.check_mod_updates(manual=False))
+        if manager.settings.check_mod_updates and manager.settings.nexus_api_key:
+            root.after(1500, lambda: self.check_mod_updates(manual=False))
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -718,6 +717,10 @@ class App:
         self.refw_badge.pack(side="right", padx=(0, px(10)))
         self.refw_badge.bind("<Button-1>", lambda e: self._on_refw_click())
         Tooltip(t, self.refw_badge, self._refw_tooltip)
+        # Nexus mod updates: shown while checking, with the result, or when the API key is missing
+        self.mods_badge = ttk.Label(header, text="", style="BadgeNeutral.TLabel", cursor="hand2")
+        self.mods_badge.bind("<Button-1>", lambda e: self._on_mods_badge_click())
+        Tooltip(t, self.mods_badge, self._mods_tooltip)
         # shown once a newer release is found
         self.update_button = ttk.Button(header, text="", style="Update.TButton", command=self.show_update)
         Tooltip(t, self.update_button, "새 버전의 변경 내역을 보고 업데이트합니다")
@@ -1120,6 +1123,59 @@ class App:
             self.state_badge.configure(text="● 게임에 적용됨", style="BadgeOk.TLabel")
         self.buttons["apply"].configure(style="Accent.TButton" if m.dirty and m.game_dir else "TButton")
         self.profile_button.configure(text=f"프로필 · {shorten_middle(m.profile, 16)}")
+        self._update_mods_badge()
+
+    def _update_mods_badge(self):
+        m, s = self.manager, self.manager.settings
+        updates = sum(1 for mod in m.mods if mod.update)
+        state = None
+        if self._checking_mods:
+            state = ("● 모드 업데이트 확인 중", "BadgeNeutral.TLabel")
+        elif updates:
+            state = (f"● 모드 업데이트 {updates}개", "BadgeInfo.TLabel")
+        elif not s.check_mod_updates:
+            state = None
+        elif not s.nexus_api_key:
+            if any(mod.origin != refw.ORIGIN for mod in m.mods):
+                state = ("● Nexus 키 필요", "BadgeNeutral.TLabel")
+        elif self._mod_check_error:
+            state = ("● 모드 업데이트 확인 실패", "BadgeWarn.TLabel")
+        elif s.last_mod_check:
+            state = ("● 모드 최신", "BadgeOk.TLabel")
+        if state is None:
+            self.mods_badge.pack_forget()
+            return
+        self.mods_badge.configure(text=state[0], style=state[1])
+        if not self.mods_badge.winfo_manager():
+            self.mods_badge.pack(side="right", padx=(0, self.theme.px(10)), after=self.refw_badge)
+
+    def _mods_tooltip(self) -> str:
+        s = self.manager.settings
+        if self._checking_mods:
+            return "Nexus에서 설치한 모드의 새 버전을 확인하고 있습니다"
+        if not s.nexus_api_key:
+            return ("설정에서 Nexus API 키를 넣으면 프로그램을 켤 때마다 모드 업데이트를 확인합니다.\n"
+                    "클릭하면 설정을 엽니다.")
+        lines = []
+        if self._mod_check_error:
+            lines.append(f"확인하지 못했습니다: {self._mod_check_error}")
+        updates = [mod for mod in self.manager.mods if mod.update]
+        lines += [f"{mod.name}  {mod.version or '?'} → {mod.update.get('version') or '새 파일'}" for mod in updates[:10]]
+        if len(updates) > 10:
+            lines.append(f"… 외 {len(updates) - 10}개")
+        if s.last_mod_check:
+            lines.append("마지막 확인: " + time.strftime("%Y-%m-%d %H:%M", time.localtime(s.last_mod_check)))
+        lines.append("클릭하면 업데이트가 있는 모드만 보여 줍니다." if updates else "클릭하면 다시 확인합니다.")
+        return "\n".join(lines)
+
+    def _on_mods_badge_click(self):
+        if not self.manager.settings.nexus_api_key:
+            self.open_settings()
+        elif any(mod.update for mod in self.manager.mods):
+            self.filter_var.set(FILTER_UPDATES)
+            self.refresh()
+        elif not self._checking_mods:
+            self.check_mod_updates(manual=True)
 
     # ------------------------------------------------------------------ profiles
     def _fill_profile_menu(self):
@@ -1300,6 +1356,7 @@ class App:
                     "오른쪽 클릭 > 'Nexus 링크 설정'으로 모드 페이지 주소를 넣어 주세요."), parent=self.root)
             return
         self._checking_mods = True
+        self._update_mods_badge()
 
         def status(msg):
             if self.busy is None:
@@ -1319,12 +1376,14 @@ class App:
 
     def _on_mods_checked(self, results: dict | None, problems: list[str], error: Exception | None, manual: bool):
         self._checking_mods = False
+        self._mod_check_error = str(error) if error is not None else None
         if self.busy is None:
             self.status_var.set("준비")
         if error is not None:
             if not isinstance(error, nexus.NexusError):
                 log.error("모드 업데이트 확인 중 오류", exc_info=error)
             log.warning("모드 업데이트 확인 실패: %s", error)
+            self._update_mods_badge()
             if manual:
                 messagebox.showwarning("모드 업데이트 확인", str(error), parent=self.root)
             return
@@ -2184,7 +2243,8 @@ class App:
         self._update = release
         self.update_button.configure(text=f"⬆  v{release.version} 업데이트")
         if not self.update_button.winfo_manager():
-            self.update_button.pack(side="right", padx=(0, self.theme.px(10)), after=self.refw_badge)
+            after = self.mods_badge if self.mods_badge.winfo_manager() else self.refw_badge
+            self.update_button.pack(side="right", padx=(0, self.theme.px(10)), after=after)
         log.info("새 버전 v%s이 나왔습니다. 오른쪽 위 '업데이트' 버튼을 누르세요.", release.version)
         if manual:
             self.show_update()
