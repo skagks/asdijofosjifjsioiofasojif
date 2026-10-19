@@ -78,6 +78,15 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     assert (game_dir / "natives/STM/o.tex").read_text() == "2"
     assert "옵션 1/2" in app.tree.item(opts.id, "values")[1]
 
+    # a newer release shows the update button and its dialog
+    from mhwmm.updater import Release
+    release = Release("9.9.9", "v9.9.9", "### 변경 내역\n\n- **새 기능**", "https://example", None, 0, None)
+    app._on_update_checked(release, None, False)
+    assert app.update_button.winfo_manager() == "pack"
+    assert "v9.9.9" in app.update_button.cget("text")
+    dialog = gui.UpdateDialog(root, app.theme, release, can_install=True)
+    dialog.destroy()
+
     app.apply_theme("light")  # switching themes repaints without errors
     app.search_var.set("zzz")
     assert app.tree.get_children() == ()

@@ -230,6 +230,12 @@ COMMANDS = {
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["--finish-update"] and len(argv) == 3:
+        # started by the in-app updater from the freshly downloaded exe
+        from .updater import finish_update
+
+        return finish_update(argv[1], int(argv[2]))
     args = build_parser().parse_args(argv)
     if args.cmd in (None, "gui"):
         from .gui import main as gui_main

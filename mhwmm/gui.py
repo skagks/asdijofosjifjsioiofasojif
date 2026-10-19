@@ -14,7 +14,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, fsutil, steam
+from . import __version__, fsutil, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, DEFAULT_PAK_CHAIN, GAME_EXE, NEXUS_URL, PAK_CHAINS,
@@ -23,6 +23,7 @@ from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .manager import (InstallError, InstallSession, Mod, ModManager, acquire_instance_lock,
                       default_data_dir, setup_logging)
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
+from .updater import Release, UpdateError
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
@@ -51,7 +52,7 @@ INSTALL_FILETYPES = [
     ("모든 파일", "*.*"),
 ]
 # Errors that are shown to the user without a traceback in the log.
-EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, OSError, ValueError)
+EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
 
 
 KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
@@ -167,10 +168,10 @@ class Dialog(tk.Toplevel):
         self.body = ttk.Frame(self, padding=theme.px(22))
         self.body.pack(fill="both", expand=True)
 
-    def buttons(self, ok_text: str, ok_command):
+    def buttons(self, ok_text: str, ok_command, cancel_text: str = "취소"):
         row = ttk.Frame(self.body)
         row.pack(fill="x", pady=(self.theme.px(18), 0))
-        ttk.Button(row, text="취소", command=self.cancel).pack(side="right")
+        ttk.Button(row, text=cancel_text, command=self.cancel).pack(side="right")
         ttk.Button(row, text=ok_text, style="Accent.TButton", command=ok_command).pack(
             side="right", padx=(0, self.theme.px(8)))
         self.bind("<Return>", lambda e: ok_command())
@@ -211,6 +212,34 @@ class TextDialog(Dialog):
         self.destroy()
 
 
+class UpdateDialog(Dialog):
+    """Shows what a new release changes; result is "install", "page" or None."""
+
+    def __init__(self, parent, theme: Theme, release: Release, can_install: bool):
+        super().__init__(parent, theme, "업데이트")
+        px = theme.px
+        ttk.Label(self.body, text=f"새 버전 v{release.version}이 나왔습니다", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.body, text=f"지금 쓰는 버전은 v{__version__}입니다.", style="Muted.TLabel").pack(
+            anchor="w", pady=(px(4), px(12)))
+        notes = theme.mark(tk.Text(self.body, height=12, width=66, wrap="word", font=theme.fonts["small"],
+                                   padx=px(14), pady=px(10), cursor="arrow"), "text")
+        text = release.changes.replace("**", "").replace("`", "") or "변경 내역이 없습니다."
+        notes.insert("1.0", text)
+        notes.configure(state="disabled")
+        notes.pack(fill="both", expand=True)
+        if not can_install:
+            ttk.Label(self.body, text="Python으로 실행 중이라 자동 업데이트 대신 다운로드 페이지를 엽니다.",
+                      style="Muted.TLabel", wraplength=px(480), justify="left").pack(anchor="w", pady=(px(10), 0))
+        row = self.buttons("지금 업데이트" if can_install else "다운로드 페이지 열기",
+                           lambda: self.finish("install" if can_install else "page"), cancel_text="나중에")
+        if can_install:
+            ttk.Button(row, text="릴리즈 페이지", command=lambda: self.finish("page")).pack(side="left")
+
+    def finish(self, result: str):
+        self.result = result
+        self.destroy()
+
+
 class SettingsDialog(Dialog):
     def __init__(self, parent, theme: Theme, manager: ModManager):
         super().__init__(parent, theme, "설정")
@@ -238,11 +267,13 @@ class SettingsDialog(Dialog):
         self.auto_apply = tk.BooleanVar(value=s.auto_apply)
         self.enable_on_install = tk.BooleanVar(value=s.enable_on_install)
         self.check_running = tk.BooleanVar(value=s.check_game_running)
+        self.check_updates = tk.BooleanVar(value=s.check_updates)
         checks = ttk.Frame(self.body)
         checks.pack(fill="x", pady=(px(14), 0))
         for text, var in (("변경 즉시 게임 폴더에 적용", self.auto_apply),
                           ("설치한 모드를 바로 활성화", self.enable_on_install),
-                          ("적용 전에 게임 실행 여부 확인", self.check_running)):
+                          ("적용 전에 게임 실행 여부 확인", self.check_running),
+                          ("시작할 때 새 버전 확인", self.check_updates)):
             theme.checkbutton(checks, text, var).pack(anchor="w", pady=px(1))
 
         data = ttk.Frame(self.body)
@@ -264,6 +295,7 @@ class SettingsDialog(Dialog):
                 auto_apply=self.auto_apply.get(),
                 enable_on_install=self.enable_on_install.get(),
                 check_game_running=self.check_running.get(),
+                check_updates=self.check_updates.get(),
             )
         except ValueError as exc:
             messagebox.showerror("설정", str(exc), parent=self)
@@ -289,6 +321,7 @@ class App:
         self._preview = None
         self._conflicts = None
         self._log_visible = True
+        self._update: Release | None = None
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -315,6 +348,8 @@ class App:
         root.after(60, self._place_sash)
         root.after(100, self._poll_events)
         root.after(300, self._startup)
+        if manager.settings.check_updates:
+            root.after(2500, lambda: self.check_updates(manual=False))
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -364,6 +399,9 @@ class App:
         self.refw_badge.pack(side="right", padx=(0, px(10)))
         self.refw_badge.bind("<Button-1>", lambda e: self._on_refw_click())
         Tooltip(t, self.refw_badge, self._refw_tooltip)
+        # shown once a newer release is found
+        self.update_button = ttk.Button(header, text="", style="Update.TButton", command=self.show_update)
+        Tooltip(t, self.update_button, "새 버전의 변경 내역을 보고 업데이트합니다")
 
     def _build_main_menu(self, parent) -> tk.Menu:
         m = self.theme.mark(tk.Menu(parent, tearoff=False), "menu")
@@ -381,6 +419,7 @@ class App:
         m.add_command(label="REFramework 다운로드", command=lambda: webbrowser.open(REFRAMEWORK_URL))
         m.add_command(label="Nexus Mods (몬헌 와일즈)", command=lambda: webbrowser.open(NEXUS_URL))
         m.add_separator()
+        m.add_command(label="업데이트 확인", command=lambda: self.check_updates(manual=True))
         m.add_command(label="사용법", command=self.show_help)
         m.add_command(label="정보", command=self.show_about)
         m.add_separator()
@@ -1053,6 +1092,8 @@ class App:
                 kind = event[0]
                 if kind == "log":
                     self._append_log(event[1], event[2])
+                elif kind == "call":  # result of a small background job
+                    event[1](*event[2:])
                 elif kind == "progress":
                     _, done, total, msg = event
                     if str(self.progress.cget("mode")) != "determinate":
@@ -1083,6 +1124,8 @@ class App:
             self.root.after(80, self._poll_events)
 
     def _after_task(self):
+        if self._closed:
+            return
         if self.busy is None and self._close_after_task:
             self._destroy()
             return
@@ -1478,6 +1521,71 @@ class App:
             "• natives 폴더(루스 파일) 모드와 Lua 스크립트는 REFramework가 필요합니다. REFramework도 이 프로그램으로 설치할 수 있습니다.\n"
             "• 7z/rar 파일은 PC에 설치된 반디집이나 7-Zip으로 풉니다."), parent=self.root)
 
+    # ------------------------------------------------------------------ updates
+    def check_updates(self, manual: bool):
+        """Look for a newer release in the background."""
+        def worker():
+            try:
+                release = updater.check_for_update()
+            except UpdateError as exc:
+                self.events.put(("call", self._on_update_checked, None, exc, manual))
+            else:
+                self.events.put(("call", self._on_update_checked, release, None, manual))
+
+        if manual:
+            self.status_var.set("새 버전 확인 중...")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_checked(self, release: Release | None, error: Exception | None, manual: bool):
+        if manual:
+            self.status_var.set("준비")
+        if error is not None:
+            log.info("업데이트 확인 실패: %s", error)
+            if manual:
+                messagebox.showwarning("업데이트 확인", str(error), parent=self.root)
+            return
+        if release is None:
+            if manual:
+                messagebox.showinfo("업데이트 확인", f"최신 버전(v{__version__})을 쓰고 있습니다.", parent=self.root)
+            return
+        self._update = release
+        self.update_button.configure(text=f"⬆  v{release.version} 업데이트")
+        if not self.update_button.winfo_manager():
+            self.update_button.pack(side="right", padx=(0, self.theme.px(10)), after=self.refw_badge)
+        log.info("새 버전 v%s이 나왔습니다. 오른쪽 위 '업데이트' 버튼을 누르세요.", release.version)
+        if manual:
+            self.show_update()
+
+    def show_update(self):
+        release = self._update
+        if release is None:
+            return
+        choice = UpdateDialog(self.root, self.theme, release, updater.can_self_update()).show()
+        if choice == "page":
+            webbrowser.open(release.page_url)
+        elif choice == "install":
+            self.install_update(release)
+
+    def install_update(self, release: Release):
+        if not self._idle():
+            return
+        target = updater.current_exe()
+        staged = updater.staged_path(target)
+
+        def done(path):
+            messagebox.showinfo("업데이트", f"v{release.version}을 내려받았습니다.\n"
+                                          "프로그램을 다시 시작해 업데이트를 적용합니다.", parent=self.root)
+            try:
+                updater.launch_finisher(path, target)
+            except OSError as exc:
+                self.show_error("업데이트", f"업데이트를 시작하지 못했습니다: {exc}")
+                return
+            log.info("v%s로 업데이트하기 위해 다시 시작합니다.", release.version)
+            self._destroy()
+
+        self.run_task("update", "업데이트 다운로드 중...", lambda p: updater.download(release, staged, p),
+                      on_done=done, on_error=lambda exc: self.show_error("업데이트", str(exc)))
+
     def show_about(self):
         messagebox.showinfo("정보", f"{APP_TITLE}\n버전 {__version__}\n\n데이터 폴더:\n{self.manager.data_dir}", parent=self.root)
 
@@ -1615,6 +1723,8 @@ def main(data_dir=None) -> int:
         root.destroy()
         return 1
     setup_logging(manager.data_dir, QueueLogHandler(events))
+    if updater.can_self_update():
+        updater.cleanup_staged()
     App(root, manager, events)
     root.deiconify()
     root.mainloop()

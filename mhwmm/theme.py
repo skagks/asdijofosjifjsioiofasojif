@@ -244,6 +244,8 @@ class Theme:
         s.map("Ghost.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])
         button("Link.TButton", p["surface"], p["muted"], p["hover"], p["pressed"], padding=(8, 2),
                font=f["small"], width=-2)
+        button("Update.TButton", p["accent"], p["on_accent"], p["accent_hover"], p["accent_press"],
+               padding=(12, 5), font=f["small_bold"], width=-2)
 
         for style, bg, border in (("Chip.TMenubutton", p["raised"], p["border"]),
                                   ("Ghost.TMenubutton", p["surface"], p["surface"])):

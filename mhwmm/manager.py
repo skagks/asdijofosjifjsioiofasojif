@@ -134,6 +134,7 @@ class Settings:
     auto_apply: bool = True
     enable_on_install: bool = True
     check_game_running: bool = True
+    check_updates: bool = True
 
 
 @dataclass

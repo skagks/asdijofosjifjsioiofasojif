@@ -25,3 +25,8 @@ REFRAMEWORK_DLL = "dinput8.dll"
 
 REFRAMEWORK_URL = "https://github.com/praydog/REFramework-nightly/releases"
 NEXUS_URL = "https://www.nexusmods.com/games/monsterhunterwilds/mods"
+
+# Releases of this program (used by the in-app updater).
+GITHUB_REPO = "skagks/asdijofosjifjsioiofasojif"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+EXE_NAME = "MHWildsModManager.exe"
