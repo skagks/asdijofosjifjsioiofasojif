@@ -2403,10 +2403,14 @@ def _windows_setup():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
     except Exception:
         pass
+    if getattr(sys, "frozen", False):
+        # The exe keeps Windows' default taskbar identity (its path), so a pinned shortcut to it and the
+        # running window share one taskbar button. An explicit ID would make them two buttons.
+        return
     try:
         import ctypes
 
-        # Own taskbar group/icon instead of python.exe's when run from source.
+        # From source: own taskbar group/icon instead of python.exe's.
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MHWildsModManager")  # type: ignore[attr-defined]
     except Exception:
         pass

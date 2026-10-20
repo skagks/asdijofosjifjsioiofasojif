@@ -337,3 +337,25 @@ def test_gui_moves_old_chain_paks_to_pak_mods_at_startup(root, manager, tmp_path
     pump(root, lambda: target.exists() and app.busy is None and not manager.dirty)
     assert target.read_text() == "tex" and chen.enabled
     assert not (game_dir / "re_chunk_000.pak.sub_000.pak.patch_017.pak").exists() and not manager.outdated_paks()
+
+
+def test_exe_keeps_the_default_taskbar_identity(monkeypatch):
+    """A pinned taskbar shortcut and the running exe must stay one taskbar button."""
+    import ctypes
+    import types
+
+    from mhwmm import gui
+
+    calls = []
+    fake = types.SimpleNamespace(
+        shcore=types.SimpleNamespace(SetProcessDpiAwareness=lambda v: calls.append("dpi")),
+        shell32=types.SimpleNamespace(SetCurrentProcessExplicitAppUserModelID=lambda v: calls.append(v)))
+    monkeypatch.setattr(ctypes, "windll", fake, raising=False)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(gui.sys, "frozen", True, raising=False)
+    gui._windows_setup()
+    assert calls == ["dpi"]
+    calls.clear()
+    monkeypatch.setattr(gui.sys, "frozen", False)
+    gui._windows_setup()  # from source: its own button instead of python.exe's
+    assert calls == ["dpi", "MHWildsModManager"]
