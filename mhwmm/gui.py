@@ -572,7 +572,7 @@ def requirement_note(req: dict) -> str:
     if req["state"] == "ok":
         return f"있음 ({req['by']})" if req["by"] else "있음"
     if req["state"] == "unknown":
-        return "다른 사이트 · 직접 확인하세요"
+        return "다른 사이트·게임의 모드 · 직접 확인하세요"
     note = "없음 · 스크립트가 불러오는 Lua 라이브러리" if req["kind"] == "lua" else "없음"
     return f"{note} · {req['notes']}" if req.get("notes") else note
 
@@ -1591,7 +1591,7 @@ class App:
 
     def _fetch_unread_requirements(self):
         """Requirements of Nexus mods that were never read (needs no API key)."""
-        ids = sorted({m.nexus_id for m in self.manager.mods if m.nexus_id and not m.requirements_checked})
+        ids = self.manager.requirement_targets(max_age=None)
         if ids:
             self._fetch_requirements(ids)
 

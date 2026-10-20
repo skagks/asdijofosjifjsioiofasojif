@@ -283,6 +283,7 @@ class Mod:
     # Requirements listed on the Nexus page: [{"name", "url", "nexus_id", "notes", "external"}]
     requirements: list = field(default_factory=list)
     requirements_checked: int = 0  # when they were last read from Nexus (0 = never)
+    requirements_format: int = 0  # nexus.REQUIREMENTS_FORMAT they were read with
     lua_requires: list = field(default_factory=list)  # Lua modules the mod's scripts need from other mods
     lua_scanned: bool = False
 
@@ -1000,11 +1001,12 @@ class ModManager:
     def missing_requirements(self, mod_id: str) -> list[dict]:
         return [r for r in self.requirement_status(mod_id) if r["state"] in ("missing", "off")]
 
-    def requirement_targets(self, max_age: float = 7 * 86400) -> list[int]:
-        """Nexus mods whose requirements were never read, or not for a while."""
+    def requirement_targets(self, max_age: float | None = 7 * 86400) -> list[int]:
+        """Nexus mods whose requirements were never read (or in an older format), or not for ``max_age``."""
         now = time.time()
-        return sorted({m.nexus_id for m in self.mods
-                       if m.nexus_id and now - m.requirements_checked > max_age})
+        return sorted({m.nexus_id for m in self.mods if m.nexus_id and (
+            not m.requirements_checked or m.requirements_format < nexus.REQUIREMENTS_FORMAT
+            or (max_age is not None and now - m.requirements_checked > max_age))})
 
     def set_requirements(self, found: dict[int, list[dict]]) -> list[Mod]:
         """Store requirements read from Nexus. Returns the mods that got them."""
@@ -1013,7 +1015,7 @@ class ModManager:
         for m in self.mods:
             if m.nexus_id in found:
                 m.requirements = [dict(r) for r in found[m.nexus_id]]
-                m.requirements_checked = now
+                m.requirements_checked, m.requirements_format = now, nexus.REQUIREMENTS_FORMAT
                 self._write_mod_meta(m)
                 changed.append(m)
         if changed:

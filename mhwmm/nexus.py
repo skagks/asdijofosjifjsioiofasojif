@@ -232,13 +232,18 @@ def graphql(query: str, variables: dict, api_key: str = "") -> dict:
 
 
 _GAME_ID: dict[str, int] = {}
+# A requirement on Nexus names its mod by modId and gameId (the game's domain name); url is only
+# filled in for requirements on other sites.
+_REQUIREMENT_FIELDS = "modId gameId modName url notes externalRequirement"
+_REQUIREMENT_FIELDS_MINIMAL = "modName url notes externalRequirement"
 _REQUIREMENTS_QUERY = """
 query ($filter: ModsFilter, $count: Int) {
   mods(filter: $filter, count: $count) {
-    nodes { modId modRequirements { nexusRequirements { nodes { modName url notes externalRequirement } } } }
+    nodes { modId modRequirements { nexusRequirements { nodes { %s } } } }
   }
 }"""
 REQUIREMENTS_BATCH = 50
+REQUIREMENTS_FORMAT = 2  # stored requirements of an older format are read again
 
 
 def game_id(api_key: str = "") -> int:
@@ -254,16 +259,29 @@ def game_id(api_key: str = "") -> int:
 def requirement_from_node(node: dict) -> dict | None:
     name = str(node.get("modName") or "").strip()
     url = str(node.get("url") or "").strip()
-    if not name and not url:
+    mod_id = str(node.get("modId") or "").strip()
+    game = str(node.get("gameId") or "").strip().lower()
+    if not name and not url and not mod_id:
         return None
-    m = _URL.search(url)
-    same_game = bool(m) and m["game"].lower() == GAME
+    external = bool(node.get("externalRequirement"))
+    nexus_id = 0
+    if not external and mod_id.isdigit() and int(mod_id) > 0:
+        nexus_id = int(mod_id)
+        game = game or GAME
+        if game.isdigit():  # a numeric game id instead of the domain name
+            game = GAME if int(game) == _GAME_ID.get(GAME) else game
+        url = url or MOD_URL.replace(GAME, game).format(nexus_id)
+    else:
+        m = _URL.search(url)
+        if m:
+            nexus_id, game = int(m["id"]), m["game"].lower()
+    same_game = bool(nexus_id) and game == GAME
     return {
-        "name": name or url,
+        "name": name or url or f"Nexus {game} #{mod_id}",
         "url": url,
-        "nexus_id": int(m["id"]) if same_game else 0,
+        "nexus_id": nexus_id if same_game else 0,
         "notes": str(node.get("notes") or "").strip(),
-        "external": bool(node.get("externalRequirement")) or not same_game,
+        "external": external or not same_game,  # another site or another game: cannot be checked
     }
 
 
@@ -278,7 +296,14 @@ def fetch_requirements(mod_ids: list[int], api_key: str = "") -> dict[int, list[
         chunk = ids[start:start + REQUIREMENTS_BATCH]
         flt = {"op": "OR", "filter": [{"modId": [{"value": str(i), "op": "EQUALS"}],
                                        "gameId": [{"value": str(gid), "op": "EQUALS"}]} for i in chunk]}
-        data = graphql(_REQUIREMENTS_QUERY, {"filter": flt, "count": len(chunk)}, api_key)
+        variables = {"filter": flt, "count": len(chunk)}
+        try:
+            data = graphql(_REQUIREMENTS_QUERY % _REQUIREMENT_FIELDS, variables, api_key)
+        except NexusError as exc:
+            if "field" not in str(exc).lower():
+                raise
+            # an API without modId/gameId on requirements: links still come from their urls
+            data = graphql(_REQUIREMENTS_QUERY % _REQUIREMENT_FIELDS_MINIMAL, variables, api_key)
         for node in ((data.get("mods") or {}).get("nodes") or []):
             if not isinstance(node, dict):
                 continue

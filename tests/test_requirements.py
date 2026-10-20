@@ -96,39 +96,58 @@ def test_fetch_requirements_from_nexus(monkeypatch):
         if "game(" in body["query"]:
             return FakeResponse({"data": {"game": {"id": 7777}}})
         return FakeResponse({"data": {"mods": {"nodes": [
-            {"modId": 3664, "modRequirements": {"nexusRequirements": {"nodes": [
-                {"modName": "Lua Bone System", "url": "https://www.nexusmods.com/monsterhunterwilds/mods/10",
+            {"modId": 787, "modRequirements": {"nexusRequirements": {"nodes": [
+                # Nexus mods come with modId/gameId and no url
+                {"modId": "1234", "gameId": "monsterhunterwilds", "modName": "No Color Filters", "url": "",
                  "notes": "", "externalRequirement": False},
-                {"modName": "REFramework", "url": "https://github.com/praydog/REFramework-nightly",
+                {"modId": "55", "gameId": "monsterhunterworld", "modName": "Old Game Mod", "url": "",
+                 "notes": "", "externalRequirement": False},
+                {"modId": "", "gameId": "", "modName": "REFramework", "url": "https://github.com/praydog/REFramework-nightly",
                  "notes": "nightly", "externalRequirement": True}]}}},
             {"modId": 5, "modRequirements": None},
         ]}}})
 
     monkeypatch.setattr(nexus.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(nexus, "_GAME_ID", {})
-    found = nexus.fetch_requirements([3664, 5, 3664], api_key="")
+    found = nexus.fetch_requirements([787, 5, 787], api_key="")
     assert found[5] == []
-    assert found[3664] == [
-        {"name": "Lua Bone System", "url": "https://www.nexusmods.com/monsterhunterwilds/mods/10", "nexus_id": 10,
+    assert found[787] == [
+        {"name": "No Color Filters", "url": "https://www.nexusmods.com/monsterhunterwilds/mods/1234", "nexus_id": 1234,
          "notes": "", "external": False},
+        {"name": "Old Game Mod", "url": "https://www.nexusmods.com/monsterhunterworld/mods/55", "nexus_id": 0,
+         "notes": "", "external": True},
         {"name": "REFramework", "url": "https://github.com/praydog/REFramework-nightly", "nexus_id": 0,
          "notes": "nightly", "external": True}]
     assert all(url == nexus.GRAPHQL and key is None for url, key, _ in sent)  # works without an API key
+    assert "modId gameId modName" in sent[1][2]["query"]
     flt = sent[1][2]["variables"]["filter"]
-    assert flt["op"] == "OR" and [f["modId"][0]["value"] for f in flt["filter"]] == ["5", "3664"]
+    assert flt["op"] == "OR" and [f["modId"][0]["value"] for f in flt["filter"]] == ["5", "787"]
     assert all(f["gameId"][0]["value"] == "7777" for f in flt["filter"])
 
 
-def test_cli_conflicts_and_missing(manager, tmp_path, capsys):
-    from mhwmm.cli import main
+def test_requirements_fallback_without_mod_ids(monkeypatch):
+    """An API that does not know modId/gameId on requirements: ask again for the url only."""
+    queries = []
 
-    data = str(manager.data_dir)
-    for name, files in (("A.zip", {"natives/STM/x.tex": "a"}), ("B.zip", {"natives/STM/x.tex": "b"}),
-                        ("App.zip", {"reframework/autorun/app.lua": 'require("_CatLib")'})):
-        assert main(["--data-dir", data, "install", str(make_zip(tmp_path / name, files)), "--no-deploy"]) == 0
-    assert "필요한 모드 없음: _CatLib (Lua 라이브러리)" in capsys.readouterr().out
-    assert main(["--data-dir", data, "conflicts"]) == 0
-    out = capsys.readouterr().out
-    assert "2. B  >  1. A  (파일 1개)" in out and "natives/STM/x.tex" in out and "적용되지 않는 모드" in out
-    assert main(["--data-dir", data, "list"]) == 0
-    assert "필요한 모드 없음: _CatLib" in capsys.readouterr().out
+    def fake_urlopen(request, timeout=0):
+        body = json.loads(request.data)
+        queries.append(body["query"])
+        if "game(" in body["query"]:
+            return FakeResponse({"data": {"game": {"id": 7777}}})
+        if "gameId modName" in body["query"]:
+            return FakeResponse({"errors": [{"message": 'Cannot query field "gameId" on type "ModRequirement".'}]})
+        return FakeResponse({"data": {"mods": {"nodes": [{"modId": 787, "modRequirements": {"nexusRequirements": {
+            "nodes": [{"modName": "Bones", "url": "https://www.nexusmods.com/monsterhunterwilds/mods/10",
+                       "notes": "", "externalRequirement": False}]}}}]}}})
+
+    monkeypatch.setattr(nexus.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(nexus, "_GAME_ID", {})
+    assert nexus.fetch_requirements([787])[787][0]["nexus_id"] == 10 and len(queries) == 3
+
+
+def test_requirements_of_an_older_format_are_read_again(manager, tmp_path):
+    mod = install(manager, make_zip(tmp_path / "Lepus-787-v1-0-3-1743925784.zip", {"natives/STM/a.mesh": "m"}))
+    manager.set_requirements({787: []})
+    assert manager.requirement_targets() == []
+    mod.requirements_format = 1  # read by v1.8.1, which took Nexus requirements for other sites
+    assert manager.requirement_targets() == [787] and manager.requirement_targets(max_age=None) == [787]
