@@ -195,6 +195,32 @@ def test_manager_keeps_results_and_finds_renamed_mods(manager, tmp_path):
     assert manager.find_existing("내 갑옷") is mod
 
 
+def test_other_files_of_one_nexus_page_are_other_mods(manager, tmp_path):
+    archive = make_zip(tmp_path / "Typhoeus - LBS-4926-1-0-1-1754000000.zip", {"natives/STM/t.tex": "t"})
+    with manager.prepare_install(archive) as session:
+        typhoeus = manager.install_variant(session, session.variants[0])
+    assert typhoeus.nexus_id == 4926
+    # another mod offered on the same page: not an update of the installed one
+    assert manager.find_existing("Eternal Hunt", "Eternal Hunt-4926-1-0-1755000000.zip") is None
+    assert manager.find_existing("Typhoeus - LBS", "Eternal Hunt-4926-1-0-1755000000.zip") is None  # same mod name
+    # a new version of the same file is, also after renaming the mod (the file's name decides)
+    assert manager.find_existing("Typhoeus - LBS", "Typhoeus - LBS-4926-1-1-1756000000.zip") is typhoeus
+    manager.rename(typhoeus.id, "티폰")
+    assert manager.find_existing("Typhoeus LBS", "Typhoeus_LBS-4926-1-1-1756000000 (1).zip") is typhoeus
+    # with both installed, each one's update finds its own mod
+    hunt_zip = make_zip(tmp_path / "Eternal Hunt-4926-1-0-1755000000.zip", {"natives/STM/e.tex": "e"})
+    with manager.prepare_install(hunt_zip) as session:
+        hunt = manager.install_variant(session, session.variants[0])
+    assert manager.find_existing("Eternal Hunt", "Eternal Hunt-4926-1-1-1757000000.zip") is hunt
+    assert manager.find_existing("x", "Typhoeus - LBS-4926-2-0-1757000000.zip") is typhoeus
+    # downloads named with the upload time (a downloader's random suffix is not part of the file's name)
+    assert not nexus.other_file("Ardelia 3664 1.3 2026-08-05T20-52Z m2gvlwD60.zip",
+                                "Ardelia 3664 1.4 2026-09-01T10-00Z AbCdEfGh1.zip")
+    assert nexus.other_file("Ardelia 3664 1.3 2026-08-05T20-52Z m2gvlwD60.zip", "Ardelia Alt 3664 1.0 2026-09-01T10-00Z x.zip")
+    assert not nexus.other_file("A-1-1-1754000000.zip", "B-2-1-1754000000.zip")  # other pages
+    assert not nexus.other_file("Typhoeus - LBS-4926-1-0-1-1754000000.zip", "Typhoeus - LBS.zip")  # unknown
+
+
 def test_cli_nexus(manager, tmp_path, monkeypatch, capsys):
     from mhwmm.cli import main
 

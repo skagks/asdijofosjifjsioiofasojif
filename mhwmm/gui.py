@@ -2771,10 +2771,11 @@ class App:
         existing = self.manager.find_existing(package, session.source.name)
         replace_id = None
         if existing:
+            why = (f"'{existing.name}' 모드가 이미 있습니다." if self.manager.find_by_name(package) is existing else
+                   f"'{existing.name}' 모드와 같은 Nexus 모드 페이지에서 받은 같은 이름의 파일입니다.")
             answer = messagebox.askyesnocancel(
                 "이미 설치된 모드",
-                f"'{existing.name}' 모드가 이미 있습니다.\n\n"
-                "예: 기존 모드를 새 파일로 교체 (업데이트)\n아니요: 별도의 모드로 추가\n취소: 설치하지 않음",
+                f"{why}\n\n예: 기존 모드를 새 파일로 교체 (업데이트)\n아니요: 별도의 모드로 추가\n취소: 설치하지 않음",
                 parent=self.root)
             if answer is None:
                 session.cleanup()

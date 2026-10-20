@@ -1875,11 +1875,15 @@ class ModManager:
                 for m in self.mods if m.nexus_id]
 
     def find_existing(self, name: str, source: str = "") -> Mod | None:
-        """The installed mod a new download probably updates: same name, or else the same Nexus mod."""
+        """The installed mod a new download probably updates: same name, or else the same Nexus mod -
+        but never another file of the same Nexus mod page (a page can offer several mods)."""
         mod = self.find_by_name(name)
+        if mod is not None and source and nexus.other_file(mod.source, source):
+            mod = None
         ref = nexus.parse_source_name(source) if mod is None else None
         if ref:
-            same = [m for m in self.mods if m.nexus_id == ref.mod_id and m.origin != REFW_ORIGIN]
+            same = [m for m in self.mods if m.nexus_id == ref.mod_id and m.origin != REFW_ORIGIN
+                    and not nexus.other_file(m.source, source)]
             mod = same[0] if len(same) == 1 else None
         return mod
 

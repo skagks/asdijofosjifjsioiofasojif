@@ -83,6 +83,30 @@ def parse_source_name(name: str) -> SourceRef | None:
     return None
 
 
+def file_title(name: str) -> str:
+    """The name the uploader gave a Nexus download (without mod id, version, upload time and what a
+    downloader appends), "" for a file name that is not a Nexus download's."""
+    stem = name.strip()
+    if stem.lower().endswith(_ARCHIVE_SUFFIXES):
+        stem = stem.rsplit(".", 1)[0]
+    stem = _DUPLICATE.sub("", stem)
+    m = _CLASSIC.match(stem) or _ISO.match(stem)
+    return m["name"].strip(" _-") if m else ""
+
+
+def other_file(a: str, b: str) -> bool:
+    """True when two downloads (file names) are different files of the same Nexus mod page: a page can
+    offer several mods (e.g. one per character), and an update keeps its file's name."""
+    ra, rb = parse_source_name(a), parse_source_name(b)
+    if ra is None or rb is None or ra.mod_id != rb.mod_id:
+        return False
+
+    def key(title: str) -> str:
+        return re.sub(r"[\W_]+", "", title).casefold()
+
+    return key(file_title(a)) != key(file_title(b))
+
+
 def parse_mod_ref(text: str) -> int:
     """Mod id from a Nexus mod page link or a bare number."""
     text = text.strip()
