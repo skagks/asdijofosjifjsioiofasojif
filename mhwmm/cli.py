@@ -51,6 +51,43 @@ def _print_options(manager: ModManager, mod) -> None:
         print(f"  * 옵션을 활성화해 주세요: options {mod.id} --set <번호>")
 
 
+def _print_missing(manager: ModManager, mod, indent: str = "  ") -> None:
+    for req in manager.missing_requirements(mod.id):
+        state = "꺼져 있음" if req["state"] == "off" else "없음"
+        kind = " (Lua 라이브러리)" if req["kind"] == "lua" else ""
+        print(f"{indent}필요한 모드 {state}: {req['name']}{kind}  {req['url']}".rstrip())
+
+
+def _fetch_requirements(manager: ModManager, nexus_ids: list[int]) -> None:
+    from . import nexus
+
+    if not nexus_ids:
+        return
+    try:
+        manager.set_requirements(nexus.fetch_requirements(nexus_ids, manager.settings.nexus_api_key))
+    except nexus.NexusError as exc:
+        print(f"경고: Nexus에서 필요한 모드 정보를 받지 못했습니다: {exc}", file=sys.stderr)
+
+
+def cmd_conflicts(manager: ModManager, args) -> int:
+    conflicts = manager.conflicts()
+    pairs = conflicts.pairs()
+    if not pairs:
+        print("같은 파일을 바꾸는 켜진 모드가 없습니다.")
+        return 0
+    names = {m.id: f"{i}. {m.name}" for i, m in enumerate(manager.mods, 1)}
+    for winner, loser, paths in pairs:
+        print(f"{names[winner]}  >  {names[loser]}  (파일 {len(paths)}개)")
+        for path in paths[: None if args.files else 3]:
+            print(f"    {path}")
+        if not args.files and len(paths) > 3:
+            print(f"    … 외 {len(paths) - 3}개 (--files로 모두 보기)")
+    hidden = manager.hidden_mods(conflicts)
+    if hidden:
+        print("\n적용되지 않는 모드 (파일이 모두 밀림): " + ", ".join(names[m.id] for m in hidden))
+    return 0
+
+
 def cmd_list(manager: ModManager, args) -> int:
     print(f"게임 폴더: {manager.game_dir or '(설정 안 됨)'}")
     print(f"REFramework: {'설치됨' if manager.refw_installed() else '없음'}")
@@ -69,6 +106,8 @@ def cmd_list(manager: ModManager, args) -> int:
         if m.options:
             extra += "  옵션 선택 필요" if m.needs_option else f"  옵션 {len(m.selected)}/{len(m.options)}"
         print(f"{i:3d}. {flag} {m.name}{version}  ({_kinds(manager.mod_kinds(m.id))}, id={m.id}){extra}")
+        if m.enabled:
+            _print_missing(manager, m, "       ")
     if manager.dirty:
         print("\n* 적용되지 않은 변경사항이 있습니다. 'deploy'를 실행하세요.")
     return 0
@@ -98,6 +137,9 @@ def cmd_install(manager: ModManager, args) -> int:
         print(f"설치: {mod.name}  ({_kinds(manager.mod_kinds(mod.id))}, {len(manager.mod_files(mod.id))}개 파일)")
         if mod.options:
             _print_options(manager, mod)
+    if mod.nexus_id:
+        _fetch_requirements(manager, [mod.nexus_id])
+    _print_missing(manager, mod)
     return _maybe_deploy(manager, args)
 
 
@@ -193,6 +235,7 @@ def cmd_nexus(manager: ModManager, args) -> int:
             return 0
         client = nexus.NexusClient(manager.settings.nexus_api_key)
         results, problems = nexus.check_mods(client, items, lambda done, total, msg: print(msg, file=sys.stderr))
+        _fetch_requirements(manager, manager.requirement_targets())
     except nexus.NexusError as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 1
@@ -342,6 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--delete", action="store_true", help="프로필 삭제")
     p.add_argument("--no-deploy", action="store_true")
 
+    p = sub.add_parser("conflicts", help="같은 파일을 바꾸는 모드들 보기")
+    p.add_argument("--files", action="store_true", help="겹치는 파일을 모두 보기")
+
     sub.add_parser("deploy", help="활성화된 모드를 게임 폴더에 적용")
     sub.add_parser("purge", help="게임 폴더에서 모든 모드 파일 제거")
     sub.add_parser("verify", help="적용된 파일 점검")
@@ -352,10 +398,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-READ_ONLY_COMMANDS = ("list", "verify")
+READ_ONLY_COMMANDS = ("list", "verify", "conflicts")
 COMMANDS = {
     "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw,
-    "nexus": cmd_nexus, "enable": cmd_toggle, "disable": cmd_toggle,
+    "nexus": cmd_nexus, "conflicts": cmd_conflicts, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game,
 }

@@ -60,9 +60,11 @@ FILTERS = {
     "옵션 선택 필요": lambda mod, conflicts: mod.needs_option,
     "충돌 있음": lambda mod, conflicts: any(conflicts.counts(mod.id)),
     "업데이트 있음": lambda mod, conflicts: bool(mod.update),
+    "필요한 모드 없음": None,  # needs the manager: handled in App.refresh
 }
 FILTER_ALL = "전체"
 FILTER_UPDATES = "업데이트 있음"
+FILTER_MISSING = "필요한 모드 없음"
 # Errors that are shown to the user without a traceback in the log.
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
 
@@ -450,6 +452,129 @@ class HelpDialog(Dialog):
             button.configure(style="NavActive.TButton" if i == index else "Nav.TButton")
 
 
+class ConflictsDialog(Dialog):
+    """Every two enabled mods that change the same files; result is a mod id to show in the list."""
+
+    def __init__(self, parent, theme: Theme, manager: ModManager):
+        super().__init__(parent, theme, "충돌 한눈에 보기")
+        px = theme.px
+        self.minsize(px(640), px(480))
+        conflicts = manager.conflicts()
+        self.pairs = conflicts.pairs()
+        mods = {m.id: m for m in manager.mods}
+        order = {m.id: i + 1 for i, m in enumerate(manager.mods)}
+        label = lambda mod_id: f"{order[mod_id]}. {mods[mod_id].name}"  # noqa: E731
+
+        ttk.Label(self.body, text="충돌 한눈에 보기", style="DialogTitle.TLabel").pack(anchor="w")
+        if self.pairs:
+            involved = {mod_id for w, l, _ in self.pairs for mod_id in (w, l)}
+            files = {path for _, _, paths in self.pairs for path in paths}
+            summary = (f"켜진 모드 {len(involved)}개가 파일 {len(files)}개를 함께 바꿉니다. 같은 파일은 목록에서 더 "
+                       "아래에 있는 모드(적용되는 모드)의 것이 게임에 들어갑니다.")
+        else:
+            summary = "같은 파일을 바꾸는 켜진 모드가 없습니다."
+        ttk.Label(self.body, text=summary, style="Muted.TLabel", wraplength=px(600),
+                  justify="left").pack(anchor="w", pady=(px(4), px(10)))
+        hidden = manager.hidden_mods(conflicts)
+        if hidden:
+            callout = ttk.Frame(self.body, style="Callout.TFrame", padding=(px(14), px(10)))
+            callout.pack(fill="x", pady=(0, px(10)))
+            ttk.Label(callout, text=f"적용되지 않는 모드 {len(hidden)}개", style="CalloutTitle.TLabel").pack(anchor="w")
+            ttk.Label(callout, text=", ".join(label(m.id) for m in hidden) + " — 파일이 모두 다른 모드에 밀려 게임에 "
+                      "아무것도 들어가지 않습니다. 순서를 바꾸거나 끄세요.", style="Callout.TLabel",
+                      wraplength=px(580), justify="left").pack(anchor="w", pady=(px(2), 0))
+
+        card = theme.mark(tk.Frame(self.body), "card")
+        card.pack(fill="both", expand=True)
+        self.pairs_tree = ttk.Treeview(card, columns=("winner", "loser", "count"), show="headings", height=8,
+                                       selectmode="browse")
+        for col, text, width, anchor in (("winner", "적용되는 모드", 240, "w"), ("loser", "밀리는 모드", 240, "w"),
+                                         ("count", "겹치는 파일", 90, "e")):
+            self.pairs_tree.heading(col, text=text, anchor=anchor)
+            self.pairs_tree.column(col, width=px(width), anchor=anchor, stretch=col != "count")
+        self.pairs_tree.tag_configure("odd", background=theme.p["row_alt"])
+        for i, (winner, loser, paths) in enumerate(self.pairs):
+            self.pairs_tree.insert("", "end", iid=str(i), values=(label(winner), label(loser), f"{len(paths)}개"),
+                                   tags=("odd",) if i % 2 else ())
+        self.pairs_tree.pack(fill="both", expand=True)
+        self.pairs_tree.bind("<<TreeviewSelect>>", lambda e: self._show_files())
+        self.pairs_tree.bind("<Double-1>", lambda e: self.show_in_list())
+
+        ttk.Label(self.body, text="선택한 두 모드가 함께 바꾸는 파일", style="DialogSection.TLabel").pack(
+            anchor="w", pady=(px(12), px(4)))
+        files_card = theme.mark(tk.Frame(self.body), "card")
+        files_card.pack(fill="both", expand=True)
+        self.files_tree = ttk.Treeview(files_card, columns=("path",), show="headings", height=7, selectmode="none")
+        self.files_tree.heading("path", text="게임 폴더 기준 경로", anchor="w")
+        self.files_tree.column("path", width=px(560), anchor="w")
+        fsb = ttk.Scrollbar(files_card, orient="vertical", command=self.files_tree.yview)
+        self.files_tree.configure(yscrollcommand=autohide(fsb, side="right", fill="y"))
+        self.files_tree.pack(side="left", fill="both", expand=True)
+
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", pady=(px(16), 0))
+        ttk.Button(row, text="닫기", command=self.cancel).pack(side="right")
+        show = ttk.Button(row, text="목록에서 밀리는 모드 보기", style="Accent.TButton", command=self.show_in_list)
+        show.pack(side="right", padx=(0, px(8)))
+        if self.pairs:
+            self.pairs_tree.selection_set("0")
+            self._show_files()
+        else:
+            show.state(["disabled"])
+
+    def _show_files(self):
+        self.files_tree.delete(*self.files_tree.get_children())
+        sel = self.pairs_tree.selection()
+        if sel:
+            for path in self.pairs[int(sel[0])][2][:MAX_FILE_ROWS]:
+                self.files_tree.insert("", "end", values=(path,))
+
+    def show_in_list(self):
+        sel = self.pairs_tree.selection()
+        if sel:
+            self.result = self.pairs[int(sel[0])][1]
+            self.destroy()
+
+
+class RequirementsDialog(Dialog):
+    """Mods that were just installed but need other mods that are missing or switched off."""
+
+    def __init__(self, parent, theme: Theme, items: list[tuple[Mod, list[dict]]]):
+        super().__init__(parent, theme, "필요한 모드")
+        px = theme.px
+        ttk.Label(self.body, text="필요한 모드가 없습니다", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.body, text="아래 모드를 설치하거나 켜야 제대로 작동합니다. Nexus에서 받은 파일은 이 창에 "
+                                  "끌어 놓으면 설치됩니다.", style="Muted.TLabel", wraplength=px(480),
+                  justify="left").pack(anchor="w", pady=(px(4), 0))
+        for mod, missing in items:
+            ttk.Label(self.body, text=mod.name, style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(4)))
+            for req in missing:
+                row = ttk.Frame(self.body)
+                row.pack(fill="x", pady=px(2))
+                ttk.Label(row, text="• " + req["name"]).pack(side="left")
+                ttk.Label(row, text="   " + requirement_note(req), style="Muted.TLabel",
+                          font=theme.fonts["small"]).pack(side="left")
+                if req["url"]:
+                    ttk.Button(row, text="Nexus에서 찾기" if req["kind"] == "lua" else "열기", style="Link.TButton",
+                               command=lambda url=req["url"]: webbrowser.open(url)).pack(side="right")
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", pady=(px(18), 0))
+        ttk.Button(row, text="확인", style="Accent.TButton", command=self.cancel).pack(side="right")
+        self.bind("<Return>", lambda e: self.cancel())
+
+
+def requirement_note(req: dict) -> str:
+    """Short status of a requirement for the user."""
+    if req["state"] == "off":
+        return f"설치되어 있지만 꺼져 있음 ({req['by']})"
+    if req["state"] == "ok":
+        return f"있음 ({req['by']})" if req["by"] else "있음"
+    if req["state"] == "unknown":
+        return "다른 사이트 · 직접 확인하세요"
+    note = "없음 · 스크립트가 불러오는 Lua 라이브러리" if req["kind"] == "lua" else "없음"
+    return f"{note} · {req['notes']}" if req.get("notes") else note
+
+
 class SettingsDialog(Dialog):
     def __init__(self, parent, theme: Theme, manager: ModManager):
         super().__init__(parent, theme, "설정")
@@ -590,6 +715,7 @@ class App:
         self._refw_status: refw.Status | None = None
         self._checking_mods = False
         self._mod_check_error: str | None = None
+        self._req_notices: list[str] = []  # just installed mods to tell about missing requirements
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -727,6 +853,7 @@ class App:
         m.add_separator()
         m.add_command(label="게임에 적용", accelerator="Ctrl+S", command=self.apply)
         m.add_command(label="적용 상태 점검", command=self.verify)
+        m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
         m.add_command(label="게임 폴더에서 모든 모드 파일 제거", command=self.purge)
         m.add_separator()
         m.add_command(label="모두 활성화", command=lambda: self.set_enabled_all(True))
@@ -836,8 +963,19 @@ class App:
         filter_box.pack(side="right", padx=(0, px(8)))
         filter_box.bind("<<ComboboxSelected>>", lambda e: (filter_box.selection_clear(), self.refresh()))
         Tooltip(t, filter_box, "목록에 보일 모드 고르기")
-        ttk.Label(left, text="아래쪽 모드일수록 우선 적용됩니다 · 드래그해서 순서를 바꾸세요",
-                  style="Hint.TLabel", padding=(px(18), px(2), px(18), px(10))).pack(fill="x")
+        hint = ttk.Frame(left, style="Card.TFrame", padding=(px(18), px(2), px(14), px(10)))
+        hint.pack(fill="x")
+        self.hint_label = ttk.Label(hint, text="아래쪽 모드일수록 우선 적용 · 드래그로 순서 변경",
+                                    style="Hint.TLabel")
+        self.hint_label.pack(side="left")
+        # shown while enabled mods change the same files
+        self.conflicts_button = ttk.Button(hint, text="", style="Link.TButton", command=self.show_conflicts)
+        Tooltip(t, self.conflicts_button, "어떤 모드끼리 어떤 파일을 함께 바꾸는지 한눈에 봅니다")
+        self._hint_layout = (False, False)
+        # explains the row colours while the selected mod has conflicts
+        self.legend = ttk.Frame(hint, style="Card.TFrame")
+        ttk.Label(self.legend, text="선택한 모드를 덮어씀", style="LegendBad.TLabel").pack(side="left")
+        ttk.Label(self.legend, text="선택한 모드에 밀림", style="LegendInfo.TLabel").pack(side="left", padx=(px(6), 0))
 
         area = ttk.Frame(left, style="Card.TFrame")
         area.pack(fill="both", expand=True, padx=px(6), pady=(0, px(6)))
@@ -859,7 +997,7 @@ class App:
         ysb = ttk.Scrollbar(area, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=autohide(ysb, side="right", fill="y"))
         self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_details())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: (self._update_details(), self._highlight_related()))
         self.tree.bind("<ButtonPress-1>", self._on_press)
         self.tree.bind("<B1-Motion>", self._on_motion)
         self.tree.bind("<ButtonRelease-1>", self._on_release)
@@ -919,12 +1057,17 @@ class App:
         self.conflict_text.pack(fill="both", expand=True)
         self.conflict_text.configure(state="disabled")
         self.notebook.add(conflicts, text="충돌")
+        self.conflicts_tab = conflicts
         paned.add(right, weight=2)
 
         self.context_menu = t.mark(tk.Menu(self.tree, tearoff=False), "menu")
 
     def _configure_tags(self):
         p, f, px = self.theme.p, self.theme.fonts, self.theme.px
+        # mods that override / are overridden by the selected mod; created before "odd" because
+        # ttk gives the earliest created tag priority
+        self.tree.tag_configure("over_sel", background=p["danger_bg"])
+        self.tree.tag_configure("under_sel", background=p["info_bg"])
         for tree in (self.tree, self.files_tree):
             tree.tag_configure("odd", background=p["row_alt"])
             tree.tag_configure("disabled", foreground=p["subtle"])
@@ -952,6 +1095,9 @@ class App:
                 pass
         info.tag_configure("warn_title", font=f["bold"])
         info.tag_configure("link", foreground=p["info"], underline=True)
+        for tag, color in (("req_ok", "success"), ("req_missing", "danger"), ("req_off", "warn"),
+                           ("req_unknown", "muted")):
+            info.tag_configure(tag, foreground=p[color], font=f["bold"])
         for tag, action in (("nexus_page", lambda m: m.nexus_url), ("nexus_files", lambda m: nexus.FILES_URL.format(m.nexus_id))):
             info.tag_bind(tag, "<Button-1>", lambda e, action=action: self._open_nexus(action))
         info.tag_bind("link", "<Enter>", lambda e: info.configure(cursor="hand2"))
@@ -1018,8 +1164,12 @@ class App:
         m = self.manager
         t = self.theme
         self._conflicts = m.conflicts()
+        # enabled mods that need other mods which are missing or switched off
+        missing = {mod.id for mod in m.mods if mod.enabled and m.missing_requirements(mod.id)}
         query = self._query()
         keep = FILTERS.get(self.filter_var.get())
+        if self.filter_var.get() == FILTER_MISSING:
+            keep = lambda mod, conflicts: mod.id in missing  # noqa: E731
         visible = [(i, mod) for i, mod in enumerate(m.mods)
                    if (not query or query in mod.name.casefold() or query in mod.author.casefold())
                    and (keep is None or keep(mod, self._conflicts))]
@@ -1032,7 +1182,7 @@ class App:
             tags = ["odd"] if pos % 2 else []
             if not mod.enabled:
                 tags.append("disabled")
-            elif mod.needs_option:
+            elif mod.needs_option or mod.id in missing:
                 tags.append("attention")
             elif mod.update:
                 tags.append("update")
@@ -1063,7 +1213,13 @@ class App:
         enabled = sum(1 for mod in m.mods if mod.enabled)
         updates = sum(1 for mod in m.mods if mod.update)
         count = f"{len(m.mods)}개 · 활성 {enabled}개" + (f" · 업데이트 {updates}개" if updates else "")
+        if missing:
+            count += f" · 필요한 모드 없음 {len(missing)}개"
         self.count_label.configure(text=count if m.mods else "")
+        pairs = len(self._conflicts.pairs())
+        self.conflicts_button.configure(text=f"⚠ 충돌 {pairs}쌍 보기")
+        self._layout_hint(show_button=bool(pairs))
+        self._highlight_related()
         if not m.mods:
             self.empty_title.configure(text="아직 설치된 모드가 없습니다")
             self.empty_sub.configure(text="Nexus Mods 등에서 받은 zip · 7z · rar · pak 파일을\n이곳에 끌어 놓거나 아래 버튼을 누르세요.")
@@ -1352,6 +1508,7 @@ class App:
             return
         self._checking_mods = True
         self._update_mods_badge()
+        targets = self.manager.requirement_targets()
 
         def status(msg):
             if self.busy is None:
@@ -1363,13 +1520,19 @@ class App:
                     nexus.NexusClient(key), items, lambda done, total, msg: self.events.put(("call", status, msg)))
             except Exception as exc:  # reported to the user, never fatal
                 self.events.put(("call", self._on_mods_checked, None, [], exc, manual))
-            else:
-                self.events.put(("call", self._on_mods_checked, results, problems, None, manual))
+                return
+            try:
+                found = nexus.fetch_requirements(targets, key)
+            except Exception as exc:
+                log.info("Nexus에서 필요한 모드 정보를 받지 못했습니다: %s", exc)
+                found = {}
+            self.events.put(("call", self._on_mods_checked, results, problems, None, manual, found))
 
         status("모드 업데이트 확인 중...")
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_mods_checked(self, results: dict | None, problems: list[str], error: Exception | None, manual: bool):
+    def _on_mods_checked(self, results: dict | None, problems: list[str], error: Exception | None, manual: bool,
+                         found: dict | None = None):
         self._checking_mods = False
         self._mod_check_error = str(error) if error is not None else None
         if self.busy is None:
@@ -1383,6 +1546,8 @@ class App:
                 messagebox.showwarning("모드 업데이트 확인", str(error), parent=self.root)
             return
         self.manager.set_update_results(results)
+        if found:
+            self.manager.set_requirements(found)
         for problem in problems:
             log.warning(problem)
         self.refresh()
@@ -1406,6 +1571,55 @@ class App:
             self.filter_var.set(FILTER_UPDATES)
             self.refresh()
 
+    # ------------------------------------------------------------------ requirements
+    def _check_requirements_of(self, mod: Mod):
+        """After installing: read the mod's requirements from Nexus, then say what is missing."""
+        if mod.nexus_id and mod.origin != refw.ORIGIN:
+            self._fetch_requirements([mod.nexus_id], notify=[mod.id])
+        else:
+            self._queue_requirement_notices([mod.id])
+
+    def _fetch_requirements(self, nexus_ids: list[int], notify: list[str] = ()):
+        key = self.manager.settings.nexus_api_key
+
+        def worker():
+            try:
+                found = nexus.fetch_requirements(nexus_ids, key)
+            except Exception as exc:  # offline etc.: the Lua check still works
+                log.info("Nexus에서 필요한 모드 정보를 받지 못했습니다: %s", exc)
+                found = {}
+            self.events.put(("call", self._on_requirements_fetched, found, list(notify)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_requirements_fetched(self, found: dict, notify: list[str]):
+        if found:
+            self.manager.set_requirements(found)
+            self.refresh()
+        self._queue_requirement_notices(notify)
+
+    def _queue_requirement_notices(self, mod_ids: list[str]):
+        self._req_notices += [i for i in mod_ids if i not in self._req_notices]
+        if not self._installing:
+            self._flush_requirement_notices()
+
+    def _flush_requirement_notices(self):
+        """Tell about missing requirements of the mods just installed (once the install queue is done)."""
+        ids, self._req_notices = self._req_notices, []
+        items = []
+        for mod_id in ids:
+            try:
+                mod = self.manager.get(mod_id)
+            except KeyError:
+                continue
+            missing = self.manager.missing_requirements(mod_id)
+            if missing:
+                items.append((mod, missing))
+                for req in missing:
+                    log.warning("'%s'에 필요한 모드: %s (%s)", mod.name, req["name"], requirement_note(req))
+        if items and not self._closed:
+            RequirementsDialog(self.root, self.theme, items).show()
+
     def _open_nexus(self, url_of):
         mod = self._selected_mod()
         if mod is not None and mod.nexus_id:
@@ -1421,8 +1635,11 @@ class App:
             return
         try:
             if text.strip():
+                old_id = mod.nexus_id
                 nexus_id = self.manager.link_nexus(mod.id, text)
                 log.info("'%s'을(를) Nexus 모드 #%d에 연결했습니다.", mod.name, nexus_id)
+                if nexus_id != old_id:
+                    self._fetch_requirements([nexus_id], notify=[mod.id])
             elif mod.nexus_id:
                 self.manager.unlink_nexus(mod.id)
                 log.info("'%s'의 Nexus 연결을 해제했습니다.", mod.name)
@@ -1454,6 +1671,47 @@ class App:
             return self.manager.get(ids[0])
         except KeyError:
             return None
+
+    def _highlight_related(self):
+        """Colour the mods that override, or are overridden by, the one selected mod."""
+        mod = self._selected_mod()
+        beats: dict = {}
+        beaten: dict = {}
+        if mod is not None and mod.enabled and self._conflicts is not None:
+            beats, beaten = self._conflicts.for_mod(mod.id)
+        for iid in self.tree.get_children():
+            tags = [t for t in self.tree.item(iid, "tags") if t not in ("over_sel", "under_sel")]
+            if iid in beaten:
+                tags.append("over_sel")
+            elif iid in beats:
+                tags.append("under_sel")
+            self.tree.item(iid, tags=tags)
+        self._layout_hint(show_legend=bool(beats or beaten))
+
+    def _layout_hint(self, show_button: bool | None = None, show_legend: bool | None = None):
+        """Conflicts button and colour legend at the right of the hint line (they get space before the hint)."""
+        layout = (self._hint_layout[0] if show_button is None else show_button,
+                  self._hint_layout[1] if show_legend is None else show_legend)
+        if layout == self._hint_layout:
+            return
+        self._hint_layout = layout
+        self.conflicts_button.pack_forget()
+        self.legend.pack_forget()
+        if layout[0]:
+            self.conflicts_button.pack(side="right", before=self.hint_label)
+        if layout[1]:
+            self.legend.pack(side="right", padx=(0, self.theme.px(8)), before=self.hint_label)
+
+    def show_conflicts(self):
+        mod_id = ConflictsDialog(self.root, self.theme, self.manager).show()
+        if mod_id and any(m.id == mod_id for m in self.manager.mods):
+            if not self.tree.exists(mod_id):
+                self.filter_var.set(FILTER_ALL)
+                self.search_var.set("")
+                self.refresh()
+            self.tree.selection_set(mod_id)
+            self.tree.see(mod_id)
+            self.notebook.select(self.conflicts_tab)
 
     @staticmethod
     def _set_text(widget: tk.Text, chunks):
@@ -1506,6 +1764,17 @@ class App:
         ):
             if value:
                 chunks += [(f"{label}\t", "key"), (f"{value}\n", "value")]
+        reqs = m.requirement_status(mod.id)
+        icons = {"ok": ("✓", "req_ok"), "missing": ("✕", "req_missing"), "off": ("!", "req_off"),
+                 "unknown": ("?", "req_unknown")}
+        for i, req in enumerate(reqs):
+            icon, icon_tag = icons[req["state"]]
+            name_tags = ("value", "link", f"req{i}") if req["url"] else ("value",)
+            if req["url"]:
+                self.info_text.tag_bind(f"req{i}", "<Button-1>", lambda e, url=req["url"]: webbrowser.open(url))
+            chunks += [("필요한 모드\t" if i == 0 else "\t", "key"), (f"{icon} ", ("value", icon_tag)),
+                       (req["name"], name_tags), (f"   {requirement_note(req)}\n", ("value", "muted"))]
+        missing = [r for r in reqs if r["state"] in ("missing", "off")]
         if mod.nexus_id:
             chunks += [("Nexus\t", "key"), (f"모드 페이지 #{mod.nexus_id}", ("value", "link", "nexus_page"))]
             if mod.nexus_checked:
@@ -1520,6 +1789,11 @@ class App:
                        (f"Nexus에 새 파일이 올라왔습니다{f' ({what})' if what else ''}. 받은 파일을 이 창에 끌어 놓고 "
                         "'기존 모드를 새 파일로 교체'를 고르면 순서와 활성 상태를 유지한 채 바뀝니다.\n", "note"),
                        ("Nexus 파일 페이지 열기", ("note", "link", "nexus_files")), ("\n", "note")]
+        if missing:
+            names = ", ".join(r["name"] for r in missing)
+            chunks += [("\n", None), ("필요한 모드가 없습니다\n", ("warn", "warn_title")),
+                       (f"{names} — 설치하거나 켜야 이 모드가 제대로 작동합니다. 위 '필요한 모드'의 이름을 누르면 "
+                        "Nexus 페이지가 열립니다.\n", "warn")]
         if mod.needs_option:
             chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
                        ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
@@ -1924,6 +2198,7 @@ class App:
         if not self._install_queue:
             self._installing = False
             self.refresh()
+            self._flush_requirement_notices()
             if self._apply_pending:
                 self._apply_pending = False
                 self.apply()
@@ -1984,6 +2259,7 @@ class App:
                 self.show_options(mod.id)
             if mod.enabled:
                 self.request_apply()
+            self._check_requirements_of(mod)
             self.root.after(1, self._next_install)
 
         def failed(exc):

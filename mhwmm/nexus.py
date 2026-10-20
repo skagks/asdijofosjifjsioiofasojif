@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 
 GAME = "monsterhunterwilds"
 API = "https://api.nexusmods.com/v1"
+GRAPHQL = "https://api.nexusmods.com/v2/graphql"  # public: works without an API key
 MOD_URL = f"https://www.nexusmods.com/{GAME}/mods/{{}}"
 FILES_URL = MOD_URL + "?tab=files"
 API_KEY_URL = "https://next.nexusmods.com/settings/api-keys"
@@ -160,28 +161,10 @@ class NexusClient:
         self.daily_remaining: str | None = None
 
     def _get(self, path: str):
-        request = urllib.request.Request(API + path, headers={
-            "apikey": self.api_key,
-            "Application-Name": APP_NAME,
-            "Application-Version": __version__,
-            "User-Agent": f"{APP_NAME}/{__version__}",
-            "Accept": "application/json",
-        })
-        try:
-            with urllib.request.urlopen(request, timeout=20) as resp:
-                self.hourly_remaining = resp.headers.get("x-rl-hourly-remaining")
-                self.daily_remaining = resp.headers.get("x-rl-daily-remaining")
-                return json.load(resp)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                raise NexusError("Nexus API 키가 올바르지 않습니다. 설정에서 키를 다시 확인하세요.") from exc
-            if exc.code == 404:
-                raise NexusNotFound("Nexus에서 찾을 수 없습니다 (삭제되었거나 숨겨진 모드일 수 있습니다).") from exc
-            if exc.code == 429:
-                raise NexusError("Nexus 요청 한도를 넘었습니다. 한 시간쯤 뒤에 다시 시도하세요.") from exc
-            raise NexusError(f"Nexus 응답 오류 (HTTP {exc.code})") from exc
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise NexusError(f"Nexus에 연결하지 못했습니다: {getattr(exc, 'reason', exc)}") from exc
+        data, headers = _request(API + path, self.api_key)
+        self.hourly_remaining = headers.get("x-rl-hourly-remaining")
+        self.daily_remaining = headers.get("x-rl-daily-remaining")
+        return data
 
     def validate(self) -> dict:
         data = self._get("/users/validate.json")
@@ -201,6 +184,106 @@ class NexusClient:
             except (KeyError, TypeError, ValueError, AttributeError):
                 continue
         return result
+
+
+def _request(url: str, api_key: str = "", body: dict | None = None):
+    """JSON GET (or POST of ``body``). Returns (data, response headers)."""
+    headers = {
+        "Application-Name": APP_NAME,
+        "Application-Version": __version__,
+        "User-Agent": f"{APP_NAME}/{__version__}",
+        "Accept": "application/json",
+    }
+    if api_key:
+        headers["apikey"] = api_key
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as resp:
+            return json.load(resp), resp.headers
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise NexusError("Nexus API 키가 올바르지 않습니다. 설정에서 키를 다시 확인하세요.") from exc
+        if exc.code == 404:
+            raise NexusNotFound("Nexus에서 찾을 수 없습니다 (삭제되었거나 숨겨진 모드일 수 있습니다).") from exc
+        if exc.code == 429:
+            raise NexusError("Nexus 요청 한도를 넘었습니다. 한 시간쯤 뒤에 다시 시도하세요.") from exc
+        raise NexusError(f"Nexus 응답 오류 (HTTP {exc.code})") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise NexusError(f"Nexus에 연결하지 못했습니다: {getattr(exc, 'reason', exc)}") from exc
+
+
+def graphql(query: str, variables: dict, api_key: str = "") -> dict:
+    data, _ = _request(GRAPHQL, api_key, {"query": query, "variables": variables})
+    if not isinstance(data, dict):
+        raise NexusError("Nexus 응답을 읽지 못했습니다.")
+    if data.get("errors") and not data.get("data"):
+        message = "; ".join(str(e.get("message")) for e in data["errors"] if isinstance(e, dict))
+        raise NexusError(f"Nexus 응답 오류: {message}")
+    return data.get("data") or {}
+
+
+_GAME_ID: dict[str, int] = {}
+_REQUIREMENTS_QUERY = """
+query ($filter: ModsFilter, $count: Int) {
+  mods(filter: $filter, count: $count) {
+    nodes { modId modRequirements { nexusRequirements { nodes { modName url notes externalRequirement } } } }
+  }
+}"""
+REQUIREMENTS_BATCH = 50
+
+
+def game_id(api_key: str = "") -> int:
+    if GAME not in _GAME_ID:
+        data = graphql("query ($d: String!) { game(domainName: $d) { id } }", {"d": GAME}, api_key)
+        try:
+            _GAME_ID[GAME] = int(data["game"]["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NexusError("Nexus에서 몬스터 헌터 와일즈를 찾지 못했습니다.") from exc
+    return _GAME_ID[GAME]
+
+
+def requirement_from_node(node: dict) -> dict | None:
+    name = str(node.get("modName") or "").strip()
+    url = str(node.get("url") or "").strip()
+    if not name and not url:
+        return None
+    m = _URL.search(url)
+    same_game = bool(m) and m["game"].lower() == GAME
+    return {
+        "name": name or url,
+        "url": url,
+        "nexus_id": int(m["id"]) if same_game else 0,
+        "notes": str(node.get("notes") or "").strip(),
+        "external": bool(node.get("externalRequirement")) or not same_game,
+    }
+
+
+def fetch_requirements(mod_ids: list[int], api_key: str = "") -> dict[int, list[dict]]:
+    """Requirements listed on the Nexus pages of ``mod_ids`` ({mod id: [requirement]})."""
+    ids = sorted({int(i) for i in mod_ids if int(i) > 0})
+    result: dict[int, list[dict]] = {}
+    if not ids:
+        return result
+    gid = game_id(api_key)
+    for start in range(0, len(ids), REQUIREMENTS_BATCH):
+        chunk = ids[start:start + REQUIREMENTS_BATCH]
+        flt = {"op": "OR", "filter": [{"modId": [{"value": str(i), "op": "EQUALS"}],
+                                       "gameId": [{"value": str(gid), "op": "EQUALS"}]} for i in chunk]}
+        data = graphql(_REQUIREMENTS_QUERY, {"filter": flt, "count": len(chunk)}, api_key)
+        for node in ((data.get("mods") or {}).get("nodes") or []):
+            if not isinstance(node, dict):
+                continue
+            try:
+                mod_id = int(node.get("modId"))
+            except (TypeError, ValueError):
+                continue
+            reqs = (((node.get("modRequirements") or {}).get("nexusRequirements") or {}).get("nodes") or [])
+            result[mod_id] = [r for r in (requirement_from_node(n) for n in reqs if isinstance(n, dict)) if r]
+    return result
 
 
 @dataclass

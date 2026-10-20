@@ -359,3 +359,63 @@ def test_exe_keeps_the_default_taskbar_identity(monkeypatch):
     monkeypatch.setattr(gui.sys, "frozen", False)
     gui._windows_setup()  # from source: its own button instead of python.exe's
     assert calls == ["dpi", "MHWildsModManager"]
+
+
+def test_gui_conflict_overview_and_highlight(root, manager, tmp_path):
+    from mhwmm import gui
+
+    with manager.prepare_install(make_zip(tmp_path / "A.zip", {"natives/STM/x.tex": "a", "natives/STM/y.tex": "a"})) as s:
+        a = manager.install_variant(s, s.variants[0])
+    with manager.prepare_install(make_zip(tmp_path / "B.zip", {"natives/STM/x.tex": "b", "natives/STM/y.tex": "b"})) as s:
+        b = manager.install_variant(s, s.variants[0])
+    with manager.prepare_install(make_zip(tmp_path / "C.zip", {"natives/STM/z.tex": "c"})) as s:
+        c = manager.install_variant(s, s.variants[0])
+    app = gui.App(root, manager, queue.Queue())
+    assert app.conflicts_button.cget("text") == "⚠ 충돌 1쌍 보기" and app.conflicts_button.winfo_manager()
+
+    # selecting a mod colours the ones it fights with
+    app.tree.selection_set(a.id)
+    app._highlight_related()
+    assert "over_sel" in app.tree.item(b.id, "tags") and app.legend.winfo_manager()
+    assert not {"over_sel", "under_sel"} & set(app.tree.item(c.id, "tags"))
+    app.tree.selection_set(b.id)
+    app._highlight_related()
+    assert "under_sel" in app.tree.item(a.id, "tags") and "over_sel" not in app.tree.item(a.id, "tags")
+    app.tree.selection_set(c.id)
+    app._highlight_related()
+    assert not app.legend.winfo_manager()
+
+    dialog = gui.ConflictsDialog(root, app.theme, manager)
+    assert [(w, l, len(f)) for w, l, f in dialog.pairs] == [(b.id, a.id, 2)]
+    assert dialog.pairs_tree.item("0", "values")[0] == "2. B" and len(dialog.files_tree.get_children()) == 2
+    dialog.show_in_list()
+    assert dialog.result == a.id  # A is hidden behind B entirely
+    assert manager.hidden_mods() == [a]
+
+
+def test_gui_tells_about_missing_requirements(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui, nexus
+
+    app = gui.App(root, manager, queue.Queue())
+    shown = []
+    monkeypatch.setattr(gui.RequirementsDialog, "show", lambda self: shown.append(self))
+    monkeypatch.setattr(nexus, "fetch_requirements", lambda ids, key="": {3664: [
+        {"name": "Lua Bone System", "url": nexus.MOD_URL.format(10), "nexus_id": 10, "notes": "", "external": False}]})
+    archive = make_zip(tmp_path / "Chen-3664-1-0-1740000000.zip", {
+        "natives/STM/a.mesh": "m", "reframework/autorun/chen.lua": 'require("_CatLib")'})
+    app.add_paths([str(archive)])
+    pump(root, lambda: bool(shown))
+    (mod,) = manager.mods
+    assert [r["name"] for r in manager.missing_requirements(mod.id)] == ["Lua Bone System", "_CatLib"]
+    dialog_text = " ".join(str(w.cget("text")) for w in shown[0].body.winfo_children() if isinstance(w, gui.ttk.Label))
+    assert "Chen" in dialog_text
+
+    app.refresh()
+    assert "attention" in app.tree.item(mod.id, "tags") and "필요한 모드 없음 1개" in app.count_label.cget("text")
+    app.filter_var.set(gui.FILTER_MISSING)
+    app.refresh()
+    assert list(app.tree.get_children()) == [mod.id]
+    app.tree.selection_set(mod.id)
+    app._update_details()
+    info = app.info_text.get("1.0", "end")
+    assert "필요한 모드가 없습니다" in info and "Lua Bone System" in info and "_CatLib" in info

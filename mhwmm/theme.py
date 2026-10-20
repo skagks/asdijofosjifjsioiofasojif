@@ -220,6 +220,8 @@ class Theme:
                              ("Info", "info", "info_bg")):
             s.configure(f"Badge{kind}.TLabel", background=p[bg], foreground=p[fg], font=f["small_bold"],
                         padding=(px(10), px(4)))
+            s.configure(f"Legend{kind}.TLabel", background=p[bg], foreground=p[fg], font=f["small"],
+                        padding=(px(8), px(1)))
 
         # buttons
         def button(style, bg, fg, hover, press, border=None, padding=(14, 7), font=None, width=-6):

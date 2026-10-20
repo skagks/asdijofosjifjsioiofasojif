@@ -13,6 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mhwmm.constants import GAME_EXE  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Tests never reach the internet; the ones about downloads put their own fake in place."""
+    import urllib.request
+
+    def blocked(request, *args, **kwargs):
+        url = getattr(request, "full_url", request)
+        raise OSError(f"tests do not use the network: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", blocked)
+
+
 def write(path: Path, data: str | bytes = "x") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(data, str):

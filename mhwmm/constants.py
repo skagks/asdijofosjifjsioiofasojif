@@ -24,6 +24,7 @@ REFW_ORIGIN = "reframework"  # Mod.origin of the REFramework installed through t
 
 REFRAMEWORK_URL = "https://github.com/praydog/REFramework-nightly/releases"
 NEXUS_URL = "https://www.nexusmods.com/games/monsterhunterwilds/mods"
+NEXUS_SEARCH_URL = "https://www.nexusmods.com/games/monsterhunterwilds/mods?keyword={}"
 
 # Releases of this program (used by the in-app updater).
 GITHUB_REPO = "skagks/asdijofosjifjsioiofasojif"

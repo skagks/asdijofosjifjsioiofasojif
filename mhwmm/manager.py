@@ -10,15 +10,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from . import fsutil, nexus, steam
+from . import fsutil, nexus, requirements, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
-from .constants import GAME_EXE, REFRAMEWORK_DLL, REFW_ORIGIN
+from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_URL, REFW_ORIGIN
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
 
 log = logging.getLogger(__name__)
@@ -279,6 +280,11 @@ class Mod:
     nexus_checked: int = 0  # last time this mod was looked up on Nexus
     nexus_unlinked: bool = False  # the user removed the link: don't guess it from the file name again
     update: dict = field(default_factory=dict)  # newer file found on Nexus: {"version", "file", "uploaded"}
+    # Requirements listed on the Nexus page: [{"name", "url", "nexus_id", "notes", "external"}]
+    requirements: list = field(default_factory=list)
+    requirements_checked: int = 0  # when they were last read from Nexus (0 = never)
+    lua_requires: list = field(default_factory=list)  # Lua modules the mod's scripts need from other mods
+    lua_scanned: bool = False
 
     @property
     def nexus_url(self) -> str:
@@ -289,6 +295,8 @@ class Mod:
                         if isinstance(o, dict) and isinstance(o.get("id"), str) and isinstance(o.get("name"), str)]
         ids = [o["id"] for o in self.options]
         self.selected = [i for i in ids if i in self.selected]
+        self.requirements = [r for r in self.requirements if isinstance(r, dict) and isinstance(r.get("name"), str)]
+        self.lua_requires = [r for r in self.lua_requires if isinstance(r, str)]
 
     @property
     def needs_option(self) -> bool:
@@ -325,6 +333,14 @@ class Conflicts:
             else:
                 beaten.setdefault(winner, []).append(path)
         return beats, beaten
+
+    def pairs(self) -> list[tuple[str, str, list[str]]]:
+        """(winning mod, overridden mod, files) for every two mods that change the same files, most files first."""
+        found: dict[tuple[str, str], list[str]] = {}
+        for key, ids in self.owners.items():
+            for other in ids[:-1]:
+                found.setdefault((ids[-1], other), []).append(self.paths[key])
+        return sorted(((w, l, sorted(f, key=str.casefold)) for (w, l), f in found.items()), key=lambda p: -len(p[2]))
 
     def counts(self, mod_id: str) -> tuple[int, int]:
         wins = losses = 0
@@ -697,6 +713,18 @@ class ModManager:
         multi = {k: v for k, v in owners.items() if len(v) > 1}
         return Conflicts(multi, {k: paths[k] for k in multi})
 
+    def hidden_mods(self, conflicts: Conflicts | None = None) -> list[Mod]:
+        """Enabled mods whose files all lose to other mods, so nothing of them reaches the game."""
+        conflicts = conflicts or self.conflicts()
+        hidden = []
+        for m in self.mods:
+            if not m.enabled:
+                continue
+            wins, losses = conflicts.counts(m.id)
+            if losses and not wins and losses == sum(1 for f in self.mod_files(m.id) if not is_root_pak(f)):
+                hidden.append(m)
+        return hidden
+
     # ------------------------------------------------------------- edits
     def set_enabled(self, mod_id: str, enabled: bool) -> None:
         mod = self.get(mod_id)
@@ -839,6 +867,8 @@ class ModManager:
                 mod = Mod(id=mod_id, name=self._unique_name(name),
                           enabled=self.settings.enable_on_install, installed_at=now)
             ref = nexus.parse_source_name(session.source.name)
+            if ref and ref.mod_id != mod.nexus_id:
+                mod.requirements, mod.requirements_checked = [], 0  # another Nexus mod now
             if ref:
                 mod.nexus_id, mod.nexus_file_time, mod.nexus_exact = ref.mod_id, ref.uploaded, ref.exact
                 mod.nexus_unlinked = False
@@ -856,6 +886,8 @@ class ModManager:
             mod.category = (info.category if info else "") or (mod.category if replace_id else "")
             mod.source = session.source.name
             mod.screenshot = screenshot
+            mod.lua_requires = requirements.required_modules(self._stored_files(stage))
+            mod.lua_scanned = True
             self._write_mod_meta(mod, stage)
 
             final = self.mod_dir(mod_id)
@@ -883,6 +915,111 @@ class ModManager:
             log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
         return mod
 
+    # ------------------------------------------------------------- requirements
+    @staticmethod
+    def _stored_files(mod_dir: Path) -> dict[str, Path]:
+        """Game path -> stored file for every file of a mod, all options included."""
+        out: dict[str, Path] = {}
+        files = mod_dir / "files"
+        if files.is_dir():
+            out.update((rel, files / rel) for rel in list_files(files))
+        options = mod_dir / "options"
+        if options.is_dir():
+            for option in sorted(options.iterdir()):
+                if option.is_dir():
+                    out.update((rel, option / rel) for rel in list_files(option))
+        return out
+
+    def _ensure_lua_scan(self, mod: Mod) -> None:
+        """Mods installed by older versions are read once for the Lua modules they need."""
+        if not mod.lua_scanned:
+            mod.lua_requires = requirements.required_modules(self._stored_files(self.mod_dir(mod.id)))
+            mod.lua_scanned = True
+            self._write_mod_meta(mod)
+            self.save()
+
+    def _module_providers(self) -> dict[str, list[Mod]]:
+        """Lua module -> installed mods that provide it (cached per change)."""
+        key = (self.revision, tuple((m.id, tuple(m.selected)) for m in self.mods))
+        cached = getattr(self, "_providers_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        index: dict[str, list[Mod]] = {}
+        for m in self.mods:
+            for name in requirements.provided_modules(self.mod_files(m.id)):
+                index.setdefault(name, []).append(m)
+        self._providers_cache = (key, index)
+        return index
+
+    def requirement_status(self, mod_id: str) -> list[dict]:
+        """What the mod needs and whether it is there.
+
+        Each item: {"name", "url", "notes", "kind": "nexus" | "lua", "state", "by"} where state is
+        "ok" (installed and on), "off" (installed but off), "missing" or "unknown" (cannot be checked)."""
+        mod = self.get(mod_id)
+        self._ensure_lua_scan(mod)
+        others = [m for m in self.mods if m.id != mod.id]
+        out = []
+
+        def found(candidates: list[Mod]) -> tuple[str, str]:
+            if not candidates:
+                return "missing", ""
+            best = next((m for m in candidates if m.enabled), candidates[0])
+            return ("ok" if best.enabled else "off"), best.name
+
+        for req in mod.requirements:
+            name, url = req.get("name", ""), req.get("url", "")
+            item = {"name": name, "url": url, "notes": req.get("notes", ""), "kind": "nexus", "by": ""}
+            if requirements.is_reframework(name):
+                refw = self.refw_mod()
+                ok = self.refw_installed() and (refw is None or refw.enabled)
+                item.update(state="ok" if ok else "missing", by="REFramework" if ok else "",
+                            url=url or REFRAMEWORK_URL)
+            else:
+                nexus_id = int(req.get("nexus_id") or 0)
+                matches = [m for m in others if nexus_id and m.nexus_id == nexus_id] or \
+                    [m for m in others if requirements.names_match(name, m.name)]
+                state, by = found(matches)
+                if state == "missing" and req.get("external"):
+                    state = "unknown"  # another site or game: cannot tell if it is installed
+                item.update(state=state, by=by)
+            out.append(item)
+
+        providers = self._module_providers()
+        autorun = self.game_dir / "reframework" / "autorun" if self.game_dir else None
+        for module in mod.lua_requires:
+            key = requirements.module_key(module)
+            state, by = found([m for m in providers.get(key, []) if m.id != mod.id])
+            if state == "missing" and autorun is not None and (
+                    (autorun / f"{key}.lua").is_file() or (autorun / key / "init.lua").is_file()):
+                state, by = "ok", "게임 폴더"
+            out.append({"name": module, "url": NEXUS_SEARCH_URL.format(urllib.parse.quote(module)),
+                        "notes": "", "kind": "lua", "state": state, "by": by})
+        return out
+
+    def missing_requirements(self, mod_id: str) -> list[dict]:
+        return [r for r in self.requirement_status(mod_id) if r["state"] in ("missing", "off")]
+
+    def requirement_targets(self, max_age: float = 7 * 86400) -> list[int]:
+        """Nexus mods whose requirements were never read, or not for a while."""
+        now = time.time()
+        return sorted({m.nexus_id for m in self.mods
+                       if m.nexus_id and now - m.requirements_checked > max_age})
+
+    def set_requirements(self, found: dict[int, list[dict]]) -> list[Mod]:
+        """Store requirements read from Nexus. Returns the mods that got them."""
+        now = int(time.time())
+        changed = []
+        for m in self.mods:
+            if m.nexus_id in found:
+                m.requirements = [dict(r) for r in found[m.nexus_id]]
+                m.requirements_checked = now
+                self._write_mod_meta(m)
+                changed.append(m)
+        if changed:
+            self.save()
+        return changed
+
     # ------------------------------------------------------------- Nexus
     def link_nexus(self, mod_id: str, text: str) -> int:
         """Connect a mod to its Nexus page (link or mod number). Returns the Nexus mod id."""
@@ -890,6 +1027,7 @@ class ModManager:
         nexus_id = nexus.parse_mod_ref(text)
         if nexus_id != mod.nexus_id:
             mod.nexus_id, mod.nexus_file_time, mod.nexus_checked, mod.update = nexus_id, 0, 0, {}
+            mod.requirements, mod.requirements_checked = [], 0
             mod.nexus_unlinked = False
             self._write_mod_meta(mod)
             self.save()
@@ -898,6 +1036,7 @@ class ModManager:
     def unlink_nexus(self, mod_id: str) -> None:
         mod = self.get(mod_id)
         mod.nexus_id, mod.nexus_file_time, mod.nexus_checked, mod.update = 0, 0, 0, {}
+        mod.requirements, mod.requirements_checked = [], 0
         mod.nexus_unlinked = True
         self._write_mod_meta(mod)
         self.save()
