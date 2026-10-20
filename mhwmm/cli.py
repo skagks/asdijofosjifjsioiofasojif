@@ -434,7 +434,7 @@ def cmd_equipment(manager: ModManager, args) -> int:
             use = next(u for u in item.uses if u.mod_id == job.mod_id)
             parts = [PART_LABELS.get(p, p) for p in (*item.parts, *use.parts) if p and p in use.parts]
             parts = list(dict.fromkeys(parts))
-            rarity = f" · 레어 {item.rarity}" if item.rarity else ""
+            rarity = f" · {item.rarity_text}" if item.rarity else ""
             where = f" [{', '.join(parts)}]" if parts else ""
             print(f"     {KIND_LABELS.get(item.target.kind, '')} {item.name} ({item.subtitle}{rarity}){where}")
             for part, users in item.conflicts().items():

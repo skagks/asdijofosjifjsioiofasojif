@@ -30,7 +30,9 @@ class Item:
     names: list[str]
     subtitle: str
     group: str  # sidebar group, e.g. "armor/f", "weapon/02"
-    rarity: int | None = None
+    rarity: int | None = None  # the lowest of the equipment sharing this look (low rank)
+    rarity_max: int | None = None  # and the highest (α, β ...)
+    rarities: list = field(default_factory=list)  # of each of names
     parts: tuple[str, ...] = ()  # the parts this kind of equipment has, in the game's order
     uses: list[ModUse] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -55,6 +57,19 @@ class Item:
             if len(users) > 1:
                 out[part] = users
         return out
+
+    @property
+    def top_rarity(self) -> int | None:
+        """The highest rarity: its colour frames the item's pictures."""
+        return self.rarity_max or self.rarity
+
+    @property
+    def rarity_text(self) -> str:
+        """"레어 2" or, for a look shared from low rank to β, "레어 2~6"."""
+        if not self.rarity:
+            return ""
+        high = self.top_rarity
+        return f"레어 {self.rarity}" if high == self.rarity else f"레어 {self.rarity}~{high}"
 
     def search_text(self) -> str:
         return " ".join([self.name, *self.names, self.subtitle, *(u.name for u in self.uses)]).lower()
@@ -159,9 +174,10 @@ def build(scans: list[tuple[str, str, bool, int, object]], catalog=None) -> Over
             item = items.get(key)
             if item is None:
                 name, names, entry = describe(key, catalog)
+                low, high = catalog.rarity_range(key) if catalog is not None else (None, None)
                 item = items[key] = Item(key, name, names, _subtitle(key, entry, catalog), _group(key),
-                                         catalog.rarity(key) if catalog is not None else None,
-                                         _parts(key))
+                                         rarity=low, rarity_max=high, parts=_parts(key),
+                                         rarities=catalog.rarities(key) if catalog is not None else [])
             use = next((u for u in item.uses if u.mod_id == mod_id), None)
             if use is None:
                 use = ModUse(mod_id, mod_name, enabled, order)
@@ -179,6 +195,17 @@ def build(scans: list[tuple[str, str, bool, int, object]], catalog=None) -> Over
                     to += f"({_subtitle(dest.item, entry, catalog)})"
                 to_part = PART_LABELS.get(dest.part, "")
                 note = f"'{mod_name}': {where + ' ' if where else ''}프리팹이 {to}{' ' + to_part if to_part else ''} 모델을 씁니다"
+                if note not in item.notes:
+                    item.notes.append(note)
+        for source, twin in scan.shared:
+            if catalog is not None:
+                source, twin = catalog.resolve(source), catalog.resolve(twin)
+            item = items.get(twin.item)
+            if item is not None:
+                name, _names, entry = describe(source.item, catalog)
+                where = PART_LABELS.get(source.part, "")
+                note = (f"'{mod_name}': {name}({_subtitle(source.item, entry, catalog)}){' ' + where if where else ''}의 "
+                        "게임 텍스처를 바꿉니다. 게임에서 이 장비도 같은 텍스처를 써서 함께 바뀝니다")
                 if note not in item.notes:
                     item.notes.append(note)
         for error in scan.errors:

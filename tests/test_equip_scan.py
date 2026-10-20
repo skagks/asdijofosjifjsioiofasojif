@@ -95,8 +95,23 @@ def test_loose_files(tmp_path):
     assert result.targets == {A("f/004/001", "helm"): 2, A("m/004/001", "helm"): 1, W("02/000029", "main"): 2,
                               W("02/000029", "sub"): 2, A("f/008/001", "helm"): 1}
     assert result.redirects == [(A("f/008/001", "helm"), A("f/022/000", "helm"))]
+    assert result.shared == [(A("f/004/001", "helm"), A("m/004/001", "helm"))]
     assert (result.unknown, result.paks, result.errors) == (2, 0, [])
     assert result.items() == {A("f/004/001"): 2, A("m/004/001"): 1, W("02/000029"): 4, A("f/008/001"): 1}
+
+
+def test_own_textures_do_not_change_the_other_body(tmp_path):
+    # textures of the mod's own names in the female folder: only the mod's female material uses them,
+    # the male type-2 helm (which borrows the female folder's game textures) keeps its look
+    files = stage(tmp_path / "mod", {
+        "natives/STM/Art/Model/Character/ch03/004/001/3/ch03_004_0013.mdf2.45":
+            mdf2("Art/Model/Character/ch03/004/001/3/textures/perlica_ALBD.tex"),
+        "natives/STM/Art/Model/Character/ch03/004/001/3/ch03_004_0013.mesh.241111606": MESH,
+        "natives/STM/Art/Model/Character/ch03/004/001/3/textures/perlica_ALBD.tex.241106027": TEX,
+        "natives/STM/Art/Model/Character/ch03/004/001/3/textures/ch03_004_0013_ALBD_new.tex.241106027": TEX,
+    })
+    result = scan_files(files, None)
+    assert result.targets == {A("f/004/001", "helm"): 4} and result.shared == []
 
 
 def test_unreadable_loose_files_do_not_stop_the_scan(tmp_path):

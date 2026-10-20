@@ -56,8 +56,8 @@ from .userdata import USER, read_user, rows
 
 log = logging.getLogger(__name__)
 
-CATALOG_FORMAT = 2  # raise when the result of build() changes, so that cached catalogs are made again
-# 2: thumbnails also without the GUI thumbnail tables (their names follow the TextureId)
+CATALOG_FORMAT = 3  # raise when the result of build() changes, so that cached catalogs are made again
+# 2: thumbnails also without the GUI thumbnail tables (their names follow the TextureId); 3: rarity per name
 NATIVES = "natives/STM/"
 USER_VERSION, MSG_VERSION, PFB_VERSION, TEX_VERSION = ".3", ".23", ".18", ".241106027"
 USER_EXT, MSG_EXT = ".user" + USER_VERSION, ".msg" + MSG_VERSION
@@ -171,6 +171,25 @@ def palico_thumb_prefab(tid: int) -> str:
     """5e5 + NNN*100 + X*10 -> Thumbnail_ch05_NNN_X0."""
     number, slot = divmod(tid - 500000, 100)
     return _THUMB_PREFAB.format("ch05", f"ch05_{number:03d}_{slot:02d}")
+
+
+def _named(pairs, limit: int = MAX_NAMES) -> dict:
+    """"names" (unique, in order) and the in-game rarity of each ("rarities"; the lowest when a name
+    occurs more than once), "rarity" and "rarity_max": the lowest and highest of all."""
+    rarity: dict[str, int | None] = {}
+    every = []
+    for name, rare in pairs:
+        if rare:
+            every.append(rare)
+        if not name:
+            continue
+        if name not in rarity:
+            rarity[name] = rare
+        elif rare and (rarity[name] is None or rare < rarity[name]):
+            rarity[name] = rare
+    names = list(rarity)[:limit]
+    return {"names": names, "rarities": [rarity[n] for n in names], "rarity": min(every, default=None),
+            "rarity_max": max(every, default=None)}
 
 
 def _unique(names) -> list[str]:
@@ -400,11 +419,10 @@ class _Builder:
             first = members[0]
             design = 1 if sub == first.male else 2
             bodies = [b for b in "mf" if listed is None or (b, model, sub) in listed] or ["m", "f"]
-            names_ = _unique(s.name for s in members)[:MAX_NAMES]
-            rarity = min((s.rarity for s in members if s.rarity), default=None)
+            named = _named((s.name, s.rarity) for s in members)
             for body in bodies:
-                entry = {"names": names_, "design": design, "single_design": first.male == first.female,
-                         "rarity": rarity, "pieces": {}, "thumbs": {}}
+                entry = {**named, "design": design, "single_design": first.male == first.female,
+                         "pieces": {}, "thumbs": {}}
                 for p, part in enumerate(ARMOR_THUMB_PARTS):
                     for s in members:
                         pair = pieces.get(s.fixed, {}).get(part)
@@ -482,8 +500,7 @@ class _Builder:
                      _rarity(r.get("_Rare")), t, _int(r.get(f"_{file}Id"))))  # _<Type>Id: its weapon, if any
             for key, members in found.items():
                 members.sort(key=lambda m: m[0])
-                entry = {"names": _unique(m[1] for m in members)[:MAX_NAMES],
-                         "rarity": min((m[2] for m in members if m[2]), default=None), "thumbs": {}, "thumb": None}
+                entry = {**_named((m[1], m[2]) for m in members), "thumbs": {}, "thumb": None}
                 in_tree = Counter(tree[m[4]] for m in members if m[4] in tree)
                 if in_tree:
                     entry["tree"] = in_tree.most_common(1)[0][0]
@@ -530,8 +547,7 @@ class _Builder:
             members.sort(key=lambda m: m[0])
             tid = 10 * 10 ** 6 + members[0][3]
             prefab = thumbs.get(tid) or item_thumb_prefab(tid)
-            entry = {"names": _unique(m[1] for m in members)[:MAX_NAMES],
-                     "rarity": min((m[2] for m in members if m[2]), default=None), "thumbs": {},
+            entry = {**_named((m[1], m[2]) for m in members), "thumbs": {},
                      "thumb": self.thumb(prefab) if prefab else None}
             if entry["names"] or entry["thumb"]:
                 out[key] = entry
@@ -565,8 +581,7 @@ class _Builder:
         out = self.section("palico")
         for number, members in groups.items():
             members.sort(key=lambda m: m[0])
-            entry = {"names": _unique(m[2] for m in members)[:MAX_NAMES],
-                     "rarity": min((m[3] for m in members if m[3]), default=None), "pieces": {}, "thumbs": {}}
+            entry = {**_named((m[2], m[3]) for m in members), "pieces": {}, "thumbs": {}}
             for part in ("helm", "body", "weapon"):
                 name = next((pieces[m[1]][part] for m in members if part in pieces.get(m[1], {})), "")
                 if name:
@@ -718,6 +733,10 @@ def _part(value) -> str | None:
     return ARMOR_THUMB_PARTS[v] if v is not None and 0 <= v < len(ARMOR_THUMB_PARTS) else None
 
 
+def _rare(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _item_thumb(thumbs: dict[str, str]) -> str | None:
     return next((thumbs[p] for p in ITEM_THUMB_ORDER if p in thumbs), None)
 
@@ -778,9 +797,28 @@ class Catalog:
         return tex if isinstance(tex, str) and tex else None
 
     def rarity(self, target: Target) -> int | None:
+        """The lowest in-game rarity of the equipment that looks like this (e.g. the low-rank set)."""
         entry = self.entry(target)
-        value = entry.get("rarity") if entry else None
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
+        return _rare(entry.get("rarity")) if entry else None
+
+    def rarity_range(self, target: Target) -> tuple[int | None, int | None]:
+        """(lowest, highest) rarity of the equipment that shares this look (low rank ... α, β)."""
+        entry = self.entry(target)
+        if not entry:
+            return None, None
+        low = _rare(entry.get("rarity"))
+        return low, _rare(entry.get("rarity_max")) or low
+
+    def rarities(self, target: Target) -> list[int | None]:
+        """The rarity of each of names(target)."""
+        entry = self.entry(target)
+        if not entry:
+            return []
+        names, rares = entry.get("names"), entry.get("rarities")
+        if not isinstance(names, list):
+            return []
+        rares = rares if isinstance(rares, list) and len(rares) == len(names) else [None] * len(names)
+        return [_rare(r) for n, r in zip(names, rares) if isinstance(n, str) and n]
 
     def weapon_type_name(self, wtype: int) -> str:
         found = _dict(self._labels.get("weapon_types")).get(str(wtype))

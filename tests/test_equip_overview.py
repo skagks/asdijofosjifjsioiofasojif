@@ -4,8 +4,8 @@ from mhwmm.equip import overview
 from mhwmm.equip.model import Target, fallback_label
 
 
-def scan(targets, redirects=(), errors=()):
-    return SimpleNamespace(targets=dict(targets), redirects=list(redirects), errors=list(errors))
+def scan(targets, redirects=(), errors=(), shared=()):
+    return SimpleNamespace(targets=dict(targets), redirects=list(redirects), errors=list(errors), shared=list(shared))
 
 
 class FakeCatalog:
@@ -24,7 +24,13 @@ class FakeCatalog:
         return {"design": 2} if target.kind == "armor" else {}
 
     def rarity(self, target):
-        return 3 if target.kind == "armor" else None
+        return self.rarity_range(target)[0]
+
+    def rarity_range(self, target):
+        return (3, 7) if target.kind == "armor" else (None, None)
+
+    def rarities(self, target):
+        return [3, 7] if target.kind == "armor" else []
 
     def weapon_type_name(self, wtype):
         return "쌍검"
@@ -47,6 +53,8 @@ def test_items_merge_mods_and_mark_conflicts():
     result = overview.build(scans, catalog)
     armor, blades = result.items
     assert armor.name == "시험 · 시험α" and armor.subtitle == "여성 · 타입 2" and armor.rarity == 3
+    assert (armor.rarity_max, armor.rarities, armor.rarity_text) == (7, [3, 7], "레어 3~7")
+    assert (blades.rarity, blades.rarity_text) == (None, "")
     assert armor.changed == ["helm", "body"]
     assert [u.name for u in armor.uses] == ["Armor A", "Armor B", "Old helm"]
     assert armor.uses[0].files == 5
@@ -66,6 +74,25 @@ def test_without_catalog_uses_game_numbers_and_notes_redirects():
     assert item.name == fallback_label(item.target) == "방어구 008-001" and item.subtitle == "여성"
     assert item.notes == ["'Lepus': 머리 프리팹이 방어구 022-000 머리 모델을 씁니다"]
     assert item.changed == ["helm"] and not item.conflicts()
+
+
+def test_the_other_body_sharing_a_game_texture_says_why():
+    female, male = Target("armor", "f/004/001", "helm"), Target("armor", "m/004/001", "helm")
+    result = overview.build([("p", "Perlica", True, 0, scan({female: 1, male: 1}, shared=[(female, male)]))],
+                            FakeCatalog({("armor", "f/004/001"): ["시험"]}))
+    she, he = result.items
+    assert she.notes == []
+    assert he.notes == ["'Perlica': 시험(여성 · 타입 2) 머리의 게임 텍스처를 바꿉니다. "
+                        "게임에서 이 장비도 같은 텍스처를 써서 함께 바뀝니다"]
+
+
+def test_rarity_text():
+    item = overview.Item(Target("armor", "f/004/001"), "시험", ["시험"], "", "armor/f", rarity=4)
+    assert item.rarity_text == "레어 4"
+    item.rarity_max = 4
+    assert item.rarity_text == "레어 4"
+    item.rarity_max = 8
+    assert item.rarity_text == "레어 4~8"
 
 
 def test_fallback_labels():

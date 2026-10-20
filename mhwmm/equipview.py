@@ -405,15 +405,15 @@ class EquipmentWindow(tk.Toplevel):
         t, px = self.theme, self.theme.px
         tile = ttk.Frame(self.list, style="Tile.TFrame", padding=(px(10), px(9)))
         tile.pack(fill="x", pady=(0, px(6)))
-        box, picture = self._picture_box(tile, px(self.THUMB), item.rarity)
+        box, picture = self._picture_box(tile, px(self.THUMB), item.top_rarity)
         box.pack(side="left", anchor="n")
         self._picture(picture, item, item.target.with_part(self._show_part(item)), px(self.THUMB))
 
         right = ttk.Frame(tile, style="Tile.TFrame")
         right.pack(side="right", anchor="n", padx=(px(8), 0))
         if item.rarity:
-            ttk.Label(right, text=f"레어 {item.rarity}", style="TileMuted.TLabel",
-                      foreground=self._rarity_text(item.rarity)).pack(anchor="e")
+            ttk.Label(right, text=item.rarity_text, style="TileMuted.TLabel",
+                      foreground=self._rarity_text(item.top_rarity)).pack(anchor="e")
         conflicts = item.conflicts()
         if conflicts:
             chip = ttk.Label(right, text="겹침", style="PartConflict.TLabel")
@@ -526,18 +526,17 @@ class EquipmentWindow(tk.Toplevel):
                       wraplength=px(296)).pack(anchor="w")
             return
         d = self.detail
-        box, picture = self._picture_box(d, px(self.PICTURE), item.rarity)
+        box, picture = self._picture_box(d, px(self.PICTURE), item.top_rarity)
         box.pack(anchor="center")
         self._picture(picture, item, item.target.with_part(self._show_part(item)), px(self.PICTURE))
         if item.target.kind == "armor":
             self._part_pictures(d, item)
         ttk.Label(d, text=item.name, style="CardTitle.TLabel", wraplength=px(296), justify="left").pack(
             anchor="w", pady=(px(14), 0))
-        bits = [item.subtitle] + ([f"레어 {item.rarity}"] if item.rarity else [])
+        bits = [item.subtitle] + ([item.rarity_text] if item.rarity else [])
         ttk.Label(d, text=" · ".join(bits), style="CardMuted.TLabel").pack(anchor="w", pady=(px(2), 0))
-        if len(item.names) > 1 and item.name != " · ".join(item.names):
-            ttk.Label(d, text=" / ".join(item.names), style="CardMuted.TLabel", wraplength=px(296),
-                      justify="left", font=t.fonts["small"]).pack(anchor="w", pady=(px(6), 0))
+        if len(item.names) > 1:
+            self._names(d, item)
 
         self._section(d, "바꾸는 모드")
         conflicts = item.conflicts()
@@ -590,6 +589,20 @@ class EquipmentWindow(tk.Toplevel):
         label.bind("<Button-1>", lambda e: self.app.show_picture(path, use.name, parent=self))
         Tooltip(self.theme, label, "모드에 들어 있는 미리보기 그림 · 누르면 크게 봅니다")
 
+    def _names(self, parent, item: ov.Item):
+        """Every equipment that looks like this, each in its rarity's colour (low rank, α, β ...)."""
+        px = self.theme.px
+        box = ttk.Frame(parent, style="Card.TFrame")
+        box.pack(anchor="w", fill="x", pady=(px(6), 0))
+        rarities = item.rarities if len(item.rarities) == len(item.names) else [None] * len(item.names)
+        for name, rarity in zip(item.names, rarities):
+            row = ttk.Frame(box, style="Card.TFrame")
+            row.pack(anchor="w", fill="x")
+            ttk.Label(row, text=name, style="CardMuted.TLabel", wraplength=px(230), justify="left").pack(side="left")
+            if rarity:
+                ttk.Label(row, text=f"레어 {rarity}", style="CardMuted.TLabel", font=self.theme.fonts["small"],
+                          foreground=self._rarity_text(rarity)).pack(side="right")
+
     def _section(self, parent, title: str):
         ttk.Label(parent, text=title, style="Section.TLabel").pack(anchor="w", pady=(self.theme.px(16), 0))
 
@@ -601,7 +614,7 @@ class EquipmentWindow(tk.Toplevel):
         for part in ARMOR_PARTS[:5]:
             cell = ttk.Frame(row, style="Card.TFrame")
             cell.pack(side="left", padx=px(3))
-            box, picture = self._picture_box(cell, px(self.PART), item.rarity if part in changed else None)
+            box, picture = self._picture_box(cell, px(self.PART), item.top_rarity if part in changed else None)
             box.pack()
             self._picture(picture, item, item.target.with_part(part), px(self.PART))
             ttk.Label(cell, text=PART_LABELS[part], style="PartOn.TLabel" if part in changed else "PartOff.TLabel"

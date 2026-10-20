@@ -30,7 +30,7 @@ from .paths import classify, normalize
 
 log = logging.getLogger(__name__)
 
-SCAN_FORMAT = 1  # raise when results can change, so that cached scans are made again
+SCAN_FORMAT = 2  # raise when results can change, so that cached scans are made again (2: only game textures count for the other body)
 MAX_READ = 4 << 20  # larger files are never read: materials and prefabs are far smaller
 MDF2_MAGIC = b"MDF\x00"
 PFB_MAGIC = b"PFB\x00"
@@ -63,6 +63,8 @@ class ModScan:
     unknown: int = 0  # files and pak entries of no equipment
     paks: int = 0
     errors: list[str] = field(default_factory=list)
+    # (a replaced game texture's own part, the other body's part that uses the same texture)
+    shared: list[tuple[Target, Target]] = field(default_factory=list)
 
     def items(self) -> dict[Target, int]:
         """Files per equipment, parts merged."""
@@ -75,7 +77,8 @@ class ModScan:
         return {"format": SCAN_FORMAT,
                 "targets": [[t.kind, t.key, t.part, n] for t, n in sorted(self.targets.items())],
                 "redirects": [[[a.kind, a.key, a.part], [b.kind, b.key, b.part]] for a, b in self.redirects],
-                "unknown": self.unknown, "paks": self.paks, "errors": list(self.errors)}
+                "unknown": self.unknown, "paks": self.paks, "errors": list(self.errors),
+                "shared": [[[a.kind, a.key, a.part], [b.kind, b.key, b.part]] for a, b in self.shared]}
 
     @classmethod
     def from_dict(cls, data) -> "ModScan | None":
@@ -85,7 +88,8 @@ class ModScan:
                 return None
             return cls({Target(str(k), str(key), str(p)): int(n) for k, key, p, n in data["targets"]},
                        [(Target(*map(str, a)), Target(*map(str, b))) for a, b in data["redirects"]],
-                       int(data["unknown"]), int(data["paks"]), [str(e) for e in data["errors"]])
+                       int(data["unknown"]), int(data["paks"]), [str(e) for e in data["errors"]],
+                       [(Target(*map(str, a)), Target(*map(str, b))) for a, b in data["shared"]])
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
 
@@ -191,16 +195,23 @@ def _swaps(own: Target, mesh: Target) -> bool:
     return not (own.kind == mesh.kind == "armor" and own.key[1:] == mesh.key[1:])
 
 
-_TWINS: dict[tuple[str, str], list[str]] | None = None
+_TWINS: tuple[dict[tuple[str, str], list[str]], frozenset[str]] | None = None
 
 
 def texture_twins() -> dict[tuple[str, str], list[str]]:
     """(armor key, part) of a folder with textures -> the other body's folders of the same design that
     have models but no textures of their own: their materials use these textures (a body wearing the
     other body's design, e.g. ch03/060/000 uses ch02/060/000's textures)."""
+    return _twins()[0]
+
+
+def _twins() -> tuple[dict[tuple[str, str], list[str]], frozenset[str]]:
+    """texture_twins() and the game's own armor textures (normalized paths): only a mod file that
+    replaces one of those changes the look of the folders that borrow it - a texture of the mod's
+    own name is used by the mod's own materials only."""
     global _TWINS
     if _TWINS is None:
-        meshes, textures = set(), set()
+        meshes, textures, files = set(), set(), set()
         for p in game_paths():
             if "/model/character/ch0" not in p:
                 continue
@@ -211,12 +222,13 @@ def texture_twins() -> dict[tuple[str, str], list[str]]:
                 meshes.add((t.key, t.part))
             elif ".tex." in p:
                 textures.add((t.key, t.part))
+                files.add(normalize(p))
         twins: dict[tuple[str, str], list[str]] = {}
         for key, part in sorted(meshes - textures):
             other = ("f" if key[0] == "m" else "m") + key[1:]
             if (other, part) in textures:
                 twins.setdefault((other, part), []).append(key)
-        _TWINS = twins
+        _TWINS = twins, frozenset(files)
     return _TWINS
 
 
@@ -336,14 +348,18 @@ def scan_files(files: Mapping[str, Path], index: PathIndex | None) -> ModScan:
             if not (_adopt(items) | _infer_all(content)):
                 break
 
-    twins = texture_twins() if any(f.target and f.target.kind == "armor" and f.ext() == "tex" for f in items) else {}
+    twins, game_textures = _twins() if any(f.target and f.target.kind == "armor" and f.ext() == "tex"
+                                           for f in items) else ({}, frozenset())
     for f in items:
         if f.target is None:
             scan.unknown += 1
             continue
         scan.targets[f.target] = scan.targets.get(f.target, 0) + 1
-        if f.target.kind == "armor" and f.ext() == "tex":  # also the look of the folders that borrow it
+        if f.target.kind == "armor" and f.ext() == "tex" and normalize(f.path) in game_textures:
+            # a game texture the other body's model of this design uses: its look changes too
             for key in twins.get((f.target.key, f.target.part), ()):
                 twin = Target("armor", key, f.target.part)
                 scan.targets[twin] = scan.targets.get(twin, 0) + 1
+                if (f.target, twin) not in scan.shared:
+                    scan.shared.append((f.target, twin))
     return scan

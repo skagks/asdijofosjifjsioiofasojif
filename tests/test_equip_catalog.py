@@ -369,6 +369,7 @@ def test_armor_both_designs_and_bodies(cat):
             entry = cat.entry(A(key))
             assert cat.names(A(key)) == ["시험", "Trial α"]  # sort id order; English where Korean is missing
             assert (entry["design"], entry["single_design"], cat.rarity(A(key))) == (design, False, 1)
+            assert cat.rarity_range(A(key)) == (1, 5) and cat.rarities(A(key)) == [1, 5]  # low rank ... α
             assert entry["pieces"] == {"helm": "시험투구", "body": "시험갑옷", "leg": "시험장화α"}
     assert cat.name(A("f/004/001", "helm")) == "시험투구" and cat.name(A("f/004/001", "arm")) == "시험"
     assert cat.name(A("f/004/001")) == "시험"
@@ -395,6 +396,7 @@ def test_weapons_share_models_and_layered_ones_follow(cat):
     key = W("02/000029", "main")
     assert cat.names(key) == ["새벽쌍검Ⅰ", "황혼쌍검", "새벽쌍검 덧입기"]
     assert cat.name(key) == "새벽쌍검Ⅰ" and cat.rarity(key) == 6
+    assert cat.rarity_range(key) == (6, 8) and cat.rarities(key) == [6, 8, 8]
     assert cat.thumb(key) == thumb_tex("it02", "it0200_0083") and cat.thumb(W("02/000029")) == cat.thumb(key)
     assert cat.entry(key)["tree"] == "새벽 파생"
     assert cat.names(W("02/000028")) == ["첫걸음쌍검Ⅰ"] and cat.thumb(W("02/000028")) is None
