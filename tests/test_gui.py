@@ -80,8 +80,8 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
             "Opts/One/natives/STM/o.tex": "1", "Opts/Two/natives/STM/o.tex": "2"})) as s:
         opts = manager.install_package(s, s.variants)
     app.refresh()
-    assert app.tree.item(opts.id, "values")[1] == "Opts"
-    assert app.tree.item(opts.id, "values")[4] == "선택 필요"
+    assert app.tree.item(opts.id, "values")[1] == "⚠ Opts"  # no option on yet: marked as a problem
+    assert app.tree.item(opts.id, "values")[4] == "선택 필요" and "problem" in app.tree.item(opts.id, "tags")
     app.show_options(opts.id)
     assert app.notebook.select() == str(app.options_tab)
     app._option_vars[1][1].set(True)
@@ -371,7 +371,14 @@ def test_gui_conflict_overview_and_highlight(root, manager, tmp_path):
     with manager.prepare_install(make_zip(tmp_path / "C.zip", {"natives/STM/z.tex": "c"})) as s:
         c = manager.install_variant(s, s.variants[0])
     app = gui.App(root, manager, queue.Queue())
-    assert app.conflicts_button.cget("text") == "⚠ 충돌 1쌍 보기" and app.conflicts_button.winfo_manager()
+    assert app.conflicts_button.cget("text") == "충돌 1쌍 보기 ›" and app.conflicts_button.winfo_manager()
+    # A is hidden behind B entirely: a problem, shown with the problems button and a tooltip
+    assert "problem" in app.tree.item(a.id, "tags") and app.tree.item(a.id, "values")[1] == "⚠ A"
+    assert app.problems_button.cget("text") == "⚠ 문제 1개" and "밀려" in app._row_tooltip(a.id)
+    app.show_problems()
+    assert list(app.tree.get_children()) == [a.id]
+    app.filter_var.set(gui.FILTER_ALL)
+    app.refresh()
 
     # selecting a mod colours the ones it fights with
     app.tree.selection_set(a.id)
@@ -411,7 +418,8 @@ def test_gui_tells_about_missing_requirements(root, manager, tmp_path, monkeypat
     assert "Chen" in dialog_text
 
     app.refresh()
-    assert "attention" in app.tree.item(mod.id, "tags") and "필요한 모드 없음 1개" in app.count_label.cget("text")
+    assert "problem" in app.tree.item(mod.id, "tags") and app.problems_button.cget("text") == "⚠ 문제 1개"
+    assert "Lua Bone System" in app._row_tooltip(mod.id)
     app.filter_var.set(gui.FILTER_MISSING)
     app.refresh()
     assert list(app.tree.get_children()) == [mod.id]

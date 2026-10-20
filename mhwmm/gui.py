@@ -62,11 +62,13 @@ FILTERS = {
     "옵션 선택 필요": lambda mod, conflicts: mod.needs_option,
     "충돌 있음": lambda mod, conflicts: any(conflicts.counts(mod.id)),
     "업데이트 있음": lambda mod, conflicts: bool(mod.update),
-    "필요한 모드 없음": None,  # needs the manager: handled in App.refresh
+    "필요한 모드 없음": None,  # these two need the manager: handled in App.refresh
+    "문제 있음": None,
 }
 FILTER_ALL = "전체"
 FILTER_UPDATES = "업데이트 있음"
 FILTER_MISSING = "필요한 모드 없음"
+FILTER_PROBLEMS = "문제 있음"
 # Errors that are shown to the user without a traceback in the log.
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
 
@@ -180,6 +182,47 @@ class Tooltip:
         if self.tip is not None:
             self.tip.destroy()
             self.tip = None
+
+
+class RowTooltip(Tooltip):
+    """Tooltip for the Treeview row under the mouse; ``text(row id)`` gives its text ("" for none)."""
+
+    def __init__(self, theme: Theme, tree: ttk.Treeview, text):
+        super().__init__(theme, tree, text)
+        self.row = ""
+        tree.bind("<Motion>", self._on_motion, add="+")
+
+    def _on_motion(self, event):
+        row = self.widget.identify_row(event.y)
+        if row != self.row:
+            self.row = row
+            self._hide()
+            if row:
+                self._schedule()
+
+    def _hide(self, _event=None):
+        super()._hide()
+        if _event is not None and _event.type == tk.EventType.Leave:
+            self.row = ""
+
+    def _show(self):
+        self.after_id = None
+        text = self.text(self.row) if self.row and self.widget.exists(self.row) else ""
+        if not text:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        label = tk.Label(tip, text=text, justify="left", padx=self.theme.px(10), pady=self.theme.px(6),
+                         font=self.theme.fonts["small"])
+        self.theme.mark(label, "tooltip")
+        label.pack()
+        tip.update_idletasks()
+        bbox = self.widget.bbox(self.row) or (0, 0, 0, self.widget.winfo_height())
+        x = self.widget.winfo_pointerx() + self.theme.px(14)
+        x = max(0, min(x, self.widget.winfo_screenwidth() - tip.winfo_reqwidth() - 4))
+        y = self.widget.winfo_rooty() + bbox[1] + bbox[3] + self.theme.px(2)
+        tip.wm_geometry(f"+{x}+{y}")
+        self.tip = tip
 
 
 class Dialog(tk.Toplevel):
@@ -718,6 +761,7 @@ class App:
         self._checking_mods = False
         self._mod_check_error: str | None = None
         self._req_notices: list[str] = []  # just installed mods to tell about missing requirements
+        self._problems: dict[str, list[str]] = {}  # enabled mods that cannot fully work, with the reasons
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -954,6 +998,11 @@ class App:
         ttk.Label(head, text="설치된 모드", style="Section.TLabel").pack(side="left")
         self.count_label = ttk.Label(head, text="", style="CardMuted.TLabel")
         self.count_label.pack(side="left", padx=(px(10), 0))
+        # shown when needed, between the title and the count (packed before the count so they always fit)
+        self.problems_button = ttk.Button(head, text="", style="Problem.TButton", command=self.show_problems)
+        Tooltip(t, self.problems_button, "제대로 작동하지 않는 모드만 보기 (옵션 미선택 · 필요한 모드 없음 · 전부 밀림)")
+        self.conflicts_button = ttk.Button(head, text="", style="Conflict.TButton", command=self.show_conflicts)
+        Tooltip(t, self.conflicts_button, "어떤 모드끼리 어떤 파일을 함께 바꾸는지 한눈에 봅니다")
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(head, textvariable=self.search_var, width=24)
         self.search_entry.pack(side="right")
@@ -973,13 +1022,9 @@ class App:
         self.hint_label = ttk.Label(hint, text="아래쪽 모드일수록 우선 적용 · 드래그로 순서 변경",
                                     style="Hint.TLabel")
         self.hint_label.pack(side="left")
-        # shown while enabled mods change the same files
-        self.conflicts_button = ttk.Button(hint, text="", style="Link.TButton", command=self.show_conflicts)
-        Tooltip(t, self.conflicts_button, "어떤 모드끼리 어떤 파일을 함께 바꾸는지 한눈에 봅니다")
-        self._hint_layout = (False, False)
         # explains the row colours while the selected mod has conflicts
         self.legend = ttk.Frame(hint, style="Card.TFrame")
-        ttk.Label(self.legend, text="선택한 모드를 덮어씀", style="LegendBad.TLabel").pack(side="left")
+        ttk.Label(self.legend, text="선택한 모드를 덮어씀", style="LegendOver.TLabel").pack(side="left")
         ttk.Label(self.legend, text="선택한 모드에 밀림", style="LegendInfo.TLabel").pack(side="left", padx=(px(6), 0))
 
         area = ttk.Frame(left, style="Card.TFrame")
@@ -1008,6 +1053,7 @@ class App:
         self.tree.bind("<ButtonRelease-1>", self._on_release)
         self.tree.bind("<Double-1>", self._on_double)
         self.tree.bind("<Button-3>", self._on_context)
+        RowTooltip(t, self.tree, self._row_tooltip)
         self.tree.bind("<Button-2>", self._on_context)
 
         self.empty = ttk.Frame(area, style="Card.TFrame")
@@ -1071,8 +1117,10 @@ class App:
         p, f, px = self.theme.p, self.theme.fonts, self.theme.px
         # mods that override / are overridden by the selected mod; created before "odd" because
         # ttk gives the earliest created tag priority
-        self.tree.tag_configure("over_sel", background=p["danger_bg"])
+        self.tree.tag_configure("over_sel", background=p["over_bg"])
         self.tree.tag_configure("under_sel", background=p["info_bg"])
+        # enabled mods that cannot work as they are (also before "odd": it is a background)
+        self.tree.tag_configure("problem", background=p["problem_bg"], foreground=p["danger"])
         for tree in (self.tree, self.files_tree):
             tree.tag_configure("odd", background=p["row_alt"])
             tree.tag_configure("disabled", foreground=p["subtle"])
@@ -1172,11 +1220,15 @@ class App:
         t = self.theme
         self._conflicts = m.conflicts()
         # enabled mods that need other mods which are missing or switched off
-        missing = {mod.id for mod in m.mods if mod.enabled and m.missing_requirements(mod.id)}
+        missing = {mod.id: m.missing_requirements(mod.id) for mod in m.mods if mod.enabled}
+        missing = {mod_id: reqs for mod_id, reqs in missing.items() if reqs}
+        self._problems = self._find_problems(missing)
         query = self._query()
         keep = FILTERS.get(self.filter_var.get())
         if self.filter_var.get() == FILTER_MISSING:
             keep = lambda mod, conflicts: mod.id in missing  # noqa: E731
+        elif self.filter_var.get() == FILTER_PROBLEMS:
+            keep = lambda mod, conflicts: mod.id in self._problems  # noqa: E731
         visible = [(i, mod) for i, mod in enumerate(m.mods)
                    if (not query or query in mod.name.casefold() or query in mod.author.casefold())
                    and (keep is None or keep(mod, self._conflicts))]
@@ -1189,19 +1241,18 @@ class App:
             tags = ["odd"] if pos % 2 else []
             if not mod.enabled:
                 tags.append("disabled")
-            elif mod.needs_option or mod.id in missing:
-                tags.append("attention")
+            elif mod.id in self._problems:
+                tags.append("problem")
             elif mod.update:
                 tags.append("update")
-            elif losses and not wins and losses == sum(1 for f in files if not is_root_pak(f)):
-                tags.append("overridden")
             options = ""
             if mod.options:
                 options = "선택 필요" if mod.needs_option else f"{len(mod.selected)}/{len(mod.options)}"
             version = mod.version
             if mod.update:
                 version = f"{mod.version or '?'} → {mod.update.get('version') or '새 파일'}"
-            values = (index + 1, mod.name, kinds_short(self._display_kinds(mod)), version, options,
+            name = f"⚠ {mod.name}" if mod.id in self._problems else mod.name
+            values = (index + 1, name, kinds_short(self._display_kinds(mod)), version, options,
                       len(files), conflict)
             image = on if mod.enabled else off
             if mod.id in existing:
@@ -1220,12 +1271,16 @@ class App:
         enabled = sum(1 for mod in m.mods if mod.enabled)
         updates = sum(1 for mod in m.mods if mod.update)
         count = f"{len(m.mods)}개 · 활성 {enabled}개" + (f" · 업데이트 {updates}개" if updates else "")
-        if missing:
-            count += f" · 필요한 모드 없음 {len(missing)}개"
         self.count_label.configure(text=count if m.mods else "")
         pairs = len(self._conflicts.pairs())
-        self.conflicts_button.configure(text=f"⚠ 충돌 {pairs}쌍 보기")
-        self._layout_hint(show_button=bool(pairs))
+        self.problems_button.configure(text=f"⚠ 문제 {len(self._problems)}개")
+        self.conflicts_button.configure(text=f"충돌 {pairs}쌍 보기 ›")
+        pills = ((self.problems_button, bool(self._problems)), (self.conflicts_button, bool(pairs)))
+        for button, _ in pills:
+            button.pack_forget()
+        for button, show in pills:
+            if show:
+                button.pack(side="left", padx=(self.theme.px(8), 0), before=self.count_label)
         self._highlight_related()
         if not m.mods:
             self.empty_title.configure(text="아직 설치된 모드가 없습니다")
@@ -1693,6 +1748,27 @@ class App:
         except KeyError:
             return None
 
+    def _find_problems(self, missing: dict[str, list[dict]]) -> dict[str, list[str]]:
+        """Why each enabled mod cannot fully work: {mod id: [reason]}."""
+        problems: dict[str, list[str]] = {}
+        for mod in self.manager.mods:
+            if not mod.enabled:
+                continue
+            reasons = []
+            if mod.needs_option:
+                reasons.append("옵션을 하나도 켜지 않아 아무 파일도 적용되지 않습니다")
+            if mod.id in missing:
+                reasons.append("필요한 모드가 없거나 꺼져 있습니다: " + ", ".join(r["name"] for r in missing[mod.id]))
+            if reasons:
+                problems[mod.id] = reasons
+        for mod in self.manager.hidden_mods(self._conflicts):
+            problems.setdefault(mod.id, []).append("파일이 모두 다른 모드에 밀려 아무것도 적용되지 않습니다")
+        return problems
+
+    def _row_tooltip(self, mod_id: str) -> str:
+        reasons = self._problems.get(mod_id)
+        return "\n".join("⚠ " + r for r in reasons) if reasons else ""
+
     def _highlight_related(self):
         """Colour the mods that override, or are overridden by, the one selected mod."""
         mod = self._selected_mod()
@@ -1707,22 +1783,15 @@ class App:
             elif iid in beats:
                 tags.append("under_sel")
             self.tree.item(iid, tags=tags)
-        self._layout_hint(show_legend=bool(beats or beaten))
+        if beats or beaten:
+            if not self.legend.winfo_manager():
+                self.legend.pack(side="right", before=self.hint_label)  # gets its space before the hint
+        else:
+            self.legend.pack_forget()
 
-    def _layout_hint(self, show_button: bool | None = None, show_legend: bool | None = None):
-        """Conflicts button and colour legend at the right of the hint line (they get space before the hint)."""
-        layout = (self._hint_layout[0] if show_button is None else show_button,
-                  self._hint_layout[1] if show_legend is None else show_legend)
-        if layout == self._hint_layout:
-            return
-        self._hint_layout = layout
-        self.conflicts_button.pack_forget()
-        self.legend.pack_forget()
-        if layout[0]:
-            self.conflicts_button.pack(side="right", before=self.hint_label)
-        if layout[1]:
-            self.legend.pack(side="right", padx=(0, self.theme.px(8)), before=self.hint_label)
-
+    def show_problems(self):
+        self.filter_var.set(FILTER_PROBLEMS)
+        self.refresh()
     def show_conflicts(self):
         mod_id = ConflictsDialog(self.root, self.theme, self.manager).show()
         if mod_id and any(m.id == mod_id for m in self.manager.mods):

@@ -26,6 +26,7 @@ PALETTES = {
         "success": "#63c98d", "success_bg": "#1c2c24", "warn": "#eaa646", "warn_bg": "#30271a",
         "danger": "#f0736a", "danger_bg": "#33201f", "chip": "#2a2720", "chip_text": "#e6c48f",
         "info": "#62b6c4", "info_bg": "#1a2a2e",
+        "problem_bg": "#3d2222", "over": "#b6a1ee", "over_bg": "#2b2540",
     },
     "light": {
         "bg": "#efece6", "surface": "#fbfaf8", "raised": "#ffffff", "hover": "#f3eee5",
@@ -37,6 +38,7 @@ PALETTES = {
         "success": "#2e8f57", "success_bg": "#e3f2e8", "warn": "#a8650f", "warn_bg": "#f8ecd6",
         "danger": "#c93c33", "danger_bg": "#f8e1df", "chip": "#f3e7d2", "chip_text": "#8a5a12",
         "info": "#237785", "info_bg": "#dff0f2",
+        "problem_bg": "#fbdcd8", "over": "#6a4bb0", "over_bg": "#ebe4f7",
     },
 }
 THEME_NAMES = {"dark": "다크", "light": "라이트"}
@@ -217,7 +219,7 @@ class Theme:
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
         for kind, fg, bg in (("Ok", "success", "success_bg"), ("Warn", "warn", "warn_bg"),
                              ("Bad", "danger", "danger_bg"), ("Neutral", "chip_text", "chip"),
-                             ("Info", "info", "info_bg")):
+                             ("Info", "info", "info_bg"), ("Over", "over", "over_bg")):
             s.configure(f"Badge{kind}.TLabel", background=p[bg], foreground=p[fg], font=f["small_bold"],
                         padding=(px(10), px(4)))
             s.configure(f"Legend{kind}.TLabel", background=p[bg], foreground=p[fg], font=f["small"],
@@ -252,6 +254,10 @@ class Theme:
                font=f["small"], width=-2)
         button("Update.TButton", p["accent"], p["on_accent"], p["accent_hover"], p["accent_press"],
                padding=(12, 5), font=f["small_bold"], width=-2)
+        # coloured pills next to the mod count: problems (opens the filter) and conflicts (opens the overview)
+        for style, fg, bg, hover in (("Problem.TButton", p["danger"], p["problem_bg"], p["danger_bg"]),
+                                     ("Conflict.TButton", p["warn"], p["warn_bg"], p["select"])):
+            button(style, bg, fg, hover, hover, padding=(10, 3), font=f["small_bold"], width=-2)
         # table of contents in the usage guide
         button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 8), width=-2)
         s.configure("Nav.TButton", anchor="w")
