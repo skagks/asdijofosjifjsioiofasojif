@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import uuid
@@ -27,6 +28,14 @@ from .analyzer import Variant, analyze, classify, list_files, package_name, raw_
 from .archive import extract, is_archive
 from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_URL, REFW_ORIGIN
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
+from .equip import EquipError
+from .equip import catalog as equip_catalog
+from .equip import icons as equip_icons
+from .equip import overview as equip_overview
+from .equip import pathlist as equip_pathlist
+from .equip import scan as equip_scan
+from .equip import tex as equip_tex
+from .equip.model import PART_LABELS
 from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
 from .matfix.repair import RSZ_RE, FileResult, RszContext, check_mod, is_material_file, rsz_sources
@@ -394,6 +403,17 @@ class MaterialRun:
     registry_updated: str = ""  # newer type data downloaded during the run (used from the next check)
 
 
+@dataclass
+class EquipJob:
+    """One mod for the equipment window, taken on the caller's thread."""
+    mod_id: str
+    name: str
+    enabled: bool
+    order: int  # place in the load order (later mods win)
+    stamp: str  # changes when the mod's files change
+    files: dict  # game path -> stored file (selected options, repaired materials)
+
+
 class InstallSession:
     """An extracted archive (or folder) waiting for the user to pick variants."""
 
@@ -451,6 +471,12 @@ class ModManager:
         self._record_cache: dict[str, dict] = {}
         self._game_version: tuple[str, str] | None = None
         self._registry_date: str | None = None
+        self._equip_lock = threading.RLock()
+        self._equip_game_index = None  # GameIndex kept for the equipment window's pictures
+        self._equip_catalog: tuple[str, object] | None = None  # (game version, Catalog)
+        self._equip_paths = None  # PathIndex of the game's equipment paths (for .pak mods)
+        self._equip_scans: dict[str, tuple[str, object]] | None = None  # mod id -> (stamp, ModScan)
+        self._equip_failed: set[tuple[str, int]] = set()  # pictures that could not be read
         self.data_dir.mkdir(parents=True, exist_ok=True)
         rsz.TypeRegistry.updates = self.data_dir / "cache"
         self.mods_dir.mkdir(exist_ok=True)
@@ -1311,6 +1337,229 @@ class ModManager:
             self.dirty = self.dirty or mod.enabled
         self.save()
         return had
+
+    # ------------------------------------------------------------- equipment
+    def equipment_jobs(self) -> list[EquipJob]:
+        """Every mod with the files it puts into the game, for equipment_scans (call on the GUI thread)."""
+        return [self._equip_job(order, mod) for order, mod in enumerate(self.mods)]
+
+    def _equip_job(self, order: int, mod: Mod) -> EquipJob:
+        files = {rel: path for rel, (path, _key) in self.mod_entries(mod.id).items()}
+        stamp = f"{self._stamp(mod)}|{','.join(mod.selected)}|{len(files)}"
+        return EquipJob(mod.id, mod.name, mod.enabled, order, stamp, files)
+
+    def _equip_game(self, progress: ProgressFn | None = None) -> GameIndex | None:
+        """The game's pak index (None without a readable game)."""
+        if not self.game_dir or not self.game_dir.is_dir() or not matfix.available():
+            return None
+        with self._equip_lock:
+            version = self.game_version()
+            index = self._equip_game_index
+            if index is None or index.fingerprint != version or not fsutil.same_path(index.game_dir, self.game_dir):
+                self._equip_game_index = GameIndex(self.game_dir, self.data_dir / "cache", progress)
+                self._equip_failed.clear()  # pictures read through the old index
+            return self._equip_game_index
+
+    def equipment_catalog(self, progress: ProgressFn | None = None, rebuild: bool = False,
+                          build: bool = True):
+        """Names, rarity and preview pictures of the game's equipment, read from the game itself and
+        cached per game version (None without a game). ``build=False``: only a cached one."""
+        version = self.game_version(refresh=build)
+        if not version:
+            return None
+        with self._equip_lock:
+            if self._equip_catalog and self._equip_catalog[0] == version and not rebuild:
+                return self._equip_catalog[1]
+            # the catalog depends on the game, the build rules, the NPC files of the bundled path list and
+            # the .user type data (a table it cannot read exactly has no names)
+            cache = self.data_dir / "cache" / (f"equip-catalog-{version}-{equip_catalog.CATALOG_FORMAT}-"
+                                               f"{equip_pathlist.list_version()[:8]}-{self.registry_date()}.json")
+            if not rebuild and cache.is_file():
+                try:
+                    found = equip_catalog.Catalog.from_json(cache.read_text(encoding="utf-8"))
+                except (OSError, ValueError, EquipError) as exc:
+                    log.info("장비 정보 캐시를 다시 만듭니다: %s", exc)
+                else:
+                    self._equip_catalog = (version, found)
+                    return found
+            if not build:
+                return None
+            game = self._equip_game(progress)
+            if game is None:
+                return None
+            if rebuild:  # read everything again, pictures and icons too
+                self._equip_failed.clear()
+                folder = self._picture_dir()
+                if folder is not None:
+                    (folder / "ui.json").unlink(missing_ok=True)
+            try:
+                data = equip_catalog.build(game, rsz.TypeRegistry.load(), progress,
+                                           npc_settings=equip_pathlist.npc_visual_settings())
+            finally:
+                rsz.TypeRegistry.release()
+            found = equip_catalog.Catalog(data)
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                for old in cache.parent.glob("equip-catalog-*.json"):
+                    old.unlink(missing_ok=True)  # from before a game update
+                fsutil.atomic_write_json(cache, found.data)
+            except OSError as exc:
+                log.warning("장비 정보를 저장하지 못했습니다: %s", exc)
+            self._equip_catalog = (version, found)
+            return found
+
+    def _equip_scan_file(self) -> Path:
+        return self.data_dir / "cache" / "equip-scans.json"
+
+    def _load_equip_scans(self) -> dict[str, tuple[str, object]]:
+        if self._equip_scans is None:
+            self._equip_scans = {}
+            try:
+                saved = json.loads(self._equip_scan_file().read_text(encoding="utf-8"))
+                if saved.get("paths") == equip_pathlist.list_version():  # each scan carries its format
+                    for mod_id, (stamp, scan) in saved.get("mods", {}).items():
+                        found = equip_scan.ModScan.from_dict(scan)
+                        if found is not None:
+                            self._equip_scans[mod_id] = (str(stamp), found)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                pass
+        return self._equip_scans
+
+    def equipment_scans(self, jobs: list[EquipJob], progress: ProgressFn | None = None) -> dict:
+        """mod id -> ModScan: the equipment each job's files belong to (cached until the mod changes).
+        Thread-safe: reads the mods' stored files only."""
+        progress = progress or (lambda done, total, msg: None)
+        with self._equip_lock:
+            scans = self._load_equip_scans()
+            out, changed = {}, False
+            for i, job in enumerate(jobs):
+                cached = scans.get(job.mod_id)
+                if cached is not None and cached[0] == job.stamp:
+                    out[job.mod_id] = cached[1]
+                    continue
+                if self._equip_paths is None and any(rel.lower().endswith(".pak") for rel in job.files):
+                    progress(i, len(jobs), "게임 파일 이름 목록 준비 중...")
+                    self._equip_paths = equip_pathlist.PathIndex(self.data_dir / "cache")
+                progress(i, len(jobs), f"모드 파일 살펴보는 중... {job.name}")
+                scan = equip_scan.scan_files(job.files, self._equip_paths)
+                scans[job.mod_id] = (job.stamp, scan)
+                out[job.mod_id] = scan
+                changed = True
+            known = {m.id for m in self.mods}
+            for mod_id in [k for k in scans if k not in known]:
+                del scans[mod_id]
+                changed = True
+            if changed:
+                saved = {"paths": equip_pathlist.list_version(),
+                         "mods": {k: [stamp, scan.to_dict()] for k, (stamp, scan) in scans.items()}}
+                try:
+                    fsutil.atomic_write_json(self._equip_scan_file(), saved)
+                except OSError as exc:
+                    log.debug("장비 검사 결과를 저장하지 못했습니다: %s", exc)
+            return out
+
+    def equipment_summary(self, mod_id: str) -> list[str]:
+        """Short names of what a mod changes, from what was already worked out (never reads the game)."""
+        mod = self.get(mod_id)
+        if not self._equip_lock.acquire(blocking=False):
+            return []  # being worked out right now (the GUI shows it once that is done)
+        try:
+            cached = self._load_equip_scans().get(mod_id)
+            if not cached or cached[0] != self._equip_job(0, mod).stamp:
+                return []
+            catalog = self.equipment_catalog(build=False)
+        finally:
+            self._equip_lock.release()
+        items = equip_overview.build([(mod_id, mod.name, mod.enabled, 0, cached[1])], catalog).items
+        out = []
+        for item in items:
+            parts = [PART_LABELS.get(p, p) for p in item.changed if p]
+            out.append(f"{item.name} ({item.subtitle}{': ' + '·'.join(parts) if parts else ''})")
+        return out
+
+    def _picture_dir(self) -> Path | None:
+        version = self.game_version()
+        if not version:
+            return None
+        base = self.data_dir / "cache" / "equip-pictures"
+        here = base / f"{version[:16]}-{equip_icons.PICTURE_FORMAT}"
+        if not here.is_dir():
+            try:
+                for old in base.glob("*"):  # from before a game update
+                    fsutil.rmtree(old)
+                here.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
+        return here
+
+    def equipment_thumbnail(self, tex_path: str, size: int) -> Path | None:
+        """A game preview picture as a PNG of at most size x size (cached; None when it cannot be read
+        or Pillow is missing). Safe to call from a worker thread."""
+        key = (tex_path, size)
+        if key in self._equip_failed:
+            return None
+        folder = self._picture_dir()
+        if folder is None:
+            return None
+        target = folder / f"{hashlib.sha1(tex_path.lower().encode('utf-8')).hexdigest()[:20]}_{size}.png"
+        if target.is_file():
+            return target
+        game = self._equip_game()
+        data = game.read(tex_path) if game is not None else None
+        try:
+            if data is None:
+                raise EquipError("게임에 없는 그림")
+            image = equip_tex.decode(data, max_side=size)
+            image.thumbnail((size, size))
+            tmp = target.with_name(f"{target.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+            image.save(tmp, "PNG")
+            tmp.replace(target)
+            return target
+        except (EquipError, OSError, ValueError) as exc:
+            log.debug("장비 그림을 만들지 못했습니다 (%s): %s", tex_path, exc)
+            self._equip_failed.add(key)
+            return None
+
+    def equipment_ui(self) -> dict:
+        """The game's rarity colours ({"1": "#rrggbb"...}) and weapon-type icons ({type: PNG path}),
+        cached per game version; {} when the game's UI files cannot be read."""
+        folder = self._picture_dir()
+        if folder is None:
+            return {}
+        saved = folder / "ui.json"
+        try:
+            ui = json.loads(saved.read_text(encoding="utf-8"))
+            if all(Path(p).is_file() for p in ui.get("weapon_icons", {}).values()):
+                return ui
+        except (OSError, ValueError, AttributeError):
+            pass
+        game = self._equip_game()
+        if game is None:
+            return {}
+        ui = {"rarity": {}, "weapon_icons": {}}
+        colors = equip_icons.rarity_colors(game.read)
+        ui["rarity"] = {str(n): "#%02x%02x%02x" % tuple(rgb[:3]) for n, rgb in colors.items()}
+        for wtype, image in equip_icons.weapon_type_icons(game.read, 48).items():
+            path = folder / f"weapon-type-{wtype}.png"
+            try:
+                image.save(path, "PNG")
+                ui["weapon_icons"][str(wtype)] = str(path)
+            except OSError:
+                pass
+        try:
+            fsutil.atomic_write_json(saved, ui)
+        except OSError:
+            pass
+        return ui
+
+    def save_equipment_icon_sheet(self, target: Path, progress: ProgressFn | None = None) -> bool:
+        """The game's icon atlas with a labelled grid (to confirm the weapon-icon positions)."""
+        game = self._equip_game(progress)
+        sheet = equip_icons.icon_sheet(game.read) if game is not None else None
+        if sheet is None:
+            return False
+        sheet.save(target, "PNG")
+        return True
 
     # ------------------------------------------------------------- requirements
     @staticmethod

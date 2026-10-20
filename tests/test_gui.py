@@ -1,3 +1,4 @@
+import gc
 import queue
 import time
 
@@ -15,6 +16,7 @@ def root():
     except tk.TclError:
         pytest.skip("화면(display)이 없어 GUI 테스트를 건너뜁니다")
     yield r
+    gc.collect()  # Tk variables of the test must go before the interpreter does (else Python 3.10 can crash)
     try:
         r.destroy()
     except tk.TclError:

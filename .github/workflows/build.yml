@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install pytest zstandard
+      - run: pip install pytest zstandard pillow
       - run: python -m pytest -q
 
   windows-exe:
@@ -38,6 +38,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed
           --name MHWildsModManager --icon assets/icon.ico --collect-all tkinterdnd2
           --collect-submodules zstandard --add-data "mhwmm/matfix/rsz_types.json.xz;mhwmm/matfix"
+          --add-data "mhwmm/equip/equip_paths.txt.xz;mhwmm/equip"
           MHWildsModManager.pyw
       - uses: actions/upload-artifact@v4
         with:

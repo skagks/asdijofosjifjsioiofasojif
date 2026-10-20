@@ -417,6 +417,7 @@ def types(monkeypatch):
     from mhwmm.matfix import rsz
 
     monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry())
+    monkeypatch.setattr(rsz.TypeRegistry, "_from_file", False)  # release() must not drop it (other tests load the real one)
 
 
 def old_avp(scale=2.5):

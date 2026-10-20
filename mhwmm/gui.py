@@ -871,6 +871,9 @@ class App:
         self._req_notices: list[str] = []  # just installed mods to tell about missing requirements
         self._problems: dict[str, list[str]] = {}  # enabled mods that cannot fully work, with the reasons
         self._matfix_running = False  # a background material check is running
+        self.equipment_window = None  # the 장비 외형 window while it is open
+        self._equip_warming = False
+        self._equip_again = False
         self._matfix_again = False  # ... and another one was asked for meanwhile
         self._offer_scheduled = False
 
@@ -889,6 +892,8 @@ class App:
         self._build_statusbar()
         self._build_log()
         self._build_main()
+        root.update_idletasks()
+        root.minsize(max(px(980), self.toolbar.winfo_reqwidth()), px(620))  # the whole toolbar stays visible
         self._configure_tags()
         self._bind_keys()
         self._setup_dnd()
@@ -913,6 +918,7 @@ class App:
             root.after(2000, self._fetch_unread_requirements)
         if manager.settings.check_materials:
             root.after(4000, self.check_materials_background)
+        root.after(9000, self.warm_equipment)
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -1016,6 +1022,7 @@ class App:
         m.add_command(label="게임에 적용", accelerator="Ctrl+S", command=self.apply)
         m.add_command(label="적용 상태 점검", command=self.verify)
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
+        m.add_command(label="장비 외형 보기", command=lambda: self.show_equipment())
         m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
         m.add_command(label="게임 폴더에서 모든 모드 파일 제거", command=self.purge)
         m.add_separator()
@@ -1037,7 +1044,7 @@ class App:
 
     def _build_toolbar(self):
         t, px = self.theme, self.theme.px
-        bar = ttk.Frame(self.root, padding=(px(20), px(14), px(20), px(2)))
+        bar = self.toolbar = ttk.Frame(self.root, padding=(px(20), px(14), px(20), px(2)))
         bar.pack(fill="x")
         self.buttons: dict[str, ttk.Button] = {}
 
@@ -1055,7 +1062,9 @@ class App:
         button("up", "▲", lambda: self.move_selected(-1), "Compact.TButton", "위로 (Ctrl+↑)")
         button("down", "▼", lambda: self.move_selected(1), "Compact.TButton", "아래로 · 우선순위 높이기 (Ctrl+↓)")
         button("rename", "이름 변경", self.rename_selected, tip="F2")
-        button("remove", "삭제", self.remove_selected, tip="Delete")
+        button("remove", "삭제", self.remove_selected, tip="Delete", padx=(0, px(14)))
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(0, px(14)), pady=px(4))
+        button("equipment", "장비 외형", lambda: self.show_equipment(), tip="모드가 어떤 장비의 모습을 바꾸는지 보기")
 
         button("apply", "✔  게임에 적용", self.apply, side="right", padx=(px(10), 0), tip="Ctrl+S")
         self.auto_var = tk.BooleanVar(value=self.manager.settings.auto_apply)
@@ -1273,6 +1282,8 @@ class App:
         for tag, action in (("nexus_page", lambda m: m.nexus_url), ("nexus_files", lambda m: nexus.FILES_URL.format(m.nexus_id))):
             info.tag_bind(tag, "<Button-1>", lambda e, action=action: self._open_nexus(action))
         info.tag_bind("nexus_set", "<Button-1>", lambda e: self.link_nexus())
+        info.tag_bind("equip_show", "<Button-1>",
+                      lambda e: self.show_equipment(self._selected_mod().id if self._selected_mod() else None))
         info.tag_bind("nexus_search", "<Button-1>", lambda e: self._search_nexus())
         for action in ("check", "repair", "restore", "report"):
             info.tag_bind(f"matfix_{action}", "<Button-1>", lambda e, action=action: self._material_action(action))
@@ -1295,6 +1306,9 @@ class App:
         self.theme.use(name)
         self._configure_tags()
         set_dark_titlebar(self.root, name == "dark")
+        if self.equipment_window is not None:
+            set_dark_titlebar(self.equipment_window, name == "dark")
+            self.equipment_window.render()  # its icons take the theme's colour
         self._update_search_hint()
         self.refresh()
 
@@ -1403,6 +1417,8 @@ class App:
             if show:
                 button.pack(side="left", padx=(self.theme.px(8), 0), before=self.count_label)
         self._highlight_related()
+        if self.equipment_window is not None:
+            self.equipment_window.mods_changed()
         if not m.mods:
             self.empty_title.configure(text="아직 설치된 모드가 없습니다")
             self.empty_sub.configure(text="Nexus Mods 등에서 받은 zip · 7z · rar · pak 파일을\n이곳에 끌어 놓거나 아래 버튼을 누르세요.")
@@ -1533,6 +1549,7 @@ class App:
         self.manager.switch_profile(name)
         log.info("프로필 전환: %s", name)
         self._changed()
+        self.warm_equipment()
 
     def new_profile(self, copy_current: bool):
         if not self.can_mutate():
@@ -1919,6 +1936,59 @@ class App:
     def show_problems(self):
         self.filter_var.set(FILTER_PROBLEMS)
         self.refresh()
+    def warm_equipment(self):
+        """Work out in the background which equipment the mods change (and read the game's names once),
+        so that the info tab can list it and the 장비 외형 window opens quickly."""
+        m = self.manager
+        if self._closed or not m.mods:
+            return
+        if self._equip_warming:
+            self._equip_again = True  # mods changed while the last one ran: go again afterwards
+            return
+        self._equip_warming = True
+        jobs = m.equipment_jobs()
+
+        def worker():
+            try:
+                m.equipment_catalog()
+                m.equipment_scans(jobs)
+            except Exception as exc:  # the window shows the problem when it is opened
+                log.debug("장비 외형을 미리 읽지 못했습니다: %s", exc)
+            self.events.put(("call", self._equipment_warmed))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _equipment_warmed(self):
+        self._equip_warming = False
+        if self._closed:
+            return
+        self._update_details()
+        if self._equip_again:
+            self._equip_again = False
+            self.warm_equipment()
+
+    def show_equipment(self, mod_id: str | None = None):
+        """The 장비 외형 window (one at a time), optionally showing only one mod's equipment."""
+        if self.equipment_window is not None:
+            self.equipment_window.show(mod_id)
+            return
+        from .equipview import EquipmentWindow  # imports this module
+
+        self.equipment_window = EquipmentWindow(self, mod_id)
+
+    def show_mod(self, mod_id: str):
+        """Select a mod in the list (clearing a search or filter that hides it) and show its info."""
+        if not any(m.id == mod_id for m in self.manager.mods):
+            return
+        if not self.tree.exists(mod_id):
+            self.filter_var.set(FILTER_ALL)
+            self.search_var.set("")
+            self.refresh()
+        self.tree.selection_set(mod_id)
+        self.tree.see(mod_id)
+        self.root.deiconify()
+        self.root.lift()
+
     def show_conflicts(self):
         mod_id = ConflictsDialog(self.root, self.theme, self.manager).show()
         if mod_id and any(m.id == mod_id for m in self.manager.mods):
@@ -2039,6 +2109,13 @@ class App:
             errors = sum(1 for r in results if r.state == "error")
             if errors:
                 chunks.append((f"\t읽지 못한 파일 {errors}개 (자세한 내용은 로그)\n", ("value", "muted")))
+        looks = m.equipment_summary(mod.id)
+        for i, text in enumerate(looks[:4]):
+            chunks += [("외형\t" if i == 0 else "\t", "key"), (f"{text}\n", "value")]
+        if looks:
+            more = f"외 {len(looks) - 4}개   " if len(looks) > 4 else ""
+            chunks += [("\t", "key"), (more, ("value", "muted")),
+                       ("장비 외형에서 보기", ("value", "link", "equip_show")), ("\n", "value")]
         if mod.update:
             new = mod.update
             what = " · ".join(x for x in (str(new.get("version") or ""), str(new.get("file") or ""),
@@ -2218,6 +2295,7 @@ class App:
         self.manager.set_options(mod_id, selected)
         # rebuild after the click handler has returned (it destroys the clicked widget)
         self.root.after_idle(lambda: self._changed(select=mod_id))
+        self.warm_equipment()  # other options change other equipment
 
     def show_options(self, mod_id: str):
         self.tree.selection_set(mod_id)
@@ -2492,6 +2570,7 @@ class App:
             self.refresh()
             self.request_apply()
             self.check_materials_background()
+            self.warm_equipment()
 
         self.run_task("game", "게임 폴더 변경 중...", lambda p: self.manager.set_game_dir(path, p), on_done=done)
 
@@ -2532,6 +2611,7 @@ class App:
             self.refresh()
             self._flush_requirement_notices()
             self.check_materials_background()
+            self.warm_equipment()
             if self._apply_pending:
                 self._apply_pending = False
                 self.apply()
@@ -2967,6 +3047,7 @@ class App:
                 menu.add_command(label="맨 아래로 (최우선)", command=lambda: self.move_to_edge(False))
                 menu.add_command(label="이름 변경", command=self.rename_selected)
                 menu.add_command(label="저장된 모드 폴더 열기", command=self.open_mod_folder)
+                menu.add_command(label="장비 외형 보기", command=lambda: self.show_equipment(ids[0]))
                 if mods[0].origin != refw.ORIGIN:
                     menu.add_separator()
                     if mods[0].update:
@@ -3266,6 +3347,8 @@ class App:
         self._destroy()
 
     def _destroy(self):
+        if self.equipment_window is not None:
+            self.equipment_window.close()
         if not self._closed:
             self._save_window_state()
         self._closed = True

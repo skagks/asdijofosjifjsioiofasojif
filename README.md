@@ -22,6 +22,9 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
   - REFramework 스크립트/플러그인 (`reframework/autorun/*.lua`, `reframework/plugins/*.dll`,
     `reframework/` 폴더 없이 `autorun/`만 들어 있는 경우 포함)
   - REFramework 자체(`dinput8.dll`)와 기타 DLL 모드
+- **장비 외형 보기**: 모드가 게임 속 어떤 장비(방어구 · 무기 · 오토모 장비 · 세크레트 · NPC 등)의 모습을 바꾸는지
+  게임의 장비 이름과 미리보기 그림으로 한눈에 보여 줍니다. 방어구는 남성 · 여성과 부위(머리 · 몸통 · 팔 · 허리 · 다리)별로,
+  같은 부위를 바꾸는 모드끼리는 **겹침**으로 표시합니다. 루스 파일 모드와 PAK 모드 모두 살펴봅니다.
 - **켜기/끄기와 로드 순서**: 체크박스로 켜고 끄며, 드래그 또는 ▲▼ 버튼으로 순서를 바꿉니다.
   목록 아래쪽 모드일수록 우선 적용됩니다.
 - **충돌 한눈에 보기**: 같은 파일을 바꾸는 모드끼리 몇 개의 파일이 겹치고 어느 모드가 이기는지, 아무것도 적용되지 않는 모드가
@@ -70,9 +73,9 @@ v1.2.0부터는 프로그램이 켜질 때 새 버전을 확인합니다. 새 �
 1. [Python 3.10 이상](https://www.python.org/downloads/)을 설치합니다 (설치할 때 *tcl/tk* 포함, 기본값).
 2. (선택) 추가 기능 설치: `pip install -r requirements.txt`
    - `tkinterdnd2`: 탐색기에서 파일을 끌어 놓아 설치
-   - `Pillow`: JPG 미리보기 이미지 표시
+   - `Pillow`: JPG 미리보기 이미지 표시, 장비 외형의 게임 그림
    - `py7zr`: 다른 압축 프로그램 없이 `.7z` 압축 풀기
-   - `zstandard`: 재질 복구 (게임 pak 파일의 압축 풀기)
+   - `zstandard`: 재질 복구, 장비 외형의 장비 이름 · 그림 (게임 pak 파일의 압축 풀기)
 3. `MHWildsModManager.pyw`를 더블클릭하거나 `python -m mhwmm`을 실행합니다.
 
 > `.rar` · `.7z` 파일은 PC에 설치된 **반디집** 또는 **7-Zip**으로 풀어서 설치합니다. 둘 다 없으면 Windows 11에
@@ -209,6 +212,29 @@ v1.2.0부터는 프로그램이 켜질 때 새 버전을 확인합니다. 새 �
 재질·RSZ 복구 규칙을, `.user`·`.pfb` 타입 정보는 [REasy](https://github.com/seifhassine/REasy)(Battlezone, MIT 라이선스)의
 MH Wilds RSZ 덤프와 그 기록을 바탕으로 만들었습니다.
 
+### 장비 외형 (모드가 바꾸는 장비 보기)
+
+툴바의 **장비 외형**을 누르면 설치된 모드가 게임 속 어떤 장비의 모습을 바꾸는지 보여 주는 창이 열립니다.
+모드를 오른쪽 클릭해 **장비 외형 보기**를 고르면 그 모드가 바꾸는 장비만 보입니다.
+
+- 왼쪽에서 방어구(남성 · 여성), 무기 종류, 사냥벌레, 오토모, 세크레트, NPC, 몬스터 등 분류를 고르고, 검색창에서
+  장비 이름이나 모드 이름으로 찾습니다. **켠 모드만**을 켜면 꺼 둔 모드는 빠집니다.
+- 장비마다 게임의 미리보기 그림, 이름(같은 모델을 쓰는 본 · 본α처럼 모두), 레어도, 바뀌는 부위가 나오고,
+  오른쪽에는 부위별 그림과 그 장비를 바꾸는 모드, 겹치는 부위가 나옵니다.
+- 켜 둔 모드 두 개 이상이 같은 부위를 바꾸면 **겹침**으로 표시합니다. 목록 아래쪽(우선순위가 높은) 모드의 모습이 보입니다.
+- 모드 파일의 게임 경로(`Art/Model/Character/ch03/004/001/...` 같은 모델 폴더)로 장비를 알아냅니다. PAK 모드는 PAK 안의
+  파일 이름 해시를 게임의 장비 파일 목록(`mhwmm/equip/equip_paths.txt.xz`)과 맞춰 봅니다. 다른 장비의 모델을 빌려 쓰는
+  프리팹(.pfb)은 "프리팹이 ○○ 모델을 씁니다"로 알려 줍니다.
+- 장비 이름 · 레어도 · 미리보기 그림은 설치된 게임의 데이터 표, 텍스트(.msg), GUI 텍스처(.tex)에서 직접 읽어 데이터 폴더의
+  `cache\`에 저장해 둡니다. 게임 파일을 이 프로그램에 넣어 배포하지 않으며, 게임이 업데이트되면 다시 읽습니다.
+  게임 폴더가 없거나 게임 파일을 읽을 수 없으면 게임 안의 번호(예: `방어구 004-001`)로 보여 줍니다.
+- 게임에서 이름과 그림을 읽으려면 zstandard가, 그림을 보려면 Pillow도 필요합니다 (exe에는 모두 들어 있습니다).
+
+텍스트 파일 형식은 [REMSG_Converter](https://github.com/dtlnor/REMSG_Converter)(dtlnor, MIT)와 REasy(MIT)를,
+텍스처의 GDeflate 압축은 [DirectStorage](https://github.com/microsoft/DirectStorage)(Apache-2.0)와 NVIDIA
+[libdeflate](https://github.com/NVIDIA/libdeflate)(MIT/Apache-2.0)의 GDeflate 설명을 바탕으로 직접 구현했습니다.
+장비 파일 목록은 REasy의 `MHWS_STM.list`(MIT)에서 뽑았습니다 (`tools/make_equip_paths.py`).
+
 ### 모드를 전부 빼고 싶을 때
 
 **☰ 메뉴 → 게임 폴더에서 모든 모드 파일 제거**를 누르면 이 프로그램이 넣은 파일을 모두 지우고 백업해 둔 원본을
@@ -228,7 +254,7 @@ v1.2.1 이하에서 `%LOCALAPPDATA%\MHWildsModManager`에 쌓인 데이터는 v1
 
 - `mods\<id>\files\` : 설치된 모드 파일 (게임 폴더 기준 구조)
 - `mods\<id>\matfix\` : 재질 복구로 만든 파일 (모드의 원래 파일은 그대로)
-- `cache\` : 재질 점검에 쓰는 게임 파일 목록 (게임이 업데이트되면 다시 만듦)
+- `cache\` : 재질 점검에 쓰는 게임 파일 목록, 장비 외형에 쓰는 장비 이름과 미리보기 그림 (게임이 업데이트되면 다시 만듦)
 - `state.json` : 모드 목록, 순서, 활성 상태, 설정
 - `deployment.json` : 게임 폴더에 넣은 파일 기록
 - `backups\` : 모드가 덮어쓴 원본 게임 파일
@@ -259,6 +285,8 @@ python -m mhwmm materials check [모드...]     # 재질이 현재 게임과 맞
 python -m mhwmm materials repair [모드...]    # 맞지 않는 재질 복구 (원래 파일은 그대로)
 python -m mhwmm materials restore "모드 이름"  # 원래 재질 파일로 되돌리기
 python -m mhwmm materials report "모드 이름" --out 진단.zip   # 진단 파일 저장
+python -m mhwmm equipment [모드...]          # 모드가 바꾸는 장비 (게임의 장비 이름으로)
+python -m mhwmm equipment --icons 아이콘.png  # 게임의 무기 아이콘 위치 확인용 그림 저장
 python -m mhwmm deploy | purge | verify
 ```
 
@@ -269,7 +297,8 @@ python -m mhwmm deploy | purge | verify
 - 같은 게임 폴더에 Fluffy Mod Manager 등 다른 모드 관리자를 같이 쓰면 서로의 파일을 알 수 없습니다.
   이 프로그램은 다른 프로그램이 넣은 파일을 건드리지 않지만, 한 가지 관리자만 쓰는 것을 권장합니다.
 - 게임이 실행 중일 때는 PAK 파일이 잠겨 있어 적용할 수 없습니다. 게임을 끈 뒤 적용하세요.
-- PAK 모드끼리 같은 대상을 바꾸는지는 PAK 내용을 열어 보지 않으므로 충돌 표시에 나오지 않습니다.
+- PAK 모드끼리 같은 파일을 바꾸는지는 충돌 표시(파일 기준)에 나오지 않습니다. 같은 장비 부위를 바꾸는 PAK 모드는
+  **장비 외형** 창에서 **겹침**으로 확인할 수 있습니다.
 
 ## 개발
 
@@ -278,7 +307,7 @@ python -m mhwmm deploy | purge | verify
 릴리즈 생성(`v` + 버전 태그, 릴리즈 노트는 CHANGELOG에서)까지 진행합니다. 버전이 그대로면 릴리즈를 건너뜁니다.
 
 ```
-pip install pytest zstandard
+pip install pytest zstandard pillow
 python -m pytest
 ```
 
@@ -288,6 +317,9 @@ python -m pytest
 - `mhwmm/matfix/` : 재질 복구 (게임 pak 읽기, mdf2 읽기/쓰기, 재질 대응·복구, `rsz.py` .user/.pfb/.scn 복구)
 - `tools/make_rsz_types.py` : RSZ 타입 정보(`rsz_types.json.xz`) 다시 만들기 (REasy 저장소 클론 필요),
   `tools/check_rsz_types.py` : 새로 만든 타입 정보 확인 (빠진 CRC, 실제 게임 파일 읽기)
+- `mhwmm/equip/` : 장비 외형 (`paths.py` 게임 경로 → 장비, `scan.py` 모드 파일·PAK 살펴보기, `catalog.py` 게임 데이터에서
+  장비 이름·그림 찾기, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처, `icons.py` 게임 아이콘·레어도 색),
+  `mhwmm/equipview.py` : 장비 외형 창, `tools/make_equip_paths.py` : 장비 파일 목록(`equip_paths.txt.xz`) 다시 만들기
 - `mhwmm/gui.py` : tkinter GUI, `mhwmm/theme.py` : 색상·글꼴·스타일, `mhwmm/cli.py` : 명령줄
 - `tools/make_assets.py` : 체크박스·스위치·아이콘 이미지 다시 만들기 (Pillow 필요)
 

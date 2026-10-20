@@ -20,7 +20,7 @@
 
 ## 개발
 
-- 테스트: `python -m pytest` (GUI 테스트는 tkinter와 화면이 있을 때만 실행, 리눅스에서는 `xvfb-run -a python -m pytest`)
+- 테스트: `python -m pytest` (Pillow가 없으면 그림 관련 테스트는 건너뜀. GUI 테스트는 tkinter와 화면이 있을 때만 실행, 리눅스에서는 `xvfb-run -a python -m pytest`)
 - UI 이미지 다시 만들기: `python tools/make_assets.py` (Pillow 필요)
 - 구조
   - `mhwmm/analyzer.py`: 압축 파일 구조 분석, 옵션(variant) 찾기
@@ -32,5 +32,13 @@
     (타입 정보 `rsz_types.json.xz`는 `tools/make_rsz_types.py`로 REasy 덤프 기록에서 만듦). 테스트에 zstandard 필요
     - 점검·복구 결과가 달라질 수 있는 변경을 하면 `manager.MATFIX_FORMAT`을 올린다. 그래야 업데이트 후 기존 기록이 '점검 전'이
       되어 다시 점검하고 복구를 다시 묻는다 (올리지 않으면 예전 결과가 그대로 남음).
+  - `mhwmm/equip/`: 장비 외형. `model.py` 공통 정의(Target 키 형식), `paths.py` 게임 경로 → 장비, `pathlist.py`·
+    `equip_paths.txt.xz` PAK 안 파일 이름 해시 찾기(`tools/make_equip_paths.py`로 REasy 목록에서 만듦), `scan.py` 모드 파일 살펴보기,
+    `catalog.py`·`userdata.py` 게임 데이터 표·msg에서 이름·그림 경로, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처,
+    `icons.py` 게임 아이콘·레어도 색, `overview.py` 창에 보일 장비 목록. 창은 `mhwmm/equipview.py`
+    - 게임 파일(텍스트·그림·데이터)은 저장소에 넣지 않는다. 테스트는 직접 만든 가짜 파일로 한다.
+    - 모드 파일을 장비에 대응시키는 규칙(paths.py, scan.py)을 바꾸면 `scan.SCAN_FORMAT`을, 게임 데이터에서 읽는 내용(catalog.py)을
+      바꾸면 `catalog.CATALOG_FORMAT`을, 게임 텍스처로 만드는 그림·아이콘(icons.py, tex.py, gdeflate.py)을 바꾸면
+      `icons.PICTURE_FORMAT`을 올린다. 그래야 데이터 폴더 `cache\`의 예전 결과를 다시 만든다.
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

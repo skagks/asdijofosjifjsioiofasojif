@@ -395,6 +395,63 @@ def cmd_materials(manager: ModManager, args) -> int:
     return 1 if failed else code
 
 
+def cmd_equipment(manager: ModManager, args) -> int:
+    """Which in-game equipment each mod changes the look of, with the game's own names."""
+    from .equip import overview
+    from .equip.model import KIND_LABELS, PART_LABELS
+
+    shown = [0.0]
+
+    def progress(done, total, msg):
+        if time.time() - shown[0] > 1.0:  # the first run reads the game's data tables
+            shown[0] = time.time()
+            print(msg, file=sys.stderr)
+
+    if args.icons:
+        if manager.save_equipment_icon_sheet(Path(args.icons), progress):
+            print(f"저장했습니다: {args.icons}")
+            return 0
+        print("게임에서 아이콘 그림을 읽지 못했습니다.", file=sys.stderr)
+        return 1
+    mods = _resolve(manager, args.mods) if args.mods else None
+    jobs = manager.equipment_jobs()
+    if mods:
+        wanted = {m.id for m in mods}
+        jobs = [j for j in jobs if j.mod_id in wanted]
+    catalog = manager.equipment_catalog(progress)
+    scans = manager.equipment_scans(jobs, progress)
+    result = overview.build([(j.mod_id, j.name, j.enabled, j.order, scans[j.mod_id]) for j in jobs], catalog)
+    if catalog is None:
+        print("게임 데이터를 읽지 못해 장비를 번호로 보여 줍니다.\n")
+    for job in jobs:
+        items = [i for i in result.items if any(u.mod_id == job.mod_id for u in i.uses)]
+        if not items and not mods:
+            continue
+        print(f"{job.order + 1}. {job.name}{'' if job.enabled else ' (꺼짐)'}")
+        if not items:
+            print("     바꾸는 장비를 찾지 못했습니다")
+        for item in items:
+            use = next(u for u in item.uses if u.mod_id == job.mod_id)
+            parts = [PART_LABELS.get(p, p) for p in (*item.parts, *use.parts) if p and p in use.parts]
+            parts = list(dict.fromkeys(parts))
+            rarity = f" · 레어 {item.rarity}" if item.rarity else ""
+            where = f" [{', '.join(parts)}]" if parts else ""
+            print(f"     {KIND_LABELS.get(item.target.kind, '')} {item.name} ({item.subtitle}{rarity}){where}")
+            for part, users in item.conflicts().items():
+                if any(u.mod_id == job.mod_id for u in users):
+                    others = ", ".join(f"'{u.name}'" for u in users if u.mod_id != job.mod_id)
+                    print(f"       겹침: {PART_LABELS.get(part, '') or '같은 장비'} - {others}도 바꿈"
+                          f" (같은 파일은 아래쪽 '{users[-1].name}' 우선)")
+            for note in item.notes:
+                print(f"       참고: {note}")
+    for problem in result.problems:
+        print(f"경고: {problem}", file=sys.stderr)
+    if catalog is not None:
+        for problem in catalog.problems:
+            print(f"경고: {problem}", file=sys.stderr)
+    return 0
+
+
 def cmd_game(manager: ModManager, args) -> int:
     path = Path(args.path) if args.path else manager.detect_game_dir()
     if path is None:
@@ -475,18 +532,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("mods", nargs="*", help="모드 id, 번호 또는 이름 (생략하면 모든 모드)")
     p.add_argument("--no-deploy", action="store_true")
 
+    p = sub.add_parser("equipment", aliases=["equip"], help="모드가 게임 속 어떤 장비의 모습을 바꾸는지 보기")
+    p.add_argument("mods", nargs="*", help="모드 id, 번호 또는 이름 (생략하면 장비를 바꾸는 모든 모드)")
+    p.add_argument("--icons", metavar="파일.png", help="게임의 아이콘 그림을 확인용으로 저장")
+
     p = sub.add_parser("game", help="게임 폴더 설정 (경로 생략 시 자동 감지)")
     p.add_argument("path", nargs="?")
     p.add_argument("--force", action="store_true")
     return parser
 
 
-READ_ONLY_COMMANDS = ("list", "verify", "conflicts")
+READ_ONLY_COMMANDS = ("list", "verify", "conflicts", "equipment", "equip")
 COMMANDS = {
     "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw,
     "nexus": cmd_nexus, "conflicts": cmd_conflicts, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
+    "equipment": cmd_equipment, "equip": cmd_equipment,
 }
 
 

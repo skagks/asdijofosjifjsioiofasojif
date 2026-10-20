@@ -219,6 +219,16 @@ class Theme:
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
         s.configure("Thumb.TFrame", background=p["bg"])
         s.configure("Thumb.TLabel", background=p["bg"], foreground=p["subtle"], font=f["small"])
+        # equipment window: tiles (one per piece of equipment), the selected one highlighted
+        for prefix, bg in (("Tile", p["raised"]), ("TileSel", p["select"])):
+            s.configure(f"{prefix}.TFrame", background=bg)
+            s.configure(f"{prefix}.TLabel", background=bg, foreground=p["text"])
+            s.configure(f"{prefix}Muted.TLabel", background=bg, foreground=p["muted"], font=f["small"])
+            s.configure(f"{prefix}Title.TLabel", background=bg, foreground=p["text"], font=f["bold"])
+        for name, fg, bg in (("PartOn", "chip_text", "chip"), ("PartOff", "subtle", "bg"),
+                             ("PartConflict", "danger", "danger_bg")):
+            s.configure(f"{name}.TLabel", background=p[bg], foreground=p[fg], font=f["small"],
+                        padding=(px(6), px(1)))
         for kind, fg, bg in (("Ok", "success", "success_bg"), ("Warn", "warn", "warn_bg"),
                              ("Bad", "danger", "danger_bg"), ("Neutral", "chip_text", "chip"),
                              ("Info", "info", "info_bg"), ("Over", "over", "over_bg")):

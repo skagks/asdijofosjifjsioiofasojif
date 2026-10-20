@@ -9,6 +9,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --collect-all tkinterdnd2 ^
     --collect-submodules zstandard ^
     --add-data "mhwmm\matfix\rsz_types.json.xz;mhwmm\matfix" ^
+    --add-data "mhwmm\equip\equip_paths.txt.xz;mhwmm\equip" ^
     MHWildsModManager.pyw || goto :error
 echo.
 echo 완료: dist\MHWildsModManager.exe
