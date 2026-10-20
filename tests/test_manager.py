@@ -213,6 +213,53 @@ def test_options_are_off_until_chosen(manager, game_dir, tmp_path):
     assert not (game_dir / "pak_mods/001_Colors.pak").exists()
 
 
+def test_options_keep_their_own_pictures(manager, tmp_path):
+    archive = make_zip(tmp_path / "Colors.zip", {
+        "Colors/Red/natives/STM/a.tex": "red",
+        "Colors/Red/preview.png": "red picture",
+        "Colors/Blue/natives/STM/a.tex": "blue",
+        "Colors/Blue/modinfo.ini": "name=Blue\nscreenshot=shot.JPG\n",
+        "Colors/Blue/shot.JPG": "blue picture",
+        "Colors/Green/natives/STM/a.tex": "green",
+    })
+    with manager.prepare_install(archive) as session:
+        mod = manager.install_package(session, session.variants)
+    pictures = {o["name"]: manager.option_preview(mod.id, o) for o in mod.options}
+    assert pictures["Red"].read_text() == "red picture"
+    assert pictures["Blue"].read_text() == "blue picture" and pictures["Blue"].suffix == ".jpg"
+    assert pictures["Green"] is None
+    assert manager.screenshot_path(mod).read_text() == "blue picture"  # the mod's own picture as before
+    reloaded = ModManager(manager.data_dir)
+    assert [reloaded.option_preview(mod.id, o) for o in reloaded.get(mod.id).options] == list(pictures.values())
+    # only pictures in the mod's previews folder
+    assert manager.option_preview(mod.id, {"preview": "previews/../mod.json"}) is None
+    assert manager.option_preview(mod.id, {"preview": "preview.jpg"}) is None
+    assert manager.option_preview(mod.id, {"preview": 3}) is None
+
+    # an update brings the pictures of the new archive
+    update = make_zip(tmp_path / "v2" / "Colors.zip", {
+        "Colors/Red/natives/STM/a.tex": "red2",
+        "Colors/Blue/natives/STM/a.tex": "blue2",
+        "Colors/Blue/preview.png": "new blue",
+    })
+    with manager.prepare_install(update) as session:
+        mod = manager.install_package(session, session.variants, replace_id=mod.id)
+    pictures = {o["name"]: manager.option_preview(mod.id, o) for o in mod.options}
+    assert pictures["Blue"].read_text() == "new blue" and pictures["Red"] is None
+    assert [f.name for f in (manager.mod_dir(mod.id) / "previews").iterdir()] == ["o1.png"]
+
+    # the same picture in every option is just the mod's picture
+    same = make_zip(tmp_path / "Same.zip", {
+        "Same/A/natives/STM/a.tex": "a", "Same/A/preview.png": "cover",
+        "Same/B/natives/STM/a.tex": "b", "Same/B/preview.png": "cover",
+    })
+    with manager.prepare_install(same) as session:
+        mod = manager.install_package(session, session.variants)
+    assert [manager.option_preview(mod.id, o) for o in mod.options] == [None, None]
+    assert manager.screenshot_path(mod).read_text() == "cover"
+    assert not (manager.mod_dir(mod.id) / "previews").exists()
+
+
 @pytest.fixture
 def frozen_exe(tmp_path, monkeypatch):
     """Pretend to run as the packaged exe in tmp_path/app, with the old data folder in tmp_path/legacy."""

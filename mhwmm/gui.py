@@ -115,6 +115,23 @@ def _virtual_screen(root: tk.Misc) -> tuple[int, int, int, int]:
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
+def load_image(path: Path, width: int, height: int):
+    """``path`` as a PhotoImage that fits in width × height, or None if it can't be shown."""
+    try:
+        if Image is not None:
+            with Image.open(path) as img:
+                img.draft(img.mode, (width, height))  # JPEG: decode at a smaller size, much faster
+                img.thumbnail((width, height))
+                return ImageTk.PhotoImage(img)
+        if path.suffix.lower() in (".png", ".gif"):
+            img = tk.PhotoImage(file=str(path))
+            factor = max(1, -(-img.width() // width), -(-img.height() // height))
+            return img.subsample(factor) if factor > 1 else img
+    except Exception as exc:
+        log.debug("미리보기 이미지를 열 수 없습니다: %s", exc)
+    return None
+
+
 def autohide(scrollbar: ttk.Scrollbar, **pack_options):
     """yscrollcommand that only shows ``scrollbar`` while there is something to scroll."""
     def set_(first, last):
@@ -267,6 +284,22 @@ class Dialog(tk.Toplevel):
     def cancel(self):
         self.result = None
         self.destroy()
+
+
+class ImageDialog(Dialog):
+    """A picture shown large; a click or any key closes it."""
+
+    def __init__(self, parent, theme: Theme, title: str, path: Path):
+        super().__init__(parent, theme, title)
+        width = min(theme.px(1280), parent.winfo_screenwidth() * 4 // 5)
+        height = min(theme.px(800), parent.winfo_screenheight() * 3 // 4)
+        self.image = load_image(path, width, height)
+        picture = ttk.Label(self.body, image=self.image or "", text="" if self.image else "그림을 열 수 없습니다.")
+        picture.pack()
+        ttk.Label(self.body, text=title, style="Muted.TLabel").pack(anchor="w", pady=(theme.px(10), 0))
+        for widget in (self, picture):
+            widget.bind("<Button-1>", lambda e: self.cancel())
+        self.bind("<Key>", lambda e: self.cancel())
 
 
 class TextDialog(Dialog):
@@ -823,6 +856,11 @@ class App:
         self._closed = False
         self._drag: dict | None = None
         self._preview = None
+        self._preview_path: tuple[Path, str] | None = None  # the picture on the info tab, for a larger view
+        self._thumbs: dict[tuple, object] = {}  # thumbnails of option pictures, by file and size
+        self._option_images: list = []  # the thumbnails on screen (Tk drops images nobody holds)
+        self._options_mod: str | None = None
+        self._options_gen = 0
         self._conflicts = None
         self._log_visible = True
         self._update: Release | None = None
@@ -1147,7 +1185,8 @@ class App:
         self.notebook.pack(fill="both", expand=True, padx=px(2), pady=(0, px(2)))
 
         info = ttk.Frame(self.notebook, style="Card.TFrame")
-        self.preview_label = ttk.Label(info, style="Card.TLabel", anchor="center")
+        self.preview_label = ttk.Label(info, style="Card.TLabel", anchor="center", cursor="hand2")
+        self.preview_label.bind("<Button-1>", lambda e: self._preview_path and self.show_picture(*self._preview_path))
         self.info_text = t.mark(tk.Text(info, wrap="word", font=t.fonts["base"], padx=px(18), pady=px(14),
                                         height=10, cursor="arrow"), "text")
         self.info_text.pack(fill="both", expand=True)
@@ -1155,11 +1194,15 @@ class App:
         self.notebook.add(info, text="정보")
 
         self.options_tab = ttk.Frame(self.notebook, style="Card.TFrame")
+        # title and "모두 켜기/끄기" stay at the top while the options scroll below
+        self.options_head = ttk.Frame(self.options_tab, style="Card.TFrame", padding=(px(18), px(14), px(18), px(6)))
+        self.options_head.pack(side="top", fill="x")
         self.options_canvas = t.mark(tk.Canvas(self.options_tab), "canvas")
         osb = ttk.Scrollbar(self.options_tab, orient="vertical", command=self.options_canvas.yview)
         self.options_canvas.configure(yscrollcommand=autohide(osb, side="right", fill="y"))
         self.options_canvas.pack(side="left", fill="both", expand=True)
-        self.options_inner = ttk.Frame(self.options_canvas, style="Card.TFrame", padding=(px(18), px(14)))
+        self.options_inner = ttk.Frame(self.options_canvas, style="Card.TFrame",
+                                       padding=(px(18), 0, px(18), px(14)))
         window = self.options_canvas.create_window((0, 0), window=self.options_inner, anchor="nw")
         self.options_inner.bind("<Configure>", lambda e: self.options_canvas.configure(
             scrollregion=self.options_canvas.bbox("all")))
@@ -1899,7 +1942,7 @@ class App:
         mod = self._selected_mod()
         self.files_tree.delete(*self.files_tree.get_children())
         if mod is None:
-            self._show_preview(None)
+            self._show_preview(None, "")
             n = len(self._selected_ids())
             if n > 1:
                 chunks = [(f"{n}개 모드 선택됨\n", "title"),
@@ -1912,7 +1955,7 @@ class App:
             self._fill_options(None)
             return
         m = self.manager
-        self._show_preview(m.screenshot_path(mod))
+        self._show_preview(m.screenshot_path(mod), mod.name)
         files = m.mod_files(mod.id)
         kinds = m.mod_kinds(mod.id)
         chunks = [(mod.name + "\n", "title")]
@@ -2042,46 +2085,116 @@ class App:
         self._fill_options(mod)
 
     def _fill_options(self, mod: Mod | None):
-        for child in self.options_inner.winfo_children():
-            child.destroy()
+        for frame in (self.options_head, self.options_inner):
+            for child in frame.winfo_children():
+                child.destroy()
         self._option_vars = []
+        self._option_images = []
+        self._options_gen += 1
         if mod is None or not mod.options:
+            self._options_mod = None
             self.notebook.tab(self.options_tab, state="hidden", text="옵션")
             return
         t, px, m = self.theme, self.theme.px, self.manager
-        inner = self.options_inner
+        # the same mod again (an option was switched): stay where the list was scrolled to
+        top = self.options_canvas.yview()[0] if self._options_mod == mod.id else 0.0
+        self._options_mod = mod.id
         self.notebook.tab(self.options_tab, state="normal",
                           text=f"옵션 {len(mod.selected)}/{len(mod.options)}" if mod.selected else "옵션 ●")
-        ttk.Label(inner, text="옵션", style="CardTitle.TLabel").pack(anchor="w")
+        head = self.options_head
+        ttk.Label(head, text="옵션", style="CardTitle.TLabel").pack(side="left")
+        ttk.Button(head, text="모두 끄기", style="Compact.TButton",
+                   command=lambda: self._set_options(mod.id, [])).pack(side="right")
+        ttk.Button(head, text="모두 켜기", style="Compact.TButton",
+                   command=lambda: self._set_options(mod.id, [o["id"] for o in mod.options])).pack(
+            side="right", padx=(0, px(6)))
+        inner = self.options_inner
         if mod.needs_option:
             callout = ttk.Frame(inner, style="Callout.TFrame", padding=(px(14), px(10)))
-            callout.pack(fill="x", pady=(px(10), px(4)))
+            callout.pack(fill="x", pady=(px(4), px(4)))
             ttk.Label(callout, text="옵션을 활성화해 주세요", style="CalloutTitle.TLabel").pack(anchor="w")
             ttk.Label(callout, text="사용할 옵션을 아래에서 하나 이상 켜야 게임에 적용됩니다.",
                       style="Callout.TLabel", wraplength=px(380), justify="left").pack(anchor="w", pady=(px(2), 0))
         else:
             ttk.Label(inner, text="여러 옵션을 함께 켤 수 있습니다. 같은 파일이 겹치면 아래쪽 옵션이 우선합니다.",
-                      style="CardMuted.TLabel", wraplength=px(380), justify="left").pack(anchor="w", pady=(px(4), px(4)))
+                      style="CardMuted.TLabel", wraplength=px(380), justify="left").pack(anchor="w", pady=(0, px(4)))
+        pictures = {o["id"]: m.option_preview(mod.id, o) for o in mod.options}
+        size = (px(128), px(72)) if any(pictures.values()) else None
+        pending = []
         for opt in mod.options:
             var = tk.BooleanVar(value=opt["id"] in mod.selected)
             self._option_vars.append((opt["id"], var))
             row = ttk.Frame(inner, style="Card.TFrame")
-            row.pack(fill="x", pady=(px(10), 0))
-            t.checkbutton(row, opt["name"], var, card=True,
+            row.pack(fill="x", pady=(px(12 if size else 10), 0))
+            if size:
+                box = ttk.Frame(row, style="Thumb.TFrame", width=size[0], height=size[1])
+                box.pack_propagate(False)
+                box.pack(side="left", anchor="n", padx=(0, px(10)))
+                thumb = ttk.Label(box, style="Thumb.TLabel", anchor="center")
+                thumb.pack(fill="both", expand=True)
+                path = pictures[opt["id"]]
+                image = self._thumbnail(path, *size, load=False) if path else None
+                if image is not None:
+                    self._show_option_thumb(thumb, path, opt["name"], image)
+                elif path:
+                    pending.append((thumb, path, opt["name"]))  # loaded once the tab is drawn
+                else:
+                    thumb.configure(text="그림 없음")
+            body = ttk.Frame(row, style="Card.TFrame")
+            body.pack(side="left", fill="x", expand=True)
+            line = ttk.Frame(body, style="Card.TFrame")
+            line.pack(fill="x")
+            t.checkbutton(line, opt["name"], var, card=True,
                           command=lambda: self._on_options_changed(mod.id)).pack(side="left")
-            ttk.Button(row, text="이것만 사용", style="Link.TButton",
+            ttk.Button(line, text="이것만 사용", style="Link.TButton",
                        command=lambda oid=opt["id"]: self._set_options(mod.id, [oid])).pack(side="right")
             files = m.option_files(mod.id, opt["id"])
-            ttk.Label(inner, text=f"{kinds_text(classify(files))} · 파일 {len(files)}개",
+            ttk.Label(body, text=f"{kinds_text(classify(files))} · 파일 {len(files)}개",
                       style="CardMuted.TLabel", font=t.fonts["small"]).pack(anchor="w", padx=(px(34), 0))
-        buttons = ttk.Frame(inner, style="Card.TFrame")
-        buttons.pack(fill="x", pady=(px(16), 0))
-        ttk.Button(buttons, text="모두 켜기", style="Compact.TButton",
-                   command=lambda: self._set_options(mod.id, [o["id"] for o in mod.options])).pack(side="left")
-        ttk.Button(buttons, text="모두 끄기", style="Compact.TButton",
-                   command=lambda: self._set_options(mod.id, [])).pack(side="left", padx=(px(6), 0))
         self._bind_wheel(inner, self.options_canvas)
-        self.options_canvas.yview_moveto(0)
+        self.options_canvas.yview_moveto(top)
+        if top:
+            self.root.after_idle(lambda: self.options_canvas.yview_moveto(top))
+        if pending:
+            gen = self._options_gen
+            self.root.after(1, lambda: self._load_option_thumbs(gen, pending, size))
+
+    def _thumbnail(self, path: Path, width: int, height: int, load: bool = True):
+        """Thumbnail of a picture, cached; with ``load=False`` only one that was made before."""
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        key = (str(path), st.st_mtime_ns, st.st_size, width, height)
+        if key not in self._thumbs:
+            if not load:
+                return None
+            if len(self._thumbs) >= 300:
+                self._thumbs.clear()
+            self._thumbs[key] = load_image(path, width, height)
+        return self._thumbs[key]
+
+    def _load_option_thumbs(self, gen: int, pending: list, size: tuple[int, int]):
+        """Load the option thumbnails one at a time so that the window stays responsive."""
+        if gen != self._options_gen or not pending:
+            return
+        thumb, path, name = pending.pop(0)
+        image = self._thumbnail(path, *size)
+        if thumb.winfo_exists():
+            if image is not None:
+                self._show_option_thumb(thumb, path, name, image)
+            else:
+                thumb.configure(text="그림 없음")
+        if pending:
+            self.root.after(1, lambda: self._load_option_thumbs(gen, pending, size))
+
+    def _show_option_thumb(self, thumb: ttk.Label, path: Path, name: str, image):
+        self._option_images.append(image)
+        thumb.configure(image=image, text="", cursor="hand2")
+        thumb.bind("<Button-1>", lambda e: self.show_picture(path, name))
+
+    def show_picture(self, path: Path, title: str):
+        ImageDialog(self.root, self.theme, title, path).show()
 
     def _bind_wheel(self, widget, canvas: tk.Canvas):
         def wheel(event):
@@ -2112,22 +2225,9 @@ class App:
         self._update_details()
         self.notebook.select(self.options_tab)
 
-    def _show_preview(self, path: Path | None):
-        self._preview = None
-        if path is not None:
-            max_w, max_h = self.theme.px(380), self.theme.px(200)
-            try:
-                if Image is not None:
-                    img = Image.open(path)
-                    img.thumbnail((max_w, max_h))
-                    self._preview = ImageTk.PhotoImage(img)
-                elif path.suffix.lower() in (".png", ".gif"):
-                    img = tk.PhotoImage(file=str(path))
-                    factor = max(1, -(-img.width() // max_w), -(-img.height() // max_h))
-                    self._preview = img.subsample(factor) if factor > 1 else img
-            except Exception as exc:
-                log.debug("미리보기 이미지를 열 수 없습니다: %s", exc)
-                self._preview = None
+    def _show_preview(self, path: Path | None, title: str):
+        self._preview = self._thumbnail(path, self.theme.px(380), self.theme.px(200)) if path is not None else None
+        self._preview_path = (path, title) if self._preview is not None else None
         if self._preview is not None:
             self.preview_label.configure(image=self._preview)
             if not self.preview_label.winfo_ismapped():

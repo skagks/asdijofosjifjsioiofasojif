@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import json
 import logging
@@ -40,6 +41,7 @@ DEFAULT_PROFILE = "기본"
 MAX_PROFILE_NAME = 40
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
+OPTION_PREVIEWS = "previews"  # per mod: the pictures of its options, named after the option id
 # Version of the check/repair rules: records made with older rules count as unchecked, so every
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
 # can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3.
@@ -752,6 +754,14 @@ class ModManager:
         p = self.mod_dir(mod.id) / mod.screenshot
         return p if p.is_file() else None
 
+    def option_preview(self, mod_id: str, option: dict) -> Path | None:
+        """The picture an option of a mod came with (Fluffy Mod Manager style), if any."""
+        rel = option.get("preview")
+        if not isinstance(rel, str) or not re.fullmatch(rf"{OPTION_PREVIEWS}/[\w.-]+", rel) or ".." in rel:
+            return None
+        p = self.mod_dir(mod_id) / rel
+        return p if p.is_file() else None
+
     def conflicts(self) -> Conflicts:
         owners: dict[str, list[str]] = {}
         paths: dict[str, str] = {}
@@ -904,11 +914,20 @@ class ModManager:
                         fsutil.copy_file(src, dst)
                 fsutil.makedirs(target)
             screenshot = ""
-            shot = next((v.screenshot for v in variants
-                         if v.screenshot and (session.base / v.screenshot).is_file()), None)
+            shots = [v.screenshot if v.screenshot and (session.base / v.screenshot).is_file() else None
+                     for v in variants]
+            shot = next((s for s in shots if s), None)
             if shot:
                 screenshot = "preview" + Path(shot).suffix.lower()
                 fsutil.copy_file(session.base / shot, stage / screenshot)
+            # options show their own picture, unless every option has the same one
+            pictures = [hashlib.sha1((session.base / s).read_bytes()).digest() if s else None
+                        for s in shots] if multi else []
+            if shot and len(set(pictures)) > 1:
+                for opt, s in zip(options, shots):
+                    if s:
+                        opt["preview"] = f"{OPTION_PREVIEWS}/{opt['id']}{Path(s).suffix.lower()}"
+                        fsutil.copy_file(session.base / s, stage / opt["preview"])
 
             info = next((v.info for v in variants if v.info), None)
             version = next((v.version for v in variants if v.version), "")

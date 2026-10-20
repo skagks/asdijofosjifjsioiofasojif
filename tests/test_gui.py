@@ -110,6 +110,64 @@ def test_gui_toggle_applies(root, manager, tmp_path, game_dir, monkeypatch):
     assert len(app.tree.get_children()) == 3
 
 
+def test_gui_options_show_pictures(root, manager, tmp_path, monkeypatch):
+    from tkinter import ttk
+
+    from mhwmm import gui
+
+    def picture(name, color):
+        img = tk.PhotoImage(master=root, width=320, height=180)
+        img.put(color, to=(0, 0, 320, 180))
+        img.write(str(tmp_path / name), format="png")
+        return (tmp_path / name).read_bytes()
+
+    archive = make_zip(tmp_path / "Pack.zip", {
+        "Pack/One/natives/STM/a.tex": "1", "Pack/One/preview.png": picture("1.png", "#c03030"),
+        "Pack/Two/natives/STM/a.tex": "2", "Pack/Two/preview.png": picture("2.png", "#3030c0"),
+        "Pack/Three/natives/STM/a.tex": "3",
+    })
+    with manager.prepare_install(archive) as s:
+        mod = manager.install_package(s, s.variants)
+    manager.settings.auto_apply = False
+    app = gui.App(root, manager, queue.Queue())
+    app.show_options(mod.id)
+
+    def widgets(parent):
+        for w in parent.winfo_children():
+            yield w
+            yield from widgets(w)
+
+    def texts(parent):
+        return [str(w.cget("text")) for w in widgets(parent) if isinstance(w, (ttk.Label, ttk.Button))]
+
+    # "모두 켜기/끄기" stay above the list instead of after the last option
+    assert {"모두 켜기", "모두 끄기"} <= set(texts(app.options_head))
+    assert "모두 켜기" not in texts(app.options_inner)
+
+    # thumbnails load after the tab is drawn; an option without a picture keeps an empty box
+    pump(root, lambda: len(app._option_images) == 2)
+    thumbs = [w for w in widgets(app.options_inner) if isinstance(w, ttk.Label) and str(w.cget("style")) == "Thumb.TLabel"]
+    assert [bool(str(w.cget("image"))) for w in thumbs] == [True, False, True]  # One, Three, Two
+    assert str(thumbs[1].cget("text")) == "그림 없음"
+
+    # switching an option rebuilds the list with the cached thumbnails right away
+    app._option_vars[0][1].set(True)
+    app._on_options_changed(mod.id)
+    root.update()
+    assert manager.get(mod.id).selected == [mod.options[0]["id"]] and len(app._option_images) == 2
+
+    # a click shows the picture large
+    shown = []
+    monkeypatch.setattr(gui.ImageDialog, "show", lambda self: shown.append((self.title(), self.image)) or self.destroy())
+    thumb = next(w for w in widgets(app.options_inner)
+                 if isinstance(w, ttk.Label) and str(w.cget("style")) == "Thumb.TLabel" and str(w.cget("image")))
+    app.show_picture(manager.option_preview(mod.id, mod.options[0]), "One")
+    assert shown[-1][0] == "One" and shown[-1][1] is not None
+    thumb.event_generate("<Button-1>")
+    root.update()
+    assert len(shown) == 2
+
+
 def test_gui_moves_old_data_with_progress(root, tmp_path, monkeypatch):
     from mhwmm import gui, manager as mgr
 

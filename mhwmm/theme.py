@@ -217,6 +217,8 @@ class Theme:
         s.configure("CalloutTitle.TLabel", background=p["warn_bg"], foreground=p["warn"], font=f["bold"])
         s.configure("Callout.TLabel", background=p["warn_bg"], foreground=p["text"])
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
+        s.configure("Thumb.TFrame", background=p["bg"])
+        s.configure("Thumb.TLabel", background=p["bg"], foreground=p["subtle"], font=f["small"])
         for kind, fg, bg in (("Ok", "success", "success_bg"), ("Warn", "warn", "warn_bg"),
                              ("Bad", "danger", "danger_bg"), ("Neutral", "chip_text", "chip"),
                              ("Info", "info", "info_bg"), ("Over", "over", "over_bg")):
