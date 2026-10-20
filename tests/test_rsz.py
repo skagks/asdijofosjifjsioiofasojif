@@ -132,10 +132,12 @@ def test_old_layout_is_rebuilt_keeping_the_mods_values():
     assert any("_NewFlag" in n for n in plan.notes)
 
 
-def test_unchanged_crcs_are_left_alone():
-    short = PARAM_FIELDS[:-1]  # reads differently from the registry, but every CRC is the game's
+def test_current_crcs_that_do_not_read_are_reported_not_changed():
+    short = PARAM_FIELDS[:-1]  # every CRC is the game's, but the data has the old shape: the game misreads it
     mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, short, param(short, scale=3.0))])
-    assert rsz.plan("a.user.3", mod, game_file(), registry()).state == "current"
+    plan = rsz.plan("a.user.3", mod, game_file(), registry())
+    assert plan.state == "stuck" and plan.data is None and "CRC는 현재 게임과 같지만" in plan.reason
+    assert "app.user_data.TestArmorParam" in plan.detail
 
 
 def test_unknown_old_crc_missing_the_last_fields_is_rebuilt():
@@ -184,7 +186,9 @@ def test_different_file_is_not_replaced():
     assert plan.state == "stuck" and "참조" in plan.reason
 
 
-def test_resource_fields_read_either_way():
+def test_resource_fields_are_strings():
+    """A real MH Wilds .pfb reads exactly only with Resource fields as length-prefixed strings
+    (REasy's reading, not MHWmodfixer's 4-byte one)."""
     fields = [["_Path", "Resource", 4, 4, 0], ["_Value", "S32", 4, 4, 0]]
     reg = registry(**{format(EXTRA, "x"): ["4444", "app.WithResource", json.dumps(fields)]})
     as_string = user_file([(EXTRA, 0x4444, [["_Path", "String", 4, 4, 0], ["_Value", "S32", 4, 4, 0]],
@@ -192,8 +196,21 @@ def test_resource_fields_read_either_way():
     schema, _ = rsz.choose_schema(rsz.parse(as_string), rsz.parse(as_string), reg)
     assert schema.resource_string
     as_index = user_file([(EXTRA, 0x4444, [["_Path", "U32", 4, 4, 0], ["_Value", "S32", 4, 4, 0]], [s32(3), s32(5)])])
-    schema, _ = rsz.choose_schema(rsz.parse(as_index), rsz.parse(as_index), reg)
-    assert not schema.resource_string  # a 4-byte index, as MHWmodfixer reads it
+    assert rsz.choose_schema(rsz.parse(as_index), rsz.parse(as_index), reg) == (None, None)
+
+
+def test_same_bytes_under_new_names_are_kept():
+    """An older dump may describe the same bytes with other names ("v0" for "Enabled"): such an
+    instance keeps its bytes, only the CRC changes."""
+    old = [["v0", "Data", 1, 1, 0], ["v1", "Data", 4, 4, 0]]
+    now = [["Enabled", "Bool", 1, 1, 0], ["_Value", "S32", 4, 4, 0]]
+    reg = rsz.TypeRegistry({"types": {format(EXTRA, "x"): ["4444", "app.Streaming", json.dumps(now)]}, "empty": {},
+                            "alt": {}, "old": {format(EXTRA, "x"): {"4440": json.dumps(old)}}})
+    mod = user_file([(EXTRA, 0x4440, old, [b"\x01", s32(9)])])
+    game = user_file([(EXTRA, 0x4444, now, [b"\x01", s32(1)])])
+    plan = rsz.plan("a.pfb.18", mod, game, reg)
+    assert (plan.state, plan.method) == ("fixable", "CRC 갱신")
+    assert plan.data[rsz.parse(mod).data_start:] == mod[rsz.parse(mod).data_start:]  # every data byte kept
 
 
 def test_bundled_registry_loads():
@@ -258,7 +275,8 @@ def avp_files(mod_crc):
     mine = {"_DispOffHear": b"\x01", "_HeadObjScale": f32(0.8)}
     old = reg.old_fields(root, mod_crc)
     mod = build(old, mod_crc, "_ArmorWpOnSettingHelm" in [f[0] for f in old], mine, [7, 8])
-    game = build(reg.fields(root), reg.crc(root), True, {"_HeadObjScale": f32(1.0)}, [1])
+    game = build(reg.fields(root), reg.crc(root), True,
+                 {"_HeadObjScale": f32(1.0), "_IsEffectCallCatchSlinger": b"\x01"}, [1])
     return mod, game, reg, root
 
 
@@ -346,12 +364,25 @@ def test_chain_physics_settings_are_not_rewritten():
 
 
 def test_unknown_old_crc_needs_clean_padding_for_a_crc_update():
-    mod = bytearray(user_file([(CHILD, 0x3000, CHILD_FIELDS, [s32(42)]),
-                               (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, scale=2.5))]))
+    mod = bytearray(user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]),
+                               (PARAM, 0x1999, PARAM_FIELDS, param(PARAM_FIELDS, scale=2.5))]))  # CRC not in the history
     info = rsz.parse(bytes(mod))
-    walked, clean = rsz.walk_current(info, rsz.Schema(), registry())
-    param_inst = walked[2]
-    pad = param_inst.start + 4 + 1 + 1  # after _Scale, _HideHair, _NewFlag: padding before _Mesh
-    mod[pad] = 0x7F  # garbage where the current layout expects padding
+    walked, _clean = rsz.walk_current(info, rsz.Schema(), registry())
+    mod[walked[2].start + 4 + 1 + 1] = 0x7F  # garbage where the current layout expects padding
     plan = rsz.plan("a.user.3", bytes(mod), game_file(), registry())
     assert plan.method != "CRC 갱신"
+
+
+def test_unchanged_instances_keep_their_bytes_padding_included():
+    first = bytearray(encode(PARAM_FIELDS, param(PARAM_FIELDS), 0))
+    mod = bytearray(user_file([(PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS)),
+                               (PARAM, OLD_CRC, OLD_PARAM, param(OLD_PARAM, scale=2.5))]))
+    info = rsz.parse(bytes(mod))
+    pad = info.data_start + 4 + 1 + 1  # padding before _Mesh in the first (current) instance
+    assert mod[pad] == 0 and len(first) > 8
+    mod[pad] = 0x55  # the game's own writer sometimes leaves such bytes
+    game = user_file([(PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, new=1)),
+                      (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, new=1))])
+    plan = rsz.plan("a.user.3", bytes(mod), game, registry())
+    assert (plan.state, plan.method) == ("fixable", "재구성")
+    assert plan.data[pad] == 0x55  # kept, not rewritten as zero
