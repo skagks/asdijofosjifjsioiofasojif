@@ -862,6 +862,7 @@ class App:
         self._options_mod: str | None = None
         self._options_gen = 0
         self._wanted_tab: str | None = None  # the details tab the user picked last
+        self._shown_tab: str | None = None  # the tab shown before the last change
         self._conflicts = None
         self._log_visible = True
         self._update: Release | None = None
@@ -1025,7 +1026,7 @@ class App:
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
         m.add_command(label="장비 외형 보기", command=lambda: self.show_equipment())
         m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
-        m.add_command(label="옵션 그림 가져오기 (예전에 설치한 모드)", command=self.read_all_option_pictures)
+        m.add_command(label="옵션 그림 다시 찾기 (그림 없는 모드)", command=self.read_all_option_pictures)
         m.add_command(label="게임 폴더에서 모든 모드 파일 제거", command=self.purge)
         m.add_separator()
         m.add_command(label="모두 활성화", command=lambda: self.set_enabled_all(True))
@@ -1195,6 +1196,7 @@ class App:
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill="both", expand=True, padx=px(2), pady=(0, px(2)))
         self.notebook.bind("<ButtonPress-1>", self._on_tab_click, add="+")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
         info = ttk.Frame(self.notebook, style="Card.TFrame")
         self.preview_label = ttk.Label(info, style="Card.TLabel", anchor="center", cursor="hand2")
@@ -2176,6 +2178,17 @@ class App:
         if index != "":
             self._wanted_tab = self.notebook.tabs()[int(index)]
 
+    def _on_tab_changed(self, _event=None):
+        """A tab picked with the keyboard (or by the app) counts too, but not the one Tk falls back to
+        when the shown tab is hidden (옵션 for a mod without options)."""
+        shown, self._shown_tab = self._shown_tab, self.notebook.select()
+        try:
+            if shown and str(self.notebook.tab(shown, "state")) == "hidden":
+                return
+        except tk.TclError:
+            pass
+        self._wanted_tab = self._shown_tab
+
     def _select_tab(self, tab):
         self._wanted_tab = str(tab)
         self.notebook.select(tab)
@@ -2223,12 +2236,12 @@ class App:
         pictures = {o["id"]: m.option_preview(mod.id, o) for o in mod.options}
         size = (px(128), px(72)) if any(pictures.values()) else None
         if size is None and not mod.pictures_read:
-            # installed before options kept their pictures: they are still in the archive
+            # e.g. installed before options kept their pictures (1.12.0): they are still in the archive
             hint = ttk.Frame(inner, style="Card.TFrame")
             hint.pack(fill="x", pady=(px(4), 0))
-            ttk.Label(hint, text="옵션 그림이 없습니다. 예전 버전(1.12.0 이전)에서 설치한 모드는 설치한 압축 파일에서 "
-                                 "옵션 그림을 가져올 수 있습니다.", style="CardMuted.TLabel", wraplength=px(380),
-                      justify="left").pack(anchor="w")
+            ttk.Label(hint, text="옵션 그림이 없습니다. 설치할 때 쓴 압축 파일에서 옵션 그림을 다시 찾아볼 수 있습니다 "
+                                 "(1.12.0 이전에 설치한 모드는 옵션 그림을 저장하지 않았습니다).", style="CardMuted.TLabel",
+                      wraplength=px(380), justify="left").pack(anchor="w")
             ttk.Button(hint, text="압축 파일에서 옵션 그림 가져오기", style="Link.TButton",
                        command=lambda: self.read_option_pictures(mod.id)).pack(anchor="w", pady=(px(2), 0))
         pending = []
@@ -2338,7 +2351,7 @@ class App:
         self._select_tab(self.options_tab)
 
     def _missing_pictures(self, mod: Mod) -> bool:
-        """A mod with options installed before they kept their pictures."""
+        """A mod with options without pictures whose archive was not looked at for them."""
         return bool(mod.options) and not mod.pictures_read and \
             not any(self.manager.option_preview(mod.id, o) for o in mod.options)
 
@@ -2349,13 +2362,13 @@ class App:
             return
         m = self.manager
         mod = m.get(mod_id)
-        path = m.find_archive(mod_id)
+        folders = m.archive_folders()
+        path = m.find_archive(mod_id, folders)
         if path is None:
-            folders = m.archive_folders()
             chosen = filedialog.askopenfilename(
                 parent=self.root, title=f"'{mod.source or mod.name}' 압축 파일 선택", filetypes=INSTALL_FILETYPES,
                 initialdir=str(folders[0]) if folders else None)
-            if not chosen:
+            if not chosen or not self._idle():  # (something may have started while the dialog was open)
                 return
             path = Path(chosen)
 
@@ -2377,31 +2390,37 @@ class App:
         if not self._idle():
             return
         m = self.manager
-        mods = [mod for mod in m.mods if self._missing_pictures(mod)]
-        if not mods:
+        ids = [mod.id for mod in m.mods if self._missing_pictures(mod)]
+        if not ids:
             messagebox.showinfo("옵션 그림", "옵션 그림을 가져올 모드가 없습니다.", parent=self.root)
-            return
-        found = [(mod.id, path) for mod in mods if (path := m.find_archive(mod.id)) is not None]
-        missing = [mod.name for mod in mods if all(mod.id != i for i, _p in found)]
-        if not found:
-            messagebox.showinfo("옵션 그림", "설치할 때 쓴 압축 파일을 찾지 못했습니다 (모드를 설치한 폴더, 다운로드, "
-                                         "바탕 화면에서 찾음).\n\n모드의 옵션 탭에서 압축 파일을 직접 골라 주세요:\n"
-                                + "\n".join(f"· {n}" for n in missing), parent=self.root)
             return
 
         def work(progress):
-            results = []
-            for i, (mod_id, path) in enumerate(found):
-                progress(i, len(found), f"옵션 그림 가져오는 중: {path.name}")
+            progress(0, len(ids), "설치할 때 쓴 압축 파일 찾는 중...")
+            folders = m.archive_folders()  # (in the background: a folder may be on a slow network drive)
+            results, missing = [], []
+            for i, mod_id in enumerate(ids):
+                name = m.get(mod_id).name
+                path = m.find_archive(mod_id, folders)
+                if path is None:
+                    missing.append(name)
+                    continue
+                progress(i, len(ids), f"옵션 그림 가져오는 중: {path.name}")
                 try:
-                    results.append((m.get(mod_id).name, m.read_option_pictures(mod_id, path), ""))
+                    results.append((name, m.read_option_pictures(mod_id, path), ""))
                 except Exception as exc:  # one broken archive does not stop the others
                     log.warning("옵션 그림을 가져오지 못했습니다: %s (%s)", path.name, exc)
-                    results.append((m.get(mod_id).name, 0, str(exc)))
-            return results
+                    results.append((name, 0, str(exc)))
+            return results, missing
 
-        def done(results):
+        def done(outcome):
+            results, missing = outcome
             self._update_details()
+            if not results:
+                messagebox.showinfo("옵션 그림", "설치할 때 쓴 압축 파일을 찾지 못했습니다 (모드를 설치한 폴더, 다운로드, "
+                                             "바탕 화면에서 찾음).\n\n모드의 옵션 탭에서 압축 파일을 직접 골라 주세요:\n"
+                                    + "\n".join(f"· {n}" for n in missing), parent=self.root)
+                return
             lines = [f"· {name}: " + (f"실패 - {error}" if error else f"그림 {n}개" if n else "옵션마다 다른 그림 없음")
                      for name, n, error in results]
             if missing:

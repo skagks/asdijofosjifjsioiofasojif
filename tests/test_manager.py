@@ -305,6 +305,16 @@ def test_option_pictures_from_the_archive_of_an_older_install(manager, tmp_path,
     pictures = [manager.option_preview(mod.id, o) for o in manager.get(mod.id).options]
     assert [p.read_text() if p else None for p in pictures] == ["blau", None, "rot"]
     assert sorted(f.name for f in (manager.mod_dir(mod.id) / "previews").iterdir()) == ["o1.png", "o3.png"]
+    # the mod's own picture stays, and no other one is added next to it
+    assert manager.screenshot_path(manager.get(mod.id)).read_text() == "blue picture"
+    jpgs = make_zip(tmp_path / "Jpg.zip", {"J/Blue/natives/STM/a.tex": "b", "J/Blue/shot.jpg": "jpg blue",
+                                           "J/Red/natives/STM/a.tex": "r", "J/Red/shot.jpg": "jpg red"})
+    assert manager.read_option_pictures(mod.id, jpgs) == 2
+    assert sorted(f.name for f in manager.mod_dir(mod.id).glob("preview.*")) == ["preview.png"]
+    # a mod without a picture of its own gets the archive's
+    manager.screenshot_path(manager.get(mod.id)).unlink()
+    manager.read_option_pictures(mod.id, jpgs)
+    assert manager.screenshot_path(manager.get(mod.id)).read_text() == "jpg blue"
 
     # an archive of something else
     other = make_zip(tmp_path / "Other.zip", {"Other/natives/STM/x.tex": "x", "Other/preview.png": "p"})
@@ -317,6 +327,18 @@ def test_option_pictures_from_the_archive_of_an_older_install(manager, tmp_path,
     assert manager.find_archive(single.id) == other
     single.source = "../escape.zip"
     assert manager.find_archive(single.id) is None
+
+    # only the user's own folders are remembered: not the app's (a REFramework download), not a relative one
+    remembered = list(manager.settings.archive_dirs)
+    refw_zip = make_zip(manager.temp_root / "REFramework-1.zip", {"Other2/natives/STM/y.tex": "y"})
+    with manager.prepare_install(refw_zip) as session:
+        manager.install_package(session, session.variants)
+    monkeypatch.chdir(tmp_path)
+    with manager.prepare_install(Path("Other.zip")) as session:
+        manager.install_package(session, session.variants)
+    assert manager.settings.archive_dirs == remembered
+    manager.settings.archive_dirs = [".", str(manager.temp_root), 3, *remembered]
+    assert manager.archive_folders()[:len(remembered)] == [Path(d) for d in remembered]
 
 
 @pytest.fixture

@@ -227,6 +227,15 @@ def test_gui_keeps_the_picked_tab_and_reads_old_option_pictures(root, manager, t
     app.tree.selection_set(pack.id)
     app._update_details()
     assert nb.select() == str(app.conflicts_tab)
+    # ... also one picked with the keyboard
+    root.update()  # (the selection events of the clicks above)
+    nb.tk.call("ttk::notebook::CycleTab", nb._w, -1)  # what the notebook's <Left> key does
+    root.update()
+    assert nb.select() != str(app.conflicts_tab)
+    picked = nb.select()
+    app._update_details()
+    root.update()
+    assert nb.select() == picked
 
     # the old mod's pictures come from its archive (still where it was installed from)
     app.show_options(pack.id)
@@ -246,9 +255,37 @@ def test_gui_keeps_the_picked_tab_and_reads_old_option_pictures(root, manager, t
                    for w in widgets(app.options_inner))
     assert "옵션 그림 2개" in app.status_var.get()
 
-    # the menu command for every such mod: nothing left to do
+    # the menu command does every such mod and tells which archives it could not find
     shown = []
     monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text, **k: shown.append(text))
+    with manager.prepare_install(make_zip(tmp_path / "dl" / "Gone.zip", {
+            "Gone/A/natives/STM/g.tex": "a", "Gone/A/preview.png": picture("3.png", "#30c030"),
+            "Gone/B/natives/STM/g.tex": "b"})) as s:
+        gone = manager.install_package(s, s.variants)
+    (tmp_path / "dl" / "Gone.zip").unlink()
+    for mod in (manager.get(pack.id), gone):
+        for opt in mod.options:
+            opt.pop("preview", None)
+        mod.pictures_read = False
+    app.read_all_option_pictures()
+    pump(root, lambda: app.busy is None and shown)
+    assert shown[-1] == "· Pack: 그림 2개\n\n압축 파일을 찾지 못한 모드 (옵션 탭에서 직접 골라 주세요):\n· Gone"
+    assert manager.get(pack.id).pictures_read and not manager.get(gone.id).pictures_read
+    shown.clear()
+    app.read_all_option_pictures()
+    pump(root, lambda: app.busy is None and shown)
+    assert shown[-1].startswith("설치할 때 쓴 압축 파일을 찾지 못했습니다") and shown[-1].endswith("· Gone")
+    app.read_all_option_pictures = lambda: pytest.fail("not again")
+    # ... which the user then picks
+    elsewhere = make_zip(tmp_path / "moved" / "Gone.zip", {
+        "Gone/A/natives/STM/g.tex": "a", "Gone/A/preview.png": picture("3.png", "#30c030"),
+        "Gone/B/natives/STM/g.tex": "b"})
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **k: str(elsewhere))
+    app.read_option_pictures(gone.id)
+    pump(root, lambda: app.busy is None and manager.get(gone.id).pictures_read)
+    assert manager.option_preview(gone.id, manager.get(gone.id).options[0]) is not None
+    shown.clear()
+    del app.read_all_option_pictures
     app.read_all_option_pictures()
     assert shown == ["옵션 그림을 가져올 모드가 없습니다."]
 

@@ -1022,17 +1022,18 @@ class ModManager:
         return mod
 
     @staticmethod
-    def _store_pictures(base: Path, shots: list, options: list[dict], target: Path) -> str:
+    def _store_pictures(base: Path, shots: list, options: list[dict], target: Path, main: bool = True) -> str:
         """Copy an extracted archive's pictures into a mod folder: the mod's own (the first of ``shots``
-        that exists) and, unless every option has the same one, each option's into previews/.
-        ``shots``: archive paths (or None) in the order of ``options`` (one entry for a mod without
-        options). Returns the mod's picture ("" without one)."""
+        that exists; not with ``main=False``) and, unless every option has the same one, each option's
+        into previews/. ``shots``: archive paths (or None) in the order of ``options`` (one entry for a
+        mod without options). Returns the mod's picture ("" without one or with ``main=False``)."""
         shots = [s if s and (base / s).is_file() else None for s in shots]
         shot = next((s for s in shots if s), None)
         if not shot:
             return ""
-        screenshot = "preview" + Path(shot).suffix.lower()
-        fsutil.copy_file(base / shot, target / screenshot)
+        screenshot = "preview" + Path(shot).suffix.lower() if main else ""
+        if main:
+            fsutil.copy_file(base / shot, target / screenshot)
         # options show their own picture, unless every option has the same one
         pictures = [hashlib.sha1((base / s).read_bytes()).digest() if s else None for s in shots] if options else []
         if len(set(pictures)) > 1:
@@ -1043,15 +1044,26 @@ class ModManager:
         return screenshot
 
     def _remember_archive_dir(self, source: Path) -> None:
-        folder = str(Path(source).parent)
-        dirs = [d for d in self.settings.archive_dirs if isinstance(d, str) and d != folder]
+        folder = os.path.abspath(Path(source).parent)
+        if not self._user_folder(folder):
+            return  # e.g. a REFramework download in the app's temp folder
+        key = os.path.normcase(folder)
+        dirs = [d for d in self.settings.archive_dirs if isinstance(d, str) and os.path.normcase(d) != key]
         self.settings.archive_dirs = [folder, *dirs][:MAX_ARCHIVE_DIRS]
+
+    def _user_folder(self, folder) -> bool:
+        """A folder of the user's (absolute, not the app's own data folder)."""
+        return os.path.isabs(folder) and not (fsutil.is_within(folder, self.data_dir)
+                                             or os.path.normcase(os.path.abspath(folder))
+                                             == os.path.normcase(os.path.abspath(self.data_dir)))
 
     def archive_folders(self) -> list[Path]:
         """Where mod archives are probably kept: the folders mods were installed from, Downloads, Desktop."""
         home = Path.home()
         found, seen = [], set()
         for d in [*self.settings.archive_dirs, home / "Downloads", home / "Desktop"]:
+            if not isinstance(d, (str, Path)) or not self._user_folder(d):
+                continue
             p = Path(d)
             key = os.path.normcase(str(p))
             if key not in seen and p.is_dir():
@@ -1059,12 +1071,13 @@ class ModManager:
                 found.append(p)
         return found
 
-    def find_archive(self, mod_id: str) -> Path | None:
-        """The archive (or folder) a mod was installed from, if it is still in one of archive_folders()."""
+    def find_archive(self, mod_id: str, folders: list[Path] | None = None) -> Path | None:
+        """The archive (or folder) a mod was installed from, if it is still in one of ``folders``
+        (archive_folders() by default)."""
         name = self.get(mod_id).source
         if not name or name in (".", "..") or "/" in name or "\\" in name:
             return None
-        for folder in self.archive_folders():
+        for folder in self.archive_folders() if folders is None else folders:
             p = folder / name
             if p.exists():
                 return p
@@ -1094,10 +1107,11 @@ class ModManager:
             for opt in options:
                 opt.pop("preview", None)
             fsutil.rmtree(target / OPTION_PREVIEWS)
+            keep = self.screenshot_path(mod) is not None  # the mod's own picture stays as it is
             screenshot = self._store_pictures(session.base, [v.screenshot if v else None for v in matched],
-                                              options, target)
+                                              options, target, main=not keep)
         mod.options = options
-        if screenshot and self.screenshot_path(mod) is None:
+        if screenshot:
             mod.screenshot = screenshot
         mod.pictures_read = True
         self._write_mod_meta(mod)
