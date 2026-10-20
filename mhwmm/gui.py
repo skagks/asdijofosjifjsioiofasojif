@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import webbrowser
 import tkinter as tk
 from pathlib import Path
@@ -18,7 +19,8 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__, fsutil, nexus, refw, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
-from .constants import APP_TITLE, GAME_EXE, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL, STEAM_APP_ID
+from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL,
+                        STEAM_APP_ID)
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .helptext import SECTIONS as HELP_SECTIONS
 from .manager import (InstallError, InstallSession, Mod, ModManager, acquire_instance_lock,
@@ -740,6 +742,7 @@ class App:
         if not manager.settings.log_visible:
             self.toggle_log()
 
+        manager.link_from_sources()  # names an older version could not read
         self.refresh()
         self._update_search_hint()
         root.after(60, self._place_sash)
@@ -750,7 +753,9 @@ class App:
         if manager.settings.check_refw_updates:
             root.after(3500, lambda: self.check_refw(manual=False))
         if manager.settings.check_mod_updates and manager.settings.nexus_api_key:
-            root.after(1500, lambda: self.check_mod_updates(manual=False))
+            root.after(1500, lambda: self.check_mod_updates(manual=False))  # reads requirements too
+        else:
+            root.after(2000, self._fetch_unread_requirements)
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -1100,6 +1105,8 @@ class App:
             info.tag_configure(tag, foreground=p[color], font=f["bold"])
         for tag, action in (("nexus_page", lambda m: m.nexus_url), ("nexus_files", lambda m: nexus.FILES_URL.format(m.nexus_id))):
             info.tag_bind(tag, "<Button-1>", lambda e, action=action: self._open_nexus(action))
+        info.tag_bind("nexus_set", "<Button-1>", lambda e: self.link_nexus())
+        info.tag_bind("nexus_search", "<Button-1>", lambda e: self._search_nexus())
         info.tag_bind("link", "<Enter>", lambda e: info.configure(cursor="hand2"))
         info.tag_bind("link", "<Leave>", lambda e: info.configure(cursor="arrow"))
         ct = self.conflict_text
@@ -1576,8 +1583,17 @@ class App:
         """After installing: read the mod's requirements from Nexus, then say what is missing."""
         if mod.nexus_id and mod.origin != refw.ORIGIN:
             self._fetch_requirements([mod.nexus_id], notify=[mod.id])
-        else:
-            self._queue_requirement_notices([mod.id])
+            return
+        if mod.origin != refw.ORIGIN:
+            log.info("'%s': 파일 이름에서 Nexus 모드 번호를 찾지 못했습니다. 정보 탭의 'Nexus 링크 설정'으로 모드 페이지를 "
+                     "연결하면 업데이트와 필요한 모드를 확인할 수 있습니다.", mod.name)
+        self._queue_requirement_notices([mod.id])
+
+    def _fetch_unread_requirements(self):
+        """Requirements of Nexus mods that were never read (needs no API key)."""
+        ids = sorted({m.nexus_id for m in self.manager.mods if m.nexus_id and not m.requirements_checked})
+        if ids:
+            self._fetch_requirements(ids)
 
     def _fetch_requirements(self, nexus_ids: list[int], notify: list[str] = ()):
         key = self.manager.settings.nexus_api_key
@@ -1619,6 +1635,11 @@ class App:
                     log.warning("'%s'에 필요한 모드: %s (%s)", mod.name, req["name"], requirement_note(req))
         if items and not self._closed:
             RequirementsDialog(self.root, self.theme, items).show()
+
+    def _search_nexus(self):
+        mod = self._selected_mod()
+        if mod is not None:
+            webbrowser.open(NEXUS_SEARCH_URL.format(urllib.parse.quote(mod.name)))
 
     def _open_nexus(self, url_of):
         mod = self._selected_mod()
@@ -1775,6 +1796,10 @@ class App:
             chunks += [("필요한 모드\t" if i == 0 else "\t", "key"), (f"{icon} ", ("value", icon_tag)),
                        (req["name"], name_tags), (f"   {requirement_note(req)}\n", ("value", "muted"))]
         missing = [r for r in reqs if r["state"] in ("missing", "off")]
+        if not mod.nexus_id and mod.origin != refw.ORIGIN:
+            chunks += [("Nexus\t", "key"), ("연결 안 됨   ", ("value", "muted")),
+                       ("링크 설정", ("value", "link", "nexus_set")), ("  ·  ", ("value", "muted")),
+                       ("Nexus에서 찾기", ("value", "link", "nexus_search")), ("\n", "value")]
         if mod.nexus_id:
             chunks += [("Nexus\t", "key"), (f"모드 페이지 #{mod.nexus_id}", ("value", "link", "nexus_page"))]
             if mod.nexus_checked:

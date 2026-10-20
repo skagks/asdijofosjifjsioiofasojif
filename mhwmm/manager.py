@@ -1041,17 +1041,23 @@ class ModManager:
         self._write_mod_meta(mod)
         self.save()
 
-    def nexus_items(self) -> list[nexus.CheckItem]:
-        """Mods connected to Nexus (reading older installs' original file names first)."""
-        changed = False
+    def link_from_sources(self) -> list[Mod]:
+        """Connect mods to Nexus from their original file names (installs of older versions, or names
+        an older version could not read). Returns the mods that got linked."""
+        linked = []
         for m in self.mods:
             if not m.nexus_id and not m.nexus_unlinked and m.origin != REFW_ORIGIN:
                 ref = nexus.parse_source_name(m.source)
                 if ref:
                     m.nexus_id, m.nexus_file_time, m.nexus_exact = ref.mod_id, ref.uploaded, ref.exact
-                    changed = True
-        if changed:
+                    linked.append(m)
+        if linked:
             self.save()
+        return linked
+
+    def nexus_items(self) -> list[nexus.CheckItem]:
+        """Mods connected to Nexus (reading older installs' original file names first)."""
+        self.link_from_sources()
         return [nexus.CheckItem(m.id, m.nexus_id, m.nexus_file_time, m.nexus_exact, m.version, m.nexus_checked)
                 for m in self.mods if m.nexus_id]
 

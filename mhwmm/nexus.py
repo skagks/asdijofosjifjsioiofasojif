@@ -33,8 +33,11 @@ RECENT_PERIOD = ("1m", 28 * 86400)  # updated.json period and how far back it re
 CLOCK_SLACK = 3600  # our clock and Nexus' may differ
 
 _ARCHIVE_SUFFIXES = (".zip", ".7z", ".rar", ".pak")
-# Better Armor-1234-1-2-1740000000
-_CLASSIC = re.compile(r"^(?P<name>.+?)-(?P<id>\d+)-(?P<ver>\d[0-9A-Za-z]*(?:-[0-9A-Za-z]+)*)-(?P<ts>\d{9,11})$")
+# Better Armor-1234-1-2-1740000000, Better Armor-1234-v1-2a-1740000000, Better Armor-1234-1740000000
+# (the version is whatever the author typed, with dots turned into dashes; it may be empty)
+_CLASSIC = re.compile(r"^(?P<name>.+?)-(?P<id>\d{1,7})(?:-(?P<ver>[^\s/\\]*?))?-(?P<ts>\d{9,11})$")
+# "name (1).zip" when the browser already had a file of that name
+_DUPLICATE = re.compile(r"\s*\(\d{1,3}\)$")
 # Ardelia 3664 1.3 2026-08-05T20-52Z ...
 _ISO = re.compile(r"^(?P<name>.+?)[ _-]+(?P<id>\d+)[ _-]+v?(?P<ver>\d[0-9A-Za-z.]*)[ _-]+"
                   r"(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}(?:-\d{2})?Z)(?P<rest>.*)$")
@@ -63,9 +66,11 @@ def parse_source_name(name: str) -> SourceRef | None:
     stem = name.strip()
     if stem.lower().endswith(_ARCHIVE_SUFFIXES):
         stem = stem.rsplit(".", 1)[0]
+    stem = _DUPLICATE.sub("", stem)
     m = _CLASSIC.match(stem)
     if m:
-        return SourceRef(m["name"].strip(" _-") or stem, int(m["id"]), m["ver"].replace("-", "."), int(m["ts"]), True)
+        version = (m["ver"] or "").replace("-", ".").replace("_", ".").strip(".")
+        return SourceRef(m["name"].strip(" _-") or stem, int(m["id"]), version, int(m["ts"]), True)
     m = _ISO.match(stem)
     if m:
         parts = [int(x) for x in re.findall(r"\d+", m["iso"])]

@@ -419,3 +419,32 @@ def test_gui_tells_about_missing_requirements(root, manager, tmp_path, monkeypat
     app._update_details()
     info = app.info_text.get("1.0", "end")
     assert "필요한 모드가 없습니다" in info and "Lua Bone System" in info and "_CatLib" in info
+
+
+def test_gui_links_mods_from_file_names_and_reads_requirements(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui, nexus
+
+    with manager.prepare_install(make_zip(tmp_path / "Plain.zip", {"natives/STM/p.tex": "p"})) as s:
+        plain = manager.install_variant(s, s.variants[0])
+    with manager.prepare_install(make_zip(tmp_path / "Mod Name-787-v1-0-1740000000.zip", {"natives/STM/a.tex": "a"})) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    assert mod.nexus_id == 787
+    mod.nexus_id = 0  # what an older version left for a "v1.0" file name
+    manager.save()
+    asked = []
+    monkeypatch.setattr(nexus, "fetch_requirements", lambda ids, key="": asked.append(ids) or {787: [
+        {"name": "Lua Bone System", "url": nexus.MOD_URL.format(10), "nexus_id": 10, "notes": "", "external": False}]})
+
+    app = gui.App(root, manager, queue.Queue())
+    assert mod.nexus_id == 787  # read from the original file name at start
+    pump(root, lambda: mod.requirements_checked, timeout=8)  # requirements are read without an API key
+    assert asked == [[787]] and mod.requirements[0]["name"] == "Lua Bone System"
+    app.tree.selection_set(mod.id)
+    app._update_details()
+    info = app.info_text.get("1.0", "end")
+    assert "모드 페이지 #787" in info and "Lua Bone System" in info
+
+    # a mod without a Nexus file name offers to link it
+    app.tree.selection_set(plain.id)
+    app._update_details()
+    assert "연결 안 됨" in app.info_text.get("1.0", "end")

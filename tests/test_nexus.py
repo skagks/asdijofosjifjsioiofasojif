@@ -30,6 +30,14 @@ def test_parse_names_and_links():
     iso = parse_source_name("Ardelia 3664 1.3 2026-08-05T20-52Z replacer.zip")
     assert (iso.name, iso.mod_id, iso.version, iso.exact) == ("Ardelia replacer", 3664, "1.3", False)
     assert parse_source_name("_CatLib.zip") is None
+    # versions starting with "v" or letters, no version, underscores, and browser duplicates
+    for name, version in (("Mod Name-787-v1-0-1740000000.zip", "v1.0"), ("Mod Name-787-1740000000.zip", ""),
+                          ("Mod Name-787-TU4-1740000000.7z", "TU4"), ("Mod Name-787-1_2-1740000000.rar", "1.2"),
+                          ("Mod Name-787-1-0-1740000000 (1).zip", "1.0")):
+        ref = parse_source_name(name)
+        assert (ref.name, ref.mod_id, ref.version, ref.uploaded) == ("Mod Name", 787, version, 1740000000), name
+    assert parse_source_name("Re-Texture-55-2-0-1740000000.zip").mod_id == 55
+    assert parse_source_name("Mod 2025-10-01.zip") is None
     assert parse_mod_ref("https://www.nexusmods.com/monsterhunterwilds/mods/3664?tab=files") == 3664
     assert parse_mod_ref("https://next.nexusmods.com/monsterhunterwilds/mods/12") == 12
     assert parse_mod_ref(" 77 ") == 77
