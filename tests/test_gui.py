@@ -170,6 +170,89 @@ def test_gui_options_show_pictures(root, manager, tmp_path, monkeypatch):
     assert len(shown) == 2
 
 
+def test_gui_keeps_the_picked_tab_and_reads_old_option_pictures(root, manager, tmp_path, monkeypatch):
+    from tkinter import ttk
+
+    from mhwmm import fsutil, gui
+
+    def picture(name, color):
+        img = tk.PhotoImage(master=root, width=32, height=18)
+        img.put(color, to=(0, 0, 32, 18))
+        img.write(str(tmp_path / name), format="png")
+        return (tmp_path / name).read_bytes()
+
+    archive = make_zip(tmp_path / "dl" / "Pack.zip", {
+        "Pack/One/natives/STM/a.tex": "1", "Pack/One/preview.png": picture("1.png", "#c03030"),
+        "Pack/Two/natives/STM/a.tex": "2", "Pack/Two/preview.png": picture("2.png", "#3030c0"),
+    })
+    with manager.prepare_install(archive) as s:
+        pack = manager.install_package(s, s.variants)
+    with manager.prepare_install(make_zip(tmp_path / "Plain.zip", {"Plain/natives/STM/p.tex": "p"})) as s:
+        plain = manager.install_package(s, s.variants)
+    for opt in pack.options:  # installed by a version before 1.12.0
+        opt.pop("preview", None)
+    fsutil.rmtree(manager.mod_dir(pack.id) / "previews")
+    pack.pictures_read = False
+    manager.settings.auto_apply = False
+    app = gui.App(root, manager, queue.Queue())
+    nb = app.notebook
+    app.tree.selection_set(pack.id)
+    app._update_details()
+    pump(root, lambda: nb.winfo_ismapped() and nb.winfo_width() > 100)
+
+    def click_tab(tab):
+        for y in range(2, 60, 3):
+            for x in range(2, nb.winfo_width(), 3):
+                index = nb.tk.call(nb._w, "identify", "tab", x, y)
+                if index != "" and nb.tabs()[int(index)] == str(tab):
+                    nb.event_generate("<ButtonPress-1>", x=x, y=y)
+                    nb.event_generate("<ButtonRelease-1>", x=x, y=y)
+                    root.update()
+                    return
+        raise AssertionError("탭을 찾지 못했습니다")
+
+    # 옵션 picked, a mod without options shows another tab, the next mod with options shows 옵션 again
+    click_tab(app.options_tab)
+    assert nb.select() == str(app.options_tab)
+    app.tree.selection_set(plain.id)
+    app._update_details()
+    assert nb.select() != str(app.options_tab)
+    app.tree.selection_set(pack.id)
+    app._update_details()
+    assert nb.select() == str(app.options_tab)
+    # a tab picked on purpose stays
+    click_tab(app.conflicts_tab)
+    app.tree.selection_set(plain.id)
+    app._update_details()
+    app.tree.selection_set(pack.id)
+    app._update_details()
+    assert nb.select() == str(app.conflicts_tab)
+
+    # the old mod's pictures come from its archive (still where it was installed from)
+    app.show_options(pack.id)
+
+    def widgets(parent):
+        for w in parent.winfo_children():
+            yield w
+            yield from widgets(w)
+
+    button = next(w for w in widgets(app.options_inner)
+                  if isinstance(w, ttk.Button) and str(w.cget("text")) == "압축 파일에서 옵션 그림 가져오기")
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **k: pytest.fail("the archive was found"))
+    button.invoke()
+    pump(root, lambda: app.busy is None and len(app._option_images) == 2)
+    assert manager.get(pack.id).pictures_read
+    assert not any(isinstance(w, ttk.Button) and str(w.cget("text")) == "압축 파일에서 옵션 그림 가져오기"
+                   for w in widgets(app.options_inner))
+    assert "옵션 그림 2개" in app.status_var.get()
+
+    # the menu command for every such mod: nothing left to do
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text, **k: shown.append(text))
+    app.read_all_option_pictures()
+    assert shown == ["옵션 그림을 가져올 모드가 없습니다."]
+
+
 def test_gui_moves_old_data_with_progress(root, tmp_path, monkeypatch):
     from mhwmm import gui, manager as mgr
 

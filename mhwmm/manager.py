@@ -53,6 +53,7 @@ MAX_PROFILE_NAME = 40
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
 OPTION_PREVIEWS = "previews"  # per mod: the pictures of its options, named after the option id
+MAX_ARCHIVE_DIRS = 8
 # Version of the check/repair rules: records made with older rules count as unchecked, so every
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
 # can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3.
@@ -283,6 +284,7 @@ class Settings:
     sash_ratio: float = 0.58
     log_visible: bool = True
     check_materials: bool = True  # look for outdated materials at startup and after installs
+    archive_dirs: list = field(default_factory=list)  # folders mods were installed from, the latest first
 
 
 @dataclass
@@ -316,6 +318,8 @@ class Mod:
     requirements_format: int = 0  # nexus.REQUIREMENTS_FORMAT they were read with
     lua_requires: list = field(default_factory=list)  # Lua modules the mod's scripts need from other mods
     lua_scanned: bool = False
+    # the archive's option pictures were looked for (installs since 1.12.0 and read_option_pictures)
+    pictures_read: bool = False
 
     @property
     def nexus_url(self) -> str:
@@ -952,21 +956,7 @@ class ModManager:
                     else:
                         fsutil.copy_file(src, dst)
                 fsutil.makedirs(target)
-            screenshot = ""
-            shots = [v.screenshot if v.screenshot and (session.base / v.screenshot).is_file() else None
-                     for v in variants]
-            shot = next((s for s in shots if s), None)
-            if shot:
-                screenshot = "preview" + Path(shot).suffix.lower()
-                fsutil.copy_file(session.base / shot, stage / screenshot)
-            # options show their own picture, unless every option has the same one
-            pictures = [hashlib.sha1((session.base / s).read_bytes()).digest() if s else None
-                        for s in shots] if multi else []
-            if shot and len(set(pictures)) > 1:
-                for opt, s in zip(options, shots):
-                    if s:
-                        opt["preview"] = f"{OPTION_PREVIEWS}/{opt['id']}{Path(s).suffix.lower()}"
-                        fsutil.copy_file(session.base / s, stage / opt["preview"])
+            screenshot = self._store_pictures(session.base, [v.screenshot for v in variants], options, stage)
 
             info = next((v.info for v in variants if v.info), None)
             version = next((v.version for v in variants if v.version), "")
@@ -1000,6 +990,7 @@ class ModManager:
             mod.category = (info.category if info else "") or (mod.category if replace_id else "")
             mod.source = session.source.name
             mod.screenshot = screenshot
+            mod.pictures_read = True
             mod.lua_requires = requirements.required_modules(self._stored_files(stage))
             mod.lua_scanned = True
             self._write_mod_meta(mod, stage)
@@ -1022,12 +1013,99 @@ class ModManager:
         if mod.enabled:
             self.revision += 1
             self.dirty = True
+        self._remember_archive_dir(session.source)
         self.save()
         if mod.options:
             log.info("설치 완료: %s (옵션 %d개, 사용할 옵션을 골라 주세요)", mod.name, len(mod.options))
         else:
             log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
         return mod
+
+    @staticmethod
+    def _store_pictures(base: Path, shots: list, options: list[dict], target: Path) -> str:
+        """Copy an extracted archive's pictures into a mod folder: the mod's own (the first of ``shots``
+        that exists) and, unless every option has the same one, each option's into previews/.
+        ``shots``: archive paths (or None) in the order of ``options`` (one entry for a mod without
+        options). Returns the mod's picture ("" without one)."""
+        shots = [s if s and (base / s).is_file() else None for s in shots]
+        shot = next((s for s in shots if s), None)
+        if not shot:
+            return ""
+        screenshot = "preview" + Path(shot).suffix.lower()
+        fsutil.copy_file(base / shot, target / screenshot)
+        # options show their own picture, unless every option has the same one
+        pictures = [hashlib.sha1((base / s).read_bytes()).digest() if s else None for s in shots] if options else []
+        if len(set(pictures)) > 1:
+            for opt, s in zip(options, shots):
+                if s:
+                    opt["preview"] = f"{OPTION_PREVIEWS}/{opt['id']}{Path(s).suffix.lower()}"
+                    fsutil.copy_file(base / s, target / opt["preview"])
+        return screenshot
+
+    def _remember_archive_dir(self, source: Path) -> None:
+        folder = str(Path(source).parent)
+        dirs = [d for d in self.settings.archive_dirs if isinstance(d, str) and d != folder]
+        self.settings.archive_dirs = [folder, *dirs][:MAX_ARCHIVE_DIRS]
+
+    def archive_folders(self) -> list[Path]:
+        """Where mod archives are probably kept: the folders mods were installed from, Downloads, Desktop."""
+        home = Path.home()
+        found, seen = [], set()
+        for d in [*self.settings.archive_dirs, home / "Downloads", home / "Desktop"]:
+            p = Path(d)
+            key = os.path.normcase(str(p))
+            if key not in seen and p.is_dir():
+                seen.add(key)
+                found.append(p)
+        return found
+
+    def find_archive(self, mod_id: str) -> Path | None:
+        """The archive (or folder) a mod was installed from, if it is still in one of archive_folders()."""
+        name = self.get(mod_id).source
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            return None
+        for folder in self.archive_folders():
+            p = folder / name
+            if p.exists():
+                return p
+        return None
+
+    def read_option_pictures(self, mod_id: str, source, progress=None) -> int:
+        """Take the options' pictures from the archive a mod was installed from (for mods installed
+        before options had pictures); its files stay as they are. Options are matched by name (by
+        position when no name matches). Returns how many options got a picture of their own."""
+        mod = self.get(mod_id)
+        if not mod.options:
+            raise InstallError("옵션이 있는 모드가 아닙니다.")
+        if progress:
+            progress(0, 1, f"압축 푸는 중: {Path(source).name}")
+        with self.prepare_install(source) as session:
+            variants = [v for v in session.variants if v.files]
+            by_name = {}
+            for v in variants:
+                by_name.setdefault(v.option or v.name, v)
+            matched = [by_name.get(o["name"]) for o in mod.options]
+            if not any(matched) and len(variants) == len(mod.options):
+                matched = variants
+            if not any(matched):
+                raise InstallError("이 압축 파일에서 모드의 옵션을 찾지 못했습니다. 이 모드를 설치한 압축 파일인지 확인해 주세요.")
+            target = self.mod_dir(mod_id)
+            options = copy.deepcopy(mod.options)
+            for opt in options:
+                opt.pop("preview", None)
+            fsutil.rmtree(target / OPTION_PREVIEWS)
+            screenshot = self._store_pictures(session.base, [v.screenshot if v else None for v in matched],
+                                              options, target)
+        mod.options = options
+        if screenshot and self.screenshot_path(mod) is None:
+            mod.screenshot = screenshot
+        mod.pictures_read = True
+        self._write_mod_meta(mod)
+        self._remember_archive_dir(Path(source))
+        self.save()
+        count = sum(1 for o in options if self.option_preview(mod_id, o))
+        log.info("옵션 그림을 가져왔습니다: %s (%d개)", mod.name, count)
+        return count
 
     # ------------------------------------------------------------- materials
     def game_version(self, refresh: bool = False) -> str:

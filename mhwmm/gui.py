@@ -861,6 +861,7 @@ class App:
         self._option_images: list = []  # the thumbnails on screen (Tk drops images nobody holds)
         self._options_mod: str | None = None
         self._options_gen = 0
+        self._wanted_tab: str | None = None  # the details tab the user picked last
         self._conflicts = None
         self._log_visible = True
         self._update: Release | None = None
@@ -1024,6 +1025,7 @@ class App:
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
         m.add_command(label="장비 외형 보기", command=lambda: self.show_equipment())
         m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
+        m.add_command(label="옵션 그림 가져오기 (예전에 설치한 모드)", command=self.read_all_option_pictures)
         m.add_command(label="게임 폴더에서 모든 모드 파일 제거", command=self.purge)
         m.add_separator()
         m.add_command(label="모두 활성화", command=lambda: self.set_enabled_all(True))
@@ -1192,6 +1194,7 @@ class App:
         right = t.mark(tk.Frame(paned), "card")
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill="both", expand=True, padx=px(2), pady=(0, px(2)))
+        self.notebook.bind("<ButtonPress-1>", self._on_tab_click, add="+")
 
         info = ttk.Frame(self.notebook, style="Card.TFrame")
         self.preview_label = ttk.Label(info, style="Card.TLabel", anchor="center", cursor="hand2")
@@ -1998,7 +2001,7 @@ class App:
                 self.refresh()
             self.tree.selection_set(mod_id)
             self.tree.see(mod_id)
-            self.notebook.select(self.conflicts_tab)
+            self._select_tab(self.conflicts_tab)
 
     @staticmethod
     def _set_text(widget: tk.Text, chunks):
@@ -2023,6 +2026,7 @@ class App:
             self._set_text(self.info_text, chunks)
             self._set_text(self.conflict_text, [("충돌\n", "title"), ("모드를 선택하세요.", "muted")])
             self._fill_options(None)
+            self._follow_tab()
             return
         m = self.manager
         self._show_preview(m.screenshot_path(mod), mod.name)
@@ -2160,6 +2164,27 @@ class App:
         self._fill_files(mod, files)
         self._fill_conflicts(mod)
         self._fill_options(mod)
+        self._follow_tab()
+
+    def _on_tab_click(self, event):
+        """Remember the details tab the user picks: it comes back as soon as another mod has it again
+        (옵션 after a mod without options showed 파일)."""
+        try:
+            index = self.notebook.tk.call(self.notebook._w, "identify", "tab", event.x, event.y)
+        except tk.TclError:
+            return
+        if index != "":
+            self._wanted_tab = self.notebook.tabs()[int(index)]
+
+    def _select_tab(self, tab):
+        self._wanted_tab = str(tab)
+        self.notebook.select(tab)
+
+    def _follow_tab(self):
+        wanted = self._wanted_tab
+        if wanted and wanted in self.notebook.tabs() and self.notebook.select() != wanted \
+                and str(self.notebook.tab(wanted, "state")) == "normal":
+            self.notebook.select(wanted)
 
     def _fill_options(self, mod: Mod | None):
         for frame in (self.options_head, self.options_inner):
@@ -2197,6 +2222,15 @@ class App:
                       style="CardMuted.TLabel", wraplength=px(380), justify="left").pack(anchor="w", pady=(0, px(4)))
         pictures = {o["id"]: m.option_preview(mod.id, o) for o in mod.options}
         size = (px(128), px(72)) if any(pictures.values()) else None
+        if size is None and not mod.pictures_read:
+            # installed before options kept their pictures: they are still in the archive
+            hint = ttk.Frame(inner, style="Card.TFrame")
+            hint.pack(fill="x", pady=(px(4), 0))
+            ttk.Label(hint, text="옵션 그림이 없습니다. 예전 버전(1.12.0 이전)에서 설치한 모드는 설치한 압축 파일에서 "
+                                 "옵션 그림을 가져올 수 있습니다.", style="CardMuted.TLabel", wraplength=px(380),
+                      justify="left").pack(anchor="w")
+            ttk.Button(hint, text="압축 파일에서 옵션 그림 가져오기", style="Link.TButton",
+                       command=lambda: self.read_option_pictures(mod.id)).pack(anchor="w", pady=(px(2), 0))
         pending = []
         for opt in mod.options:
             var = tk.BooleanVar(value=opt["id"] in mod.selected)
@@ -2303,7 +2337,80 @@ class App:
         self.tree.selection_set(mod_id)
         self.tree.see(mod_id)
         self._update_details()
-        self.notebook.select(self.options_tab)
+        self._select_tab(self.options_tab)
+
+    def _missing_pictures(self, mod: Mod) -> bool:
+        """A mod with options installed before they kept their pictures."""
+        return bool(mod.options) and not mod.pictures_read and \
+            not any(self.manager.option_preview(mod.id, o) for o in mod.options)
+
+    def read_option_pictures(self, mod_id: str):
+        """Take a mod's option pictures from the archive it was installed from (found in the folders
+        mods came from, Downloads or Desktop; else the user picks it)."""
+        if not self._idle():
+            return
+        m = self.manager
+        mod = m.get(mod_id)
+        path = m.find_archive(mod_id)
+        if path is None:
+            folders = m.archive_folders()
+            chosen = filedialog.askopenfilename(
+                parent=self.root, title=f"'{mod.source or mod.name}' 압축 파일 선택", filetypes=INSTALL_FILETYPES,
+                initialdir=str(folders[0]) if folders else None)
+            if not chosen:
+                return
+            path = Path(chosen)
+
+        def done(count):
+            self._update_details()
+            if count:
+                self.status_var.set(f"'{mod.name}': 옵션 그림 {count}개를 가져왔습니다")
+            else:
+                messagebox.showinfo("옵션 그림", f"'{path.name}'에는 옵션마다 다른 그림이 없습니다."
+                                    + (" 모드 그림은 정보 탭에 나옵니다." if m.screenshot_path(mod) else ""),
+                                    parent=self.root)
+
+        self.run_task("pictures", f"옵션 그림 가져오는 중: {path.name}",
+                      lambda progress: m.read_option_pictures(mod_id, path, progress), on_done=done,
+                      on_error=lambda exc: self.show_error("옵션 그림을 가져오지 못했습니다", f"{path.name}\n\n{exc}"))
+
+    def read_all_option_pictures(self):
+        """The same for every such mod whose archive is still in a known folder."""
+        if not self._idle():
+            return
+        m = self.manager
+        mods = [mod for mod in m.mods if self._missing_pictures(mod)]
+        if not mods:
+            messagebox.showinfo("옵션 그림", "옵션 그림을 가져올 모드가 없습니다.", parent=self.root)
+            return
+        found = [(mod.id, path) for mod in mods if (path := m.find_archive(mod.id)) is not None]
+        missing = [mod.name for mod in mods if all(mod.id != i for i, _p in found)]
+        if not found:
+            messagebox.showinfo("옵션 그림", "설치할 때 쓴 압축 파일을 찾지 못했습니다 (모드를 설치한 폴더, 다운로드, "
+                                         "바탕 화면에서 찾음).\n\n모드의 옵션 탭에서 압축 파일을 직접 골라 주세요:\n"
+                                + "\n".join(f"· {n}" for n in missing), parent=self.root)
+            return
+
+        def work(progress):
+            results = []
+            for i, (mod_id, path) in enumerate(found):
+                progress(i, len(found), f"옵션 그림 가져오는 중: {path.name}")
+                try:
+                    results.append((m.get(mod_id).name, m.read_option_pictures(mod_id, path), ""))
+                except Exception as exc:  # one broken archive does not stop the others
+                    log.warning("옵션 그림을 가져오지 못했습니다: %s (%s)", path.name, exc)
+                    results.append((m.get(mod_id).name, 0, str(exc)))
+            return results
+
+        def done(results):
+            self._update_details()
+            lines = [f"· {name}: " + (f"실패 - {error}" if error else f"그림 {n}개" if n else "옵션마다 다른 그림 없음")
+                     for name, n, error in results]
+            if missing:
+                lines += ["", "압축 파일을 찾지 못한 모드 (옵션 탭에서 직접 골라 주세요):", *(f"· {n}" for n in missing)]
+            messagebox.showinfo("옵션 그림", "\n".join(lines), parent=self.root)
+
+        self.run_task("pictures", "옵션 그림 가져오는 중...", work, on_done=done)
 
     def _show_preview(self, path: Path | None, title: str):
         self._preview = self._thumbnail(path, self.theme.px(380), self.theme.px(200)) if path is not None else None

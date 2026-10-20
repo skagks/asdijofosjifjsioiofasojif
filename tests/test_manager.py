@@ -1,9 +1,11 @@
 import zipfile
+from pathlib import Path
 
 import pytest
 
 from mhwmm.archive import extract, ArchiveError
-from mhwmm.manager import ModManager
+from mhwmm import fsutil
+from mhwmm.manager import InstallError, ModManager
 
 from conftest import make_tree, make_zip, write
 
@@ -263,6 +265,58 @@ def test_options_keep_their_own_pictures(manager, tmp_path):
     assert [manager.option_preview(mod.id, o) for o in mod.options] == [None, None]
     assert manager.screenshot_path(mod).read_text() == "cover"
     assert not (manager.mod_dir(mod.id) / "previews").exists()
+
+
+def test_option_pictures_from_the_archive_of_an_older_install(manager, tmp_path, monkeypatch):
+    downloads = tmp_path / "home" / "Downloads"
+    archive = make_zip(downloads / "Colors.zip", {
+        "Colors/Red/natives/STM/a.tex": "red", "Colors/Red/preview.png": "red picture",
+        "Colors/Blue/natives/STM/a.tex": "blue", "Colors/Blue/preview.png": "blue picture",
+        "Colors/Green/natives/STM/a.tex": "green",
+    })
+    with manager.prepare_install(archive) as session:
+        mod = manager.install_package(session, session.variants)
+    assert mod.pictures_read and manager.settings.archive_dirs == [str(downloads)]
+    assert manager.find_archive(mod.id) == archive  # the folder it was installed from
+
+    # as a version before 1.12.0 left it: no option pictures, the archive never looked at
+    for opt in mod.options:
+        opt.pop("preview", None)
+    fsutil.rmtree(manager.mod_dir(mod.id) / "previews")
+    mod.pictures_read = False
+    manager.settings.archive_dirs = []
+    files = manager.mod_files(mod.id)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    assert manager.find_archive(mod.id) == archive  # still in Downloads
+    assert manager.read_option_pictures(mod.id, archive) == 2
+    reloaded = ModManager(manager.data_dir).get(mod.id)
+    pictures = {o["name"]: manager.option_preview(mod.id, o) for o in reloaded.options}
+    assert pictures["Red"].read_text() == "red picture" and pictures["Blue"].read_text() == "blue picture"
+    assert pictures["Green"] is None and reloaded.pictures_read
+    assert manager.mod_files(mod.id) == files  # the mod's files are not touched
+
+    # options renamed since: matched by position when no name matches
+    renamed = make_zip(tmp_path / "Renamed.zip", {
+        "C/Blau/natives/STM/a.tex": "b", "C/Blau/preview.png": "blau",
+        "C/Gruen/natives/STM/a.tex": "g",
+        "C/Rot/natives/STM/a.tex": "r", "C/Rot/preview.png": "rot",
+    })
+    assert manager.read_option_pictures(mod.id, renamed) == 2
+    pictures = [manager.option_preview(mod.id, o) for o in manager.get(mod.id).options]
+    assert [p.read_text() if p else None for p in pictures] == ["blau", None, "rot"]
+    assert sorted(f.name for f in (manager.mod_dir(mod.id) / "previews").iterdir()) == ["o1.png", "o3.png"]
+
+    # an archive of something else
+    other = make_zip(tmp_path / "Other.zip", {"Other/natives/STM/x.tex": "x", "Other/preview.png": "p"})
+    with pytest.raises(InstallError):
+        manager.read_option_pictures(mod.id, other)
+    with manager.prepare_install(other) as session:
+        single = manager.install_package(session, session.variants)
+    with pytest.raises(InstallError):
+        manager.read_option_pictures(single.id, other)
+    assert manager.find_archive(single.id) == other
+    single.source = "../escape.zip"
+    assert manager.find_archive(single.id) is None
 
 
 @pytest.fixture
