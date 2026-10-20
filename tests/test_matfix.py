@@ -15,11 +15,13 @@ from mhwmm.matfix import pak as pakmod  # noqa: E402
 from mhwmm.matfix.game import GameIndex  # noqa: E402
 from mhwmm.matfix.mdf2 import Mdf2File, assemble_mdf2, extract_material  # noqa: E402
 from mhwmm.matfix.repair import NULL_MASK, check_mod  # noqa: E402
+import test_rsz as R  # noqa: E402
 
 BODY = "natives/STM/Art/Model/Character/ch03/030/601/1/ch03_030_6011"
 LEGS = "natives/STM/Art/Model/Character/ch03/030/601/2/ch03_030_6012"
 WEAPON = "natives/STM/Art/Model/Item/it01/00/0001/it0100_0001"
 SHADER = "MaterialShader/Variation/Base_Equip.mmtr"
+AVP = "natives/STM/GameDesign/Equip/_Prefab/Armor/Female/004/000/004_000_avp.user.3"
 
 
 def material(name, textures, props, mmtr=SHADER, alpha=b"\x98\x00\x00\x88", gpbf=(("MultiBlend_BAB", "g.gpbf"),)):
@@ -85,6 +87,7 @@ def game(tmp_path):
         LEGS + ".mdf2.45": assemble_mdf2([material("legs", [("BaseDielectricMap", "Art/ch03/legs.tex")],
                                                    [("Color", (1.0,) * 4)])], 45),
         WEAPON + ".mdf2.45": assemble_mdf2(current_body()[:1], 45),
+        AVP: R.game_file(),
     })
     # the latest patch wins over the base pak; this one is chunked
     write_game_pak(root / "re_chunk_000.pak.patch_001.pak", {BODY + ".mdf2.45": assemble_mdf2(current_body(), 45)},
@@ -94,7 +97,7 @@ def game(tmp_path):
 
 def test_pak_index_layers_patches_and_caches(game, tmp_path):
     index = GameIndex(game, tmp_path / "cache")
-    assert len(index) == 3
+    assert len(index) == 4
     assert index.read(BODY + ".mdf2.45") == assemble_mdf2(current_body(), 45)  # from the chunked patch
     assert index.versioned_path(BODY.lower(), "mdf2") == BODY.lower() + ".mdf2.45"  # paths are case-insensitive
     assert index.read_versioned(BODY, "mdf2", prefer=(40,))[0].endswith(".mdf2.45")
@@ -404,3 +407,104 @@ def test_cli_checks_repairs_and_restores(library, tmp_path, capsys):
     assert "원래 재질 파일로 되돌림" in capsys.readouterr().out
     from mhwmm.manager import ModManager
     assert ModManager(library.data_dir).material_state(mod.id) == "declined"
+
+
+
+# ---- .user / .pfb files ----------------------------------------------------------
+@pytest.fixture
+def types(monkeypatch):
+    """The small registry of test_rsz instead of the bundled one."""
+    from mhwmm.matfix import rsz
+
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry())
+
+
+def old_avp(scale=2.5):
+    return R.user_file([(R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(42)]),
+                        (R.PARAM, R.OLD_CRC, R.OLD_PARAM, R.param(R.OLD_PARAM, scale=scale, hide=1))])
+
+
+def test_installed_user_file_is_repaired_and_restored(library, game, tmp_path, types, caplog):
+    shipped = old_avp()
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: shipped})
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "stale"
+    (result,) = library.material_results(mod.id)
+    assert result.kind == "user" and result.rsz == [{"label": AVP, "kind": "user", "method": "재구성"}]
+
+    assert run(library, [mod.id], repair=True) == [mod]
+    assert library.material_state(mod.id) == "repaired" and not library.material_stuck(mod.id)
+    path, key = library.mod_entries(mod.id)[AVP]
+    assert key == "matfix/" + AVP and (library.files_dir(mod.id) / AVP).read_bytes() == shipped
+    library.deploy()
+    deployed = (game / AVP).read_bytes()
+    values, info = R.fields_of(deployed)
+    assert info.insts[2] == (R.PARAM, R.NEW_CRC) and values[(2, "_Scale")] == R.f32(2.5)
+
+    assert library.restore_materials(mod.id)
+    library.deploy()
+    assert (game / AVP).read_bytes() == shipped
+
+
+def test_user_file_inside_a_mod_pak(library, game, tmp_path, types):
+    pak = tmp_path / "Lepus" / "Lepus.pak"
+    pak.parent.mkdir()
+    data = old_avp(scale=4.0)
+    pakmod.write_pak([(pakmod.path_hash(AVP), data, len(data), 0),
+                      (pakmod.path_hash("natives/STM/Art/x.tex.241106027"), b"TEX", 3, 0)], pak)
+    with library.prepare_install(pak) as session:
+        mod = library.install_package(session, session.variants)
+    run(library, repair=True)
+    assert library.material_state(mod.id) == "repaired"
+    (result,) = library.material_results(mod.id)
+    assert result.rsz[0]["method"] == "재구성" and result.rsz[0]["label"].endswith(".user")
+    fixed = pakmod.PakFile(library.mod_entries(mod.id)["Lepus.pak"][0])
+    values, info = R.fields_of(fixed.read_hash(pakmod.path_hash(AVP)))
+    assert info.insts[2] == (R.PARAM, R.NEW_CRC) and values[(2, "_Scale")] == R.f32(4.0)
+    assert fixed.read_hash(pakmod.path_hash("natives/STM/Art/x.tex.241106027")) == b"TEX"
+
+
+def test_user_file_that_cannot_be_repaired_is_reported(library, game, tmp_path, types, monkeypatch):
+    from mhwmm.matfix import rsz
+
+    extra = {format(R.EXTRA, "x"): ["4444", "app.CustomChain", R.json.dumps(R.CHILD_FIELDS)]}
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry(**extra))
+    short = R.PARAM_FIELDS[:-1]
+    shipped = R.user_file([(R.EXTRA, 0x4444, R.CHILD_FIELDS, [R.s32(1)]),
+                           (R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(42)]),
+                           (R.PARAM, R.NO_CHILD_CRC, short, R.param(short))])
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: shipped})
+    run(library, repair=True)
+    (stuck,) = library.material_stuck(mod.id)
+    assert stuck["label"] == AVP and "app.CustomChain" in stuck["reason"]
+    assert library.material_state(mod.id) == "current" and not library.repaired_materials(mod.id)
+
+
+def test_rsz_lines_in_the_log(library, game, tmp_path, types, caplog):
+    pytest.importorskip("tkinter")
+    import logging
+
+    from mhwmm import gui
+
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: old_avp()})
+    jobs = library.material_jobs([mod.id])
+    found = library.run_materials(jobs, repair=True)
+    with caplog.at_level(logging.INFO):
+        gui.App._log_materials(None, found, jobs)
+    library.finish_materials(found, jobs)
+    assert f"'Lepus' {AVP}: user 복구 (재구성)" in caplog.text
+
+
+def test_records_of_the_previous_version_are_checked_again(library, game, tmp_path, types):
+    """v1.9.0 checked only .mdf2: its records must not hide a stale .user after the update."""
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: old_avp()})
+    run(library, unchecked_only=True)
+    record = dict(library._material_record(mod.id))
+    game_now = library.game_version()
+    record.update(results=[], offered=game_now)  # what v1.9.0 left behind: no format, mdf2 results only
+    record.pop("format")
+    library._save_material_record(mod.id, record)
+    assert library.material_state(mod.id) == "unchecked"
+    assert [j.mod_id for j in library.material_jobs(unchecked_only=True)] == [mod.id]
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "stale" and library.materials_to_offer() == [mod]

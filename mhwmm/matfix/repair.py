@@ -22,13 +22,15 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import MatfixError
+from . import MatfixError, rsz
 from .donors import candidate_paths, find_donor
 from .game import GameIndex, ShaderIndex
 from .mdf2 import Mdf2File, assemble_mdf2, detect_version, extract_material, version_from_name
 from .pak import PakFile, compress_as, write_pak
 
 MDF2_RE = re.compile(r"\.mdf2\.(\d+)$", re.IGNORECASE)
+RSZ_RE = re.compile(r"\.(user|pfb|scn)\.(\d+)$", re.IGNORECASE)
+SAMPLE_PFB = 0x93538AED5435EFA9  # a game pfb MHWmodfixer checks its type registry against
 CURRENT_VERSION_HINT = 45  # what the game uses now; tried first when a pak entry has no name
 
 # A slot that is new to the mod gates an optional feature the mod never used, and the
@@ -273,20 +275,28 @@ def _patch_in_place(plan: EntryPlan, wanted: list[dict]) -> bytes | None:
 @dataclass
 class FileResult:
     key: str  # the caller's name for the file
-    rel: str  # game path of a loose .mdf2, or the pak's path
-    kind: str  # "mdf2" | "pak"
-    state: str  # "current" | "fixable" | "unresolved" | "error"
+    rel: str  # game path of a loose file, or the pak's path
+    kind: str  # "mdf2" | "user" | "pfb" | "scn" | "pak"
+    state: str  # "current" | "fixable" | "unresolved" | "stuck" | "error"
     new_rel: str | None = None  # where the repaired file goes (the version number may change)
     file: Path | None = None  # the repaired file, once written
     fixed: list[str] = field(default_factory=list)  # material names rebuilt
-    unresolved: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)  # materials left as shipped (no current shader)
     notes: list[str] = field(default_factory=list)
     error: str = ""
+    # RSZ files (.user/.pfb/.scn): the loose file itself, or each such entry of a pak:
+    # {"label", "kind", "method" ("CRC 갱신" | "재구성" | "원본 교체" | "버전 번호"), "reason" (when stuck)}
+    rsz: list[dict] = field(default_factory=list)
+
+    @property
+    def stuck(self) -> list[dict]:
+        """RSZ files that no longer fit the game and could not be repaired."""
+        return [r for r in self.rsz if r.get("reason")]
 
     def to_dict(self) -> dict:
         return {"key": self.key, "rel": self.rel, "kind": self.kind, "state": self.state,
                 "new_rel": self.new_rel, "fixed": list(self.fixed), "unresolved": list(self.unresolved),
-                "notes": list(self.notes), "error": self.error}
+                "notes": list(self.notes), "error": self.error, "rsz": [dict(r) for r in self.rsz]}
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileResult | None":
@@ -294,8 +304,9 @@ class FileResult:
             return cls(str(data["key"]), str(data["rel"]), str(data["kind"]), str(data["state"]),
                        data.get("new_rel") or None, None,
                        [str(x) for x in data.get("fixed") or []], [str(x) for x in data.get("unresolved") or []],
-                       [str(x) for x in data.get("notes") or []], str(data.get("error") or ""))
-        except (KeyError, TypeError):
+                       [str(x) for x in data.get("notes") or []], str(data.get("error") or ""),
+                       [{k: str(v) for k, v in r.items()} for r in data.get("rsz") or [] if isinstance(r, dict)])
+        except (KeyError, TypeError, AttributeError):
             return None
 
 
@@ -314,55 +325,148 @@ def _loose_unit(rel: str, data: bytes, game: GameIndex) -> EntryPlan:
 
 
 def is_material_file(rel: str) -> bool:
-    """Files check_mod looks at: loose .mdf2 and PAKs for the pak_mods folder."""
+    """Files check_mod looks at: loose .mdf2/.user/.pfb/.scn and PAKs for the pak_mods folder."""
     rel = rel.replace("\\", "/")
-    return bool(MDF2_RE.search(rel)) or (rel.lower().endswith(".pak") and "/" not in rel)
+    return bool(MDF2_RE.search(rel) or RSZ_RE.search(rel)) or (rel.lower().endswith(".pak") and "/" not in rel)
 
 
-def _pak_units(rel: str, pak: PakFile, game: GameIndex) -> list[tuple[int, EntryPlan]]:
-    units = []
+class _Rsz:
+    """The type registry and whether its CRCs are this game version's (read once per check)."""
+
+    def __init__(self, game: GameIndex):
+        self.game = game
+        self._registry = self._trust = None
+
+    @property
+    def registry(self) -> rsz.TypeRegistry:
+        if self._registry is None:
+            self._registry = rsz.TypeRegistry.load()
+        return self._registry
+
+    @property
+    def trust(self) -> bool:
+        if self._trust is None:
+            self._trust = False
+            sample = self.game.read_hash(SAMPLE_PFB)
+            info = rsz.parse(sample) if sample else None
+            if info is not None and info.types:
+                self._trust = all(self.registry.crc(t) == c for t, c in rsz.crc_map(info).items())
+        return self._trust
+
+    def plan(self, label, data, donor, provided=None):
+        return rsz.plan(label, data, donor, self.registry, provided, self.trust)
+
+
+def _rsz_item(plan: rsz.RszPlan, label: str) -> dict:
+    item = {"label": label, "kind": plan.kind, "method": plan.method}
+    if plan.state == "stuck":
+        item["reason"] = plan.reason or "안전하게 고칠 방법을 찾지 못했습니다"
+    return item
+
+
+def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: _Rsz,
+               provided) -> tuple[FileResult, bytes | None]:
+    """The result for a loose .user/.pfb/.scn file and the repaired bytes (None: nothing to write)."""
+    m = RSZ_RE.search(rel)
+    ext, version = m.group(1).lower(), int(m.group(2))
+    base = rel[:m.start()]
+    donor_path = donor = None
+    for candidate in candidate_paths(base):
+        found = game.read_versioned(candidate, ext, prefer=(version,))
+        if found is not None:
+            donor_path, donor = found
+            break
+    result = FileResult(key, rel, ext, "current")
+    p = rszs.plan(rel, data, donor, provided)
+    if p is None:
+        return result, None  # not an RSZ file after all
+    result.notes = list(p.notes)
+    new_version = int(donor_path.rsplit(".", 1)[1]) if donor_path else version
+    if p.state == "current" and new_version != version:
+        p.state, p.method, p.data = "fixable", "버전 번호", data  # the game reads another version number
+    if p.state == "stuck":
+        result.state = "stuck"
+    elif p.state == "fixable":
+        result.state, result.new_rel = "fixable", RSZ_RE.sub(f".{m.group(1)}.{new_version}", rel)
+    if p.state != "current":
+        result.rsz.append(_rsz_item(p, rel))
+    return result, (p.data if p.state == "fixable" else None)
+
+
+def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: _Rsz):
+    """(mdf2 units, RSZ plans) of a mod pak's entries."""
+    units, plans = [], []
     for i, h in enumerate(pak.hashes):
         try:
-            if pak.head(i) != b"MDF\x00":  # textures and meshes: skip without reading them
+            head = pak.head(i)
+            if head != b"MDF\x00" and head not in rsz.MAGICS:  # textures and meshes: skip without reading them
                 continue
             raw = pak.read(i)
-        except MatfixError:  # an entry encrypted on its own: not a material we can read
+        except MatfixError:  # an entry encrypted on its own: nothing we can read
+            continue
+        label = f"{rel}#{h:016X}"
+        if head in rsz.MAGICS:
+            p = rszs.plan(f"{label}.{rsz.MAGICS[head]}", raw, game.read_hash(h))
+            if p is not None and p.state != "current":
+                plans.append((h, p))
             continue
         version = detect_version(raw, prefer=CURRENT_VERSION_HINT)
         if version is None:
             continue
         donor = game.read_hash(h)
         donor_version = detect_version(donor, prefer=version) if donor is not None else None
-        label = f"{rel}#{h:016X}"
         units.append((h, EntryPlan(label, raw, version, label if donor else None, donor, donor_version)))
-    return units
+    return units, plans
 
 
 def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: ShaderIndex | None,
-              out=None, progress=None) -> list[FileResult]:
+              out=None, progress=None, provided: set[str] | None = None) -> list[FileResult]:
     """Look at (key, game path, stored file) of one mod. With ``out`` (result -> path)
-    the repaired files are also written there. Files other than .mdf2 and .pak are ignored."""
+    the repaired files are also written there. ``provided``: lower-cased names (without
+    version number) of every file the mod ships, for mods in custom character slots.
+    Files other than .mdf2, .user, .pfb, .scn and .pak are ignored."""
     progress = progress or (lambda done, total, msg: None)
     whole_game = shaders.find if shaders is not None else None
+    rszs = _Rsz(game)
     results: list[FileResult] = []
+    rsz_files: list[tuple[FileResult, bytes | None]] = []
     loose: list[tuple[str, EntryPlan]] = []
-    paks: list[tuple[str, str, PakFile, list[tuple[int, EntryPlan]]]] = []
+    paks: list[tuple[str, str, PakFile, list[tuple[int, EntryPlan]], list]] = []
     for key, rel, path in files:
         if not is_material_file(rel):
             continue
         try:
             if MDF2_RE.search(rel):
                 loose.append((key, _loose_unit(rel, path.read_bytes(), game)))
+            elif RSZ_RE.search(rel):
+                rsz_files.append(_rsz_loose(key, rel, path.read_bytes(), game, rszs, provided))
             else:
                 pak = PakFile(path)
-                units = _pak_units(rel, pak, game)
-                if units:
-                    paks.append((key, rel, pak, units))
+                units, plans = _pak_units(rel, pak, game, rszs)
+                if units or plans:
+                    paks.append((key, rel, pak, units, plans))
         except Exception as exc:  # one unreadable file must not stop the rest
-            results.append(FileResult(key, rel, "mdf2" if MDF2_RE.search(rel) else "pak", "error",
-                                      error=str(exc)))
-    units = [u for _, u in loose] + [u for *_, us in paks for _, u in us]
+            m = RSZ_RE.search(rel)
+            kind = "mdf2" if MDF2_RE.search(rel) else (m.group(1).lower() if m else "pak")
+            results.append(FileResult(key, rel, kind, "error", error=str(exc)))
+    units = [u for _, u in loose] + [u for *_, us, _ps in paks for _, u in us]
     plan_entries(units, whole_game, progress)
+
+    def write(result: FileResult, make) -> None:
+        if out is None:
+            return
+        try:
+            target = Path(out(result))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            make(target)
+            result.file = target
+        except Exception as exc:
+            result.state, result.error = "error", str(exc)
+
+    for result, data in rsz_files:
+        if result.state == "fixable":
+            write(result, lambda target, data=data: target.write_bytes(data))
+        results.append(result)
 
     for key, unit in loose:
         result = FileResult(key, unit.label, "mdf2", "current", notes=unit.notes, unresolved=unit.unresolved)
@@ -372,36 +476,31 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
             result.state = "fixable"
             result.new_rel = MDF2_RE.sub(f".mdf2.{unit.out_version}", unit.label)
             result.fixed = [m.mod["name"] for m in unit.stale]
-            if out is not None:
-                try:
-                    data, _ = build_entry(unit)
-                    target = Path(out(result))
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(data)
-                    result.file = target
-                except Exception as exc:
-                    result.state, result.error = "error", str(exc)
+            write(result, lambda target, unit=unit: target.write_bytes(build_entry(unit)[0]))
         elif unit.unresolved:
             result.state = "unresolved"
         results.append(result)
 
-    for key, rel, pak, entries in paks:
+    for key, rel, pak, entries, plans in paks:
         result = FileResult(key, rel, "pak", "current")
         for _h, unit in entries:
             result.notes += unit.notes + ([unit.error] if unit.error else [])
             result.unresolved += unit.unresolved
             result.fixed += [m.mod["name"] for m in unit.stale]
+        for _h, p in plans:
+            result.rsz.append(_rsz_item(p, p.label))
+            result.notes += [f"{p.label}: {n}" for n in p.notes]
         work = [(h, u) for h, u in entries if u.needs_work]
-        if work:
+        fixed_rsz = {h: p.data for h, p in plans if p.state == "fixable"}
+        if work or fixed_rsz:
             result.state, result.new_rel = "fixable", rel
-            if out is not None:
-                try:
-                    target = Path(out(result))
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    _rebuild_pak(pak, {h: build_entry(u)[0] for h, u in work}, target)
-                    result.file = target
-                except Exception as exc:
-                    result.state, result.error = "error", str(exc)
+
+            def make(target, pak=pak, work=work, fixed_rsz=fixed_rsz):
+                _rebuild_pak(pak, {**fixed_rsz, **{h: build_entry(u)[0] for h, u in work}}, target)
+
+            write(result, make)
+        elif result.stuck:
+            result.state = "stuck"
         elif result.unresolved:
             result.state = "unresolved"
         results.append(result)

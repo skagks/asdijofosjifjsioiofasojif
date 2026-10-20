@@ -27,6 +27,7 @@
   - `mhwmm/deploy.py`: 게임 폴더 적용·해제, PAK 모드 pak_mods 배치, 원본 백업
   - `mhwmm/manager.py`: 모드 목록·옵션·설정·설치, 재질 점검·복구 기록(`mods/<id>/matfix.json`, 고친 파일은 `matfix/`)
   - `mhwmm/matfix/`: 재질(.mdf2) 복구 (MHWmodfixer 기반, MIT). `pak.py` 게임 pak 읽기·모드 pak 쓰기, `game.py` 게임 파일 색인,
-    `mdf2.py` 재질 파일, `donors.py` 현재 재질 찾기, `repair.py` 점검·복구. 테스트에 zstandard 필요
+    `mdf2.py` 재질 파일, `donors.py` 현재 재질 찾기, `repair.py` 점검·복구, `rsz.py` .user/.pfb/.scn 복구
+    (타입 정보 `rsz_types.json.xz`는 `tools/make_rsz_types.py`로 REasy 덤프 기록에서 만듦). 테스트에 zstandard 필요
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

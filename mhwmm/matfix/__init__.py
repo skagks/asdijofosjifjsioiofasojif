@@ -1,4 +1,5 @@
-"""Repair costume mods whose materials (.mdf2) went stale after a game update.
+"""Repair costume mods whose materials (.mdf2) or RSZ files (.user/.pfb/.scn) went stale
+after a game update.
 
 When Capcom changes a material's layout (new texture slots or shader parameters, a
 new file version), a mod built against the old layout shows wrong colours or
@@ -14,8 +15,14 @@ alphaZomega and others), and the donor matching and override rules it found thro
 in-game testing.  Changes here: mods are repaired where they are installed and the
 originals are kept (a repair always starts again from them), materials are patched
 in place whenever one current file matches the mod's file, and that path keeps the
-mod's shader parameters and render state too.  RSZ (.pfb/.user/.scn) repair and the
-retargeting tools are not included.
+mod's shader parameters and render state too.  RSZ files follow its order of fixes
+(CRC only, rebuild, the game's own file) but read a mod's instances with the layout they
+were written with, from the history of REasy's type dumps (see rsz.py), so a rebuild keeps
+every value the mod set.  The retargeting tools are not included.
+
+The RSZ type registry (rsz_types.json.xz, tools/make_rsz_types.py) is made from REasy by
+Battlezone, MIT License: https://github.com/seifhassine/REasy - resources/data/dumps/
+rszmhwilds.json and its history - and from MHWmodfixer's tools/rsz_fields_mhwilds.json.gz.
 
     MIT License
 
@@ -38,11 +45,34 @@ retargeting tools are not included.
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
+
+    MIT License
+
+    Copyright (c) 2025 Battlezone
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
 """
 
 from __future__ import annotations
 
-CREDIT = "재질 복구는 MHWmodfixer(Littlefish, MIT 라이선스)를 바탕으로 만들었습니다."
+CREDIT = ("재질 복구는 MHWmodfixer(Littlefish, MIT 라이선스)를, .user·.pfb 형식 정보는 "
+          "REasy(Battlezone, MIT 라이선스)를 바탕으로 만들었습니다.")
 
 
 class MatfixError(Exception):

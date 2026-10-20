@@ -364,9 +364,16 @@ def cmd_materials(manager: ModManager, args) -> int:
             if r.state == "error":
                 failed += 1
                 print(f"     {r.rel}: 오류 - {r.error}")
-            elif r.state == "fixable":
-                moved = f"  ->  {r.new_rel}" if r.new_rel != r.rel else ""
-                print(f"     {r.rel}: {', '.join(r.fixed) or '버전 번호'}{moved}")
+            elif r.state == "fixable" and (r.fixed or r.kind == "mdf2"):
+                moved = f"  ->  {r.new_rel}" if r.new_rel != r.rel and not r.rsz else ""
+                print(f"     {r.rel}: 재질 {', '.join(r.fixed) or '버전 번호'}{moved}")
+            for item in r.rsz:
+                if item.get("reason"):
+                    failed += 1
+                    print(f"     {item['label']}: {item['kind']} 복구 불가 - {item['reason']}")
+                elif r.state != "error":
+                    moved = f"  ->  {r.new_rel}" if r.kind != "pak" and r.new_rel != r.rel else ""
+                    print(f"     {item['label']}: {item['kind']} {'복구' if repair else '복구 필요'} ({item['method']}){moved}")
             if r.unresolved:
                 print(f"     {r.rel}: 같은 셰이더를 찾지 못해 그대로 둔 재질 - {', '.join(r.unresolved)}")
     if not repair and any(manager.material_state(j.mod_id) == "stale" for j in jobs):

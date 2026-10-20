@@ -616,10 +616,20 @@ def material_summary(results: list) -> str:
     parts = [f"파일 {len(fixable)}개"]
     if names:
         parts.append("재질 " + ", ".join(names[:5]) + (f" 외 {len(names) - 5}개" if len(names) > 5 else ""))
+    items = [i for r in fixable for i in r.rsz if not i.get("reason")]
+    if items:
+        kinds = sorted({i["kind"] for i in items})
+        methods = sorted({i["method"] for i in items})
+        parts.append(f"{'·'.join('.' + k for k in kinds)} {len(items)}개 ({', '.join(methods)})")
     renamed = sum(1 for r in fixable if r.new_rel and r.new_rel != r.rel)
     if renamed:
         parts.append(f"버전 번호를 바꿀 파일 {renamed}개")
     return " · ".join(parts)
+
+
+def stuck_summary(stuck: list[dict]) -> str:
+    kinds = sorted({"." + i.get("kind", "") for i in stuck})
+    return f"{'·'.join(kinds)} 파일 {len(stuck)}개"
 
 
 class MaterialsDialog(Dialog):
@@ -629,11 +639,11 @@ class MaterialsDialog(Dialog):
         super().__init__(parent, theme, "재질 복구")
         px = theme.px
         self.mods = mods
-        ttk.Label(self.body, text="재질이 현재 게임과 맞지 않는 모드", style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.body, text="게임 업데이트로 재질(.mdf2) 구조가 바뀌어 아래 모드는 텍스처가 깨지거나 검게·하얗게 보일 "
-                                  "수 있습니다. 복구하면 현재 게임의 재질 구조에 모드의 텍스처와 설정을 옮겨 담은 파일을 "
-                                  "대신 적용합니다. 모드의 원래 파일은 그대로 두므로 언제든 되돌릴 수 있고, 나중에 고치려면 "
-                                  "모드를 오른쪽 클릭해 '재질 복구'를 고르세요.",
+        ttk.Label(self.body, text="현재 게임과 맞지 않는 모드", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.body, text="게임 업데이트로 재질(.mdf2)이나 .user·.pfb 파일의 구조가 바뀌어, 아래 모드는 텍스처가 "
+                                  "깨지거나 게임이 검은 화면에서 멈출 수 있습니다. 복구하면 현재 게임의 구조에 모드의 내용을 "
+                                  "옮겨 담은 파일을 대신 적용합니다. 모드의 원래 파일은 그대로 두므로 언제든 되돌릴 수 있고, "
+                                  "나중에 고치려면 모드를 오른쪽 클릭해 '재질 복구'를 고르세요.",
                   style="Muted.TLabel", wraplength=px(580), justify="left").pack(anchor="w", pady=(px(4), px(10)))
         card = theme.mark(tk.Frame(self.body), "card")
         card.pack(fill="both", expand=True)
@@ -652,8 +662,8 @@ class MaterialsDialog(Dialog):
         sb = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=autohide(sb, side="right", fill="y"))
         self.tree.pack(side="left", fill="both", expand=True)
-        ttk.Label(self.body, text=matfix.CREDIT, style="Muted.TLabel", font=theme.fonts["small"]).pack(
-            anchor="w", pady=(px(10), 0))
+        ttk.Label(self.body, text=matfix.CREDIT, style="Muted.TLabel", font=theme.fonts["small"],
+                  wraplength=px(580), justify="left").pack(anchor="w", pady=(px(10), 0))
         self.buttons("선택한 모드 복구", self.ok, "나중에")
 
     def _toggle(self, event):
@@ -1828,7 +1838,11 @@ class App:
             if mod.id in missing:
                 reasons.append("필요한 모드가 없거나 꺼져 있습니다: " + ", ".join(r["name"] for r in missing[mod.id]))
             if self.manager.material_state(mod.id) == "stale":
-                reasons.append("재질이 현재 게임과 맞지 않아 텍스처가 이상하게 보일 수 있습니다 (오른쪽 클릭 → 재질 복구)")
+                reasons.append("재질이나 .user·.pfb 파일이 현재 게임과 맞지 않습니다 (오른쪽 클릭 → 재질 복구)")
+            stuck = self.manager.material_stuck(mod.id)
+            if stuck:
+                reasons.append(f"현재 게임과 맞지 않지만 고칠 수 없는 {stuck_summary(stuck)}이 있어 게임이 멈출 수 "
+                               "있습니다 (정보 탭 참고)")
             if reasons:
                 problems[mod.id] = reasons
         for mod in self.manager.hidden_mods(self._conflicts):
@@ -1950,6 +1964,7 @@ class App:
                 checked = time.strftime("%Y-%m-%d %H:%M", time.localtime(mod.nexus_checked))
                 chunks.append((f"   {checked} 확인", ("value", "muted")))
             chunks.append(("\n", "value"))
+        stuck = m.material_stuck(mod.id)
         if material != "none":
             results = m.material_results(mod.id)
             repaired = len(m.repaired_materials(mod.id))
@@ -1959,6 +1974,8 @@ class App:
                     chunks += [("아직 점검하지 않음   ", ("value", "muted")), ("지금 점검", ("value", "link", "matfix_check"))]
                 else:
                     chunks.append(("점검할 수 없음 (zstd 모듈 없음)", ("value", "muted")))
+            elif material == "current" and stuck:
+                chunks += [("✕ ", ("value", "req_missing")), (f"고칠 수 없는 {stuck_summary(stuck)}", "value")]
             elif material == "current":
                 chunks += [("현재 게임과 맞음", "value")]
             elif material == "stale":
@@ -1974,6 +1991,8 @@ class App:
             chunks.append(("\n", "value"))
             if material in ("stale", "repaired", "declined"):
                 chunks.append(("\t" + material_summary(results) + "\n", ("value", "muted")))
+            if stuck and material != "current":
+                chunks += [("\t✕ ", ("value", "req_missing")), (f"고칠 수 없는 {stuck_summary(stuck)}\n", "value")]
             errors = sum(1 for r in results if r.state == "error")
             if errors:
                 chunks.append((f"\t읽지 못한 파일 {errors}개 (자세한 내용은 로그)\n", ("value", "muted")))
@@ -1991,10 +2010,16 @@ class App:
                        (f"{names} — 설치하거나 켜야 이 모드가 제대로 작동합니다. 위 '필요한 모드'의 이름을 누르면 "
                         "Nexus 페이지가 열립니다.\n", "warn")]
         if material == "stale":
-            chunks += [("\n", None), ("재질이 현재 게임과 맞지 않습니다\n", ("warn", "warn_title")),
-                       ("게임 업데이트로 재질(.mdf2) 구조가 바뀌어 텍스처가 깨지거나 검게·하얗게 보일 수 있습니다. "
-                        "위 '재질 복구'를 누르면 모드의 텍스처와 설정을 현재 게임의 재질 구조에 옮겨 담은 파일을 대신 "
-                        "적용합니다. 모드의 원래 파일은 그대로 둡니다.\n", "warn")]
+            chunks += [("\n", None), ("현재 게임과 맞지 않는 파일이 있습니다\n", ("warn", "warn_title")),
+                       ("게임 업데이트로 재질(.mdf2)이나 .user·.pfb 파일의 구조가 바뀌어 텍스처가 깨지거나 게임이 "
+                        "검은 화면에서 멈출 수 있습니다. 위 '재질 복구'를 누르면 모드의 내용을 현재 게임의 구조에 옮겨 "
+                        "담은 파일을 대신 적용합니다. 모드의 원래 파일은 그대로 둡니다.\n", "warn")]
+        if stuck:
+            shown = "\n".join(f"• {i['label'].rsplit('/', 1)[-1]}: {i['reason']}" for i in stuck[:4])
+            more = f"\n… 외 {len(stuck) - 4}개" if len(stuck) > 4 else ""
+            chunks += [("\n", None), ("고칠 수 없는 파일이 있습니다\n", ("warn", "warn_title")),
+                       ("현재 게임과 맞지 않지만 안전하게 고칠 방법을 찾지 못해 그대로 둔 파일입니다. 게임이 검은 화면에서 "
+                        f"멈추면 이 모드를 끄고 모드 업데이트를 확인하세요.\n{shown}{more}\n", "warn")]
         if mod.needs_option:
             chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
                        ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
@@ -2981,14 +3006,27 @@ class App:
         for mod_id, results in run.results.items():
             for r in results:
                 where = f"'{names[mod_id]}' {r.rel}"
-                what = ", ".join(r.fixed) or "버전 번호"
+                moved = f" → {r.new_rel}" if r.new_rel and r.new_rel != r.rel else ""
                 if r.state == "error":
                     log.warning("%s: 읽거나 고치지 못했습니다: %s", where, r.error)
-                elif r.state == "fixable" and run.repair:
-                    moved = f" → {r.new_rel}" if r.new_rel != r.rel else ""
-                    log.info("%s: 재질을 복구했습니다 (%s)%s", where, what, moved)
-                elif r.state == "fixable":
-                    log.warning("%s: 재질이 현재 게임과 맞지 않습니다 (%s)", where, what)
+                elif r.state == "fixable" and (r.fixed or r.kind == "mdf2"):
+                    what = ", ".join(r.fixed) or "버전 번호"
+                    if run.repair:
+                        log.info("%s: 재질을 복구했습니다 (%s)%s", where, what, "" if r.rsz else moved)
+                    else:
+                        log.warning("%s: 재질이 현재 게임과 맞지 않습니다 (%s)", where, what)
+                for item in r.rsz:
+                    target = f"'{names[mod_id]}' {item['label']}"
+                    if item.get("reason"):
+                        log.warning("%s: %s 복구 불가 (%s)", target, item["kind"], item["reason"])
+                    elif r.state == "error":
+                        continue
+                    elif run.repair:
+                        log.info("%s: %s 복구 (%s)%s", target, item["kind"], item["method"],
+                                 moved if r.kind != "pak" else "")
+                    else:
+                        log.warning("%s: %s 파일이 현재 게임과 맞지 않습니다 (%s(으)로 고칠 수 있음)", target,
+                                    item["kind"], item["method"])
                 if r.unresolved:
                     log.info("%s: 현재 게임에서 같은 셰이더를 찾지 못해 그대로 둔 재질: %s", where, ", ".join(r.unresolved))
                 if run.repair:
@@ -3021,12 +3059,16 @@ class App:
                 return
             repaired = sum(1 for j in jobs if m.material_state(j.mod_id) == "repaired")
             failed = len(run.errors) + sum(1 for rs in run.results.values() for r in rs if r.state == "error")
-            text = f"모드 {len(jobs)}개를 점검했습니다. 현재 게임과 맞지 않는 재질이 없습니다."
+            stuck = [j.name for j in jobs if m.material_stuck(j.mod_id)]
+            text = f"모드 {len(jobs)}개를 점검했습니다. 복구할 파일이 없습니다."
             if repaired:
                 text += f"\n(이미 복구한 모드 {repaired}개 포함)"
+            if stuck:
+                text += (f"\n\n현재 게임과 맞지 않지만 고칠 수 없는 파일이 있는 모드: {', '.join(stuck[:5])}"
+                         f"{' 외' if len(stuck) > 5 else ''} — 게임이 멈추면 이 모드를 끄고 업데이트를 확인하세요.")
             if failed:
                 text += f"\n\n읽지 못한 파일 {failed}개가 있습니다. 자세한 내용은 로그를 보세요."
-            messagebox.showinfo("재질 점검", text, parent=self.root)
+            (messagebox.showwarning if stuck else messagebox.showinfo)("재질 점검", text, parent=self.root)
 
         self.run_task("matfix", "재질 점검 준비 중...", lambda p: m.run_materials(jobs, progress=p), on_done=done)
 
@@ -3051,8 +3093,10 @@ class App:
                         "그대로 있습니다. 문제가 생기면 모드를 오른쪽 클릭해 '원래 재질로 되돌리기'를 고르세요.")
             else:
                 text = "복구한 모드가 없습니다."
+            stuck = sum(len(m.material_stuck(j.mod_id)) for j in jobs)
+            failed += stuck
             if failed:
-                text += f"\n\n복구하지 못한 파일 {failed}개가 있습니다. 자세한 내용은 로그를 보세요."
+                text += f"\n\n복구하지 못한 파일 {failed}개가 있습니다. 자세한 내용은 정보 탭과 로그를 보세요."
             (messagebox.showinfo if fixed and not failed else messagebox.showwarning)("재질 복구", text, parent=self.root)
 
         self.run_task("matfix", "재질 복구 준비 중...", lambda p: m.run_materials(jobs, repair=True, progress=p),

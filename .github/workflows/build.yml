@@ -37,7 +37,7 @@ jobs:
       - run: >
           pyinstaller --noconfirm --clean --onefile --windowed
           --name MHWildsModManager --icon assets/icon.ico --collect-all tkinterdnd2
-          --collect-submodules zstandard
+          --collect-submodules zstandard --add-data "mhwmm/matfix/rsz_types.json.xz;mhwmm/matfix"
           MHWildsModManager.pyw
       - uses: actions/upload-artifact@v4
         with:

@@ -7,6 +7,7 @@ import itertools
 import logging
 import logging.handlers
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,9 +23,9 @@ from .analyzer import Variant, analyze, classify, list_files, package_name, raw_
 from .archive import extract, is_archive
 from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_URL, REFW_ORIGIN
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
-from .matfix import MatfixError
+from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
-from .matfix.repair import MDF2_RE, FileResult, check_mod, is_material_file
+from .matfix.repair import FileResult, check_mod, is_material_file
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ DEFAULT_PROFILE = "기본"
 MAX_PROFILE_NAME = 40
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
+MATFIX_FORMAT = 2  # 2: .user/.pfb/.scn are checked too; records of an older check count as unchecked
+VERSIONED_RE = re.compile(r"\.(mdf2|user|pfb|scn)\.(\d+)$", re.IGNORECASE)  # the game reads one version number
 
 
 class InstallError(Exception):
@@ -368,6 +371,7 @@ class MaterialJob:
     name: str
     stamp: str  # changes when the mod is reinstalled
     files: list  # [(source key, game path, original file)]
+    provided: set = field(default_factory=set)  # names of all the mod's files (no version number), lower case
     stage: Path | None = None  # where the repaired files are written (repairs only)
 
 
@@ -969,8 +973,9 @@ class ModManager:
         return self._game_version[1]
 
     def material_files(self, mod_id: str) -> list[tuple[str, str, Path]]:
-        """(source key, game path, original file) of the mod's materials (.mdf2) and PAKs, every option
-        included. Of several versions of one material only the newest counts: the game reads one of them."""
+        """(source key, game path, original file) of the mod's materials (.mdf2), RSZ files (.user, .pfb,
+        .scn) and PAKs, every option included. Of several versions of one file only the newest counts:
+        the game reads one of them."""
         cached = self._material_cache.get(mod_id)
         if cached is not None:
             return cached
@@ -982,17 +987,17 @@ class ModManager:
             scopes = [("", self.files_dir(mod_id), list_files(self.files_dir(mod_id)))]
         found = []
         for prefix, base, rels in scopes:
-            newest: dict[str, tuple[int, str]] = {}
+            newest: dict[tuple[str, str], tuple[int, str]] = {}
             for rel in rels:
                 if not is_material_file(rel):
                     continue
-                m = MDF2_RE.search(rel)
+                m = VERSIONED_RE.search(rel)
                 if m is None:
                     found.append((prefix + rel, rel, base / rel))
                     continue
-                stem = path_key(rel[:m.start()])
-                if stem not in newest or int(m.group(1)) > newest[stem][0]:
-                    newest[stem] = (int(m.group(1)), rel)
+                stem = (path_key(rel[:m.start()]), m.group(1).lower())
+                if stem not in newest or int(m.group(2)) > newest[stem][0]:
+                    newest[stem] = (int(m.group(2)), rel)
             found += [(prefix + rel, rel, base / rel) for _, rel in newest.values()]
         self._material_cache[mod_id] = found
         return found
@@ -1027,6 +1032,13 @@ class ModManager:
         found = [FileResult.from_dict(r) for r in results if isinstance(r, dict)] if isinstance(results, list) else []
         return [r for r in found if r is not None]
 
+    def material_stuck(self, mod_id: str) -> list[dict]:
+        """RSZ files (.user/.pfb/.scn) that no longer fit this game version and could not be repaired:
+        [{"label", "kind", "reason"}] (empty unless checked against the current game)."""
+        if self.material_state(mod_id) in ("none", "unchecked"):
+            return []
+        return [item for r in self.material_results(mod_id) for item in r.stuck]
+
     def material_state(self, mod_id: str) -> str:
         """"none" (no materials or PAKs), "unchecked" (not against this game version), "current",
         "stale" (outdated materials, not repaired), "repaired" or "declined" (the user undid the repair)."""
@@ -1034,7 +1046,7 @@ class ModManager:
             return "none"
         record = self._material_record(mod_id)
         game = self.game_version()
-        if not game or record.get("game") != game:
+        if not game or record.get("game") != game or record.get("format", 1) < MATFIX_FORMAT:
             return "unchecked"
         fixable = {r.key for r in self.material_results(mod_id) if r.state == "fixable"}
         if not fixable:
@@ -1046,17 +1058,20 @@ class ModManager:
     def stale_material_mods(self, enabled_only: bool = False) -> list[Mod]:
         return [m for m in self.mods if (m.enabled or not enabled_only) and self.material_state(m.id) == "stale"]
 
+    def _offer_key(self) -> str:
+        return f"{self.game_version()}/{MATFIX_FORMAT}"
+
     def materials_to_offer(self) -> list[Mod]:
         """Stale mods not yet offered for repair for this game version (offered once, see mark_offered)."""
-        game = self.game_version()
-        return [m for m in self.stale_material_mods() if self._material_record(m.id).get("offered") != game]
+        key = self._offer_key()
+        return [m for m in self.stale_material_mods() if self._material_record(m.id).get("offered") != key]
 
     def mark_materials_offered(self, mods: list[Mod]) -> None:
-        game = self.game_version()
+        key = self._offer_key()
         for m in mods:
             record = dict(self._material_record(m.id))
-            if record.get("offered") != game:
-                record["offered"] = game
+            if record.get("offered") != key:
+                record["offered"] = key
                 self._save_material_record(m.id, record)
 
     @staticmethod
@@ -1073,7 +1088,9 @@ class ModManager:
             mod = self.get(mod_id)
             files = self.material_files(mod_id)
             if files and not (unchecked_only and self.material_state(mod_id) != "unchecked"):
-                jobs.append(MaterialJob(mod_id, mod.name, self._stamp(mod), list(files)))
+                provided = {re.sub(r"\.\d+$", "", Path(rel).name).lower()  # as resource paths name them
+                            for rel in self._stored_files(self.mod_dir(mod_id))}
+                jobs.append(MaterialJob(mod_id, mod.name, self._stamp(mod), list(files), provided))
         return jobs
 
     def run_materials(self, jobs: list[MaterialJob], repair: bool = False,
@@ -1091,21 +1108,27 @@ class ModManager:
         shaders = ShaderIndex(game, progress)
         run = MaterialRun(game.fingerprint, repair)
         verb = "복구" if repair else "점검"
+        try:
+            self._run_jobs(jobs, game, shaders, run, verb, progress)
+        finally:
+            rsz.TypeRegistry.release()
+        progress(len(jobs), len(jobs), f"재질 {verb}을 마쳤습니다")
+        return run
+
+    def _run_jobs(self, jobs, game, shaders, run, verb, progress) -> None:
         for n, job in enumerate(jobs):
             progress(n, len(jobs), f"재질 {verb} 중... {job.name}")
             out = None
-            if repair:
+            if run.repair:
                 job.stage = self.temp_root / f"matfix-{job.mod_id}-{uuid.uuid4().hex[:6]}"
                 numbers = itertools.count(1)
                 out = lambda result, stage=job.stage, numbers=numbers: \
                     stage / f"{next(numbers):03d}_{result.new_rel.rsplit('/', 1)[-1]}"
             try:
-                run.results[job.mod_id] = check_mod(job.files, game, shaders, out)
+                run.results[job.mod_id] = check_mod(job.files, game, shaders, out, provided=job.provided)
             except Exception as exc:  # one broken mod must not stop the others
                 log.warning("%s: 재질을 %s하지 못했습니다: %s", job.name, verb, exc)
                 run.errors[job.mod_id] = str(exc)
-        progress(len(jobs), len(jobs), f"재질 {verb}을 마쳤습니다")
-        return run
 
     def finish_materials(self, run: MaterialRun, jobs: list[MaterialJob]) -> list[Mod]:
         """Store what a run found; a repair also switches the mods to their repaired files.
@@ -1123,7 +1146,7 @@ class ModManager:
                 if mod is None or results is None or self._stamp(mod) != job.stamp:
                     continue  # removed or reinstalled meanwhile, or could not be read
                 record = dict(self._material_record(mod.id))
-                record.update(game=run.game, checked=now, results=[r.to_dict() for r in results])
+                record.update(game=run.game, format=MATFIX_FORMAT, checked=now, results=[r.to_dict() for r in results])
                 had = bool(self.repaired_materials(mod.id))
                 target = self.mod_dir(mod.id) / MATFIX_DIR
                 if run.repair:

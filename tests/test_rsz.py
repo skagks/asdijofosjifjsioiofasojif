@@ -1,0 +1,280 @@
+"""RSZ (.user/.pfb) repair against a small registry: CRC-only updates, rebuilding with an
+older layout from the history, falling back to the game's own file, and refusing."""
+
+import json
+import struct
+
+from mhwmm.matfix import rsz
+
+PARAM, CHILD, EXTRA = 0xA1, 0xB1, 0xC1
+PARAM_NAME = "app.user_data.TestArmorParam"
+OLD_CRC, NEW_CRC = 0x1111, 0x2222
+NO_CHILD_CRC = 0x1110  # a version before _Child existed
+CHILD_OLD, CHILD_CRC = 0x3330, 0x3333
+
+PARAM_FIELDS = [["_Scale", "F32", 4, 4, 0], ["_HideHair", "Bool", 1, 1, 0], ["_NewFlag", "Bool", 1, 1, 0],
+                ["_Mesh", "String", 4, 4, 0], ["_PartsOff", "S32", 4, 4, 1], ["_Child", "Object", 4, 4, 0]]
+OLD_PARAM = [f for f in PARAM_FIELDS if f[0] != "_NewFlag"]
+CHILD_FIELDS = [["_Value", "S32", 4, 4, 0]]
+
+
+def registry(**extra) -> rsz.TypeRegistry:
+    types = {format(PARAM, "x"): [format(NEW_CRC, "x"), PARAM_NAME, json.dumps(PARAM_FIELDS)],
+             format(CHILD, "x"): [format(CHILD_CRC, "x"), "app.TestChild", json.dumps(CHILD_FIELDS)]}
+    types.update(extra)
+    return rsz.TypeRegistry({"types": types, "empty": {}, "alt": {},
+                             "old": {format(PARAM, "x"): {format(OLD_CRC, "x"): json.dumps(OLD_PARAM),
+                                                          format(NO_CHILD_CRC, "x"): json.dumps(PARAM_FIELDS[:-1])}}})
+
+
+def s32(v):
+    return struct.pack("<i", v)
+
+
+def f32(v):
+    return struct.pack("<f", v)
+
+
+def text(s):
+    s += "\0"
+    return struct.pack("<I", len(s)) + s.encode("utf-16-le")
+
+
+def encode(fields, values, base):
+    out = bytearray()
+    reg = registry()
+    rsz.write_values(out, base, [tuple(f) for f in fields], values, rsz.Schema(), reg)
+    return bytes(out)
+
+
+def user_file(instances, resources=("Art/Model/armor.mesh",)) -> bytes:
+    """A .user file: [(type id, crc, fields, values)] (the null instance is added first);
+    fields None marks a reference to another .user file (no data of its own)."""
+    strings = b"".join(r.encode("utf-16-le") + b"\0\0" for r in resources)
+    header_size = 48
+    res_table = header_size
+    str_start = res_table + 8 * len(resources)
+    rsz_off = (str_start + len(strings) + 15) // 16 * 16
+    header = struct.pack("<4s3I3QQ", b"USR\0", len(resources), 0, 1, res_table, 0, rsz_off, 0)
+    table = b""
+    pos = str_start
+    for r in resources:
+        table += struct.pack("<Q", pos)
+        pos += (len(r) + 1) * 2
+    count = len(instances) + 1
+    external = [i + 1 for i, inst in enumerate(instances) if inst[2] is None]
+    inst_off = 48 + 16  # RSZ header, object table (one root, padded)
+    user_off = (inst_off + count * 8 + 15) // 16 * 16
+    data_off = (user_off + 16 * len(external) + 15) // 16 * 16
+    block = bytearray(struct.pack("<4sIIIII", b"RSZ\0", 16, 1, count, len(external), 0))
+    block += struct.pack("<QQQ", inst_off, data_off, user_off)
+    block += struct.pack("<i", count - 1).ljust(16, b"\0")
+    block += struct.pack("<II", 0, 0)
+    for t, c, _f, _v in instances:
+        block += struct.pack("<II", t, c)
+    block = block.ljust(user_off, b"\0")
+    for i in external:
+        block += struct.pack("<iIQ", i, instances[i - 1][0], 0)
+    block = block.ljust(data_off, b"\0")
+    data = bytearray()
+    for _t, _c, fields, values in instances:
+        if fields is not None:
+            data += encode(fields, values, rsz_off + data_off + len(data))
+    return (header + table + strings).ljust(rsz_off, b"\0") + bytes(block) + bytes(data)
+
+
+def param(fields, scale=1.0, hide=1, new=0, mesh="Art/Model/armor.mesh", parts=(3, 4), child=1):
+    values = {"_Scale": f32(scale), "_HideHair": bytes([hide]), "_NewFlag": bytes([new]), "_Mesh": text(mesh),
+              "_PartsOff": [s32(p) for p in parts], "_Child": s32(child)}
+    return [values[f[0]] for f in fields]
+
+
+def fields_of(data):
+    info = rsz.parse(data)
+    walked, _clean = rsz.walk_current(info, rsz.Schema(), registry())
+    return {(i.index, f[0]): v for i in walked if i.fields for f, v in zip(i.fields, i.values)}, info
+
+
+def game_file(**kw):
+    return user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(7)]),
+                      (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, scale=1.0, hide=0, new=1, **kw))])
+
+
+def test_current_file_is_left_alone():
+    plan = rsz.plan("a.user.3", game_file(), game_file(), registry())
+    assert plan.state == "current" and plan.data is None
+
+
+def test_only_the_crc_changed():
+    mod = user_file([(CHILD, CHILD_OLD, CHILD_FIELDS, [s32(42)]),
+                     (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, scale=2.5))])
+    plan = rsz.plan("a.user.3", mod, game_file(), registry())
+    assert (plan.state, plan.method) == ("fixable", "CRC 갱신")
+    changed = [i for i, (a, b) in enumerate(zip(mod, plan.data)) if a != b]
+    info = rsz.parse(mod)
+    assert changed and all(info.inst_table + 8 + 4 <= i < info.inst_table + 8 + 8 for i in changed)  # only that CRC
+    assert rsz.parse(plan.data).insts[1] == (CHILD, CHILD_CRC)
+
+
+def test_old_layout_is_rebuilt_keeping_the_mods_values():
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]),
+                     (PARAM, OLD_CRC, OLD_PARAM, param(OLD_PARAM, scale=2.5, hide=1, parts=(1, 2, 3), child=1))])
+    plan = rsz.plan("a.user.3", mod, game_file(), registry())
+    assert (plan.state, plan.method) == ("fixable", "재구성")
+    values, info = fields_of(plan.data)
+    assert info.insts[2] == (PARAM, NEW_CRC)
+    assert values[(2, "_Scale")] == f32(2.5) and values[(2, "_HideHair")] == b"\x01"  # the mod's
+    assert values[(2, "_PartsOff")] == [s32(1), s32(2), s32(3)] and values[(2, "_Child")] == s32(1)
+    assert values[(2, "_NewFlag")] == b"\x01"  # the game's value for the new field
+    assert values[(1, "_Value")] == s32(42)
+    assert any("_NewFlag" in n for n in plan.notes)
+
+
+def test_crc_unchanged_but_fields_added_at_the_end():
+    short = PARAM_FIELDS[:-1]  # the game added _Child without a new CRC
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, short, param(short, scale=3.0))])
+    game = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(7)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, child=0))])
+    plan = rsz.plan("a.user.3", mod, game, registry())
+    assert (plan.state, plan.method) == ("fixable", "재구성")
+    values, _ = fields_of(plan.data)
+    assert values[(2, "_Scale")] == f32(3.0) and values[(2, "_Child")] == s32(0)
+
+
+def test_new_reference_falls_back_to_the_game_file_with_the_mods_values():
+    short = PARAM_FIELDS[:-1]
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, short, param(short, scale=3.0))])
+    plan = rsz.plan("a.user.3", mod, game_file(), registry())  # the game's _Child points at its own instance
+    assert (plan.state, plan.method) == ("fixable", "원본 교체")
+    values, _ = fields_of(plan.data)
+    assert values[(2, "_Scale")] == f32(3.0) and values[(2, "_HideHair")] == b"\x01"  # the mod's values
+    assert values[(2, "_Child")] == s32(1) and values[(1, "_Value")] == s32(42)
+    assert any("옮겼습니다" in n for n in plan.notes)
+
+
+def test_unknown_parts_are_not_replaced():
+    extra = {format(EXTRA, "x"): ["4444", "app.CustomChain", json.dumps(CHILD_FIELDS)]}
+    short = PARAM_FIELDS[:-1]
+    mod = user_file([(EXTRA, 0x4444, CHILD_FIELDS, [s32(1)]), (CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]),
+                     (PARAM, NO_CHILD_CRC, short, param(short))])
+    plan = rsz.plan("a.user.3", mod, game_file(), registry(**extra))  # _Child would point at the game's own part
+    assert plan.state == "stuck" and "app.CustomChain" in plan.reason and plan.data is None
+
+
+def test_current_crcs_with_a_part_the_game_lacks_are_not_judged():
+    extra = {format(EXTRA, "x"): ["4444", "app.CustomChain", json.dumps(CHILD_FIELDS)]}
+    mod = user_file([(EXTRA, 0x4444, CHILD_FIELDS + CHILD_FIELDS, [s32(1), s32(2)]),  # registry is wrong for it
+                     (CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS))])
+    assert rsz.plan("a.user.3", mod, game_file(), registry(**extra)).state == "current"
+
+
+def test_different_file_is_not_replaced():
+    garbage = PARAM_FIELDS[:2]
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, 0x9999, garbage, param(garbage))],
+                    resources=("Art/a.mesh", "Art/b.mesh", "Art/c.mesh", "Art/d.mesh"))
+    plan = rsz.plan("a.user.3", mod, game_file(), registry())
+    assert plan.state == "stuck" and "참조" in plan.reason
+
+
+def test_resource_fields_read_either_way():
+    fields = [["_Path", "Resource", 4, 4, 0], ["_Value", "S32", 4, 4, 0]]
+    reg = registry(**{format(EXTRA, "x"): ["4444", "app.WithResource", json.dumps(fields)]})
+    as_string = user_file([(EXTRA, 0x4444, [["_Path", "String", 4, 4, 0], ["_Value", "S32", 4, 4, 0]],
+                            [text("Art/x.mesh"), s32(5)])])
+    schema, _ = rsz.choose_schema(rsz.parse(as_string), rsz.parse(as_string), reg)
+    assert schema.resource_string
+    as_index = user_file([(EXTRA, 0x4444, [["_Path", "U32", 4, 4, 0], ["_Value", "S32", 4, 4, 0]], [s32(3), s32(5)])])
+    schema, _ = rsz.choose_schema(rsz.parse(as_index), rsz.parse(as_index), reg)
+    assert not schema.resource_string  # a 4-byte index, as MHWmodfixer reads it
+
+
+def test_bundled_registry_loads():
+    reg = rsz.TypeRegistry.load()
+    assert reg.meta.get("reasy_commit")
+    armor = next(k for k, v in reg._types.items() if v[1] == "app.user_data.PlayerArmorVisualParam")
+    fields = reg.fields(int(armor, 16))
+    assert fields and fields[0][0] == "_BaseParam"
+    assert reg._old.get(armor)  # older layouts of a type that changed over the game's updates
+
+
+def test_non_rsz_file_is_ignored():
+    assert rsz.plan("x.user.3", b"not rsz at all", None, registry()) is None
+    assert rsz.plan("x.user.3", game_file(), None, registry()).state == "current"  # nothing to compare with
+
+
+# ---- the real registry: PlayerArmorVisualParam (an armor's *_avp.user) ---------------------
+def avp_files(mod_crc):
+    """(mod, game) avp.user files: the mod written by an older game version with its own hair
+    and scale settings, the game file current."""
+    reg = rsz.TypeRegistry.load()
+    by_name = {v[1]: int(k, 16) for k, v in reg._types.items()}
+    root = by_name["app.user_data.PlayerArmorVisualParam"]
+    color = by_name["app.user_data.PlayerArmorVisualParam.cArmorColorTypeSetting"]
+    wp_on = by_name["app.user_data.PlayerArmorVisualParam.cArmorWpOnSetting"]
+    torso = by_name["app.user_data.PlayerArmorVisualParam.cTorsoArmorSetting"]
+    external = by_name["app.user_data.PlayerArmorVisualParam.ARMOR_CHILD_TYPE"]  # any type: no data of its own
+
+    def values(fields, refs, custom):
+        out = []
+        for name, kind, size, _align, is_array in fields:
+            if name in custom:
+                out.append(custom[name])
+            elif name in refs:
+                ref = refs[name]
+                out.append([s32(r) for r in ref] if is_array else s32(ref))
+            elif is_array:
+                out.append([])
+            elif kind == "String":
+                out.append(text(""))
+            else:
+                out.append(bytes(size))
+        return out
+
+    def build(layout, crc, with_wp_on, custom, parts):
+        insts = [(external, 0, None, None), (external, 0, None, None)]
+        insts.append((color, reg.crc(color), reg.fields(color), values(reg.fields(color), {}, {})))
+        refs = {"_BaseParam": 1, "_ArmorVisualSetting": 2, "_ArmorColorTypeSettings": [3]}
+        slots = ("Helm", "Body", "Arm", "Waist", "Leg")
+        if with_wp_on:
+            for slot in slots:
+                refs[f"_ArmorWpOnSetting{slot}"] = len(insts) + 1
+                insts.append((wp_on, reg.crc(wp_on), reg.fields(wp_on),
+                              values(reg.fields(wp_on), {}, {"_IsEnableSetting": b"\x01"})))
+        for slot in slots:
+            refs[f"_TorsoArmorSetting{slot}"] = len(insts) + 1
+            insts.append((torso, reg.crc(torso), reg.fields(torso),
+                          values(reg.fields(torso), {"_ArmorPartsOffList": parts}, {})))
+        insts.append((root, crc, layout, values(layout, refs, custom)))
+        return user_file(insts, resources=("GameDesign/Equip/_Prefab/Armor/Female/004/000/004_000_base.user",))
+
+    mine = {"_DispOffHear": b"\x01", "_HeadObjScale": f32(0.8)}
+    old = reg.old_fields(root, mod_crc)
+    mod = build(old, mod_crc, "_ArmorWpOnSettingHelm" in [f[0] for f in old], mine, [7, 8])
+    game = build(reg.fields(root), reg.crc(root), True, {"_HeadObjScale": f32(1.0)}, [1])
+    return mod, game, reg, root
+
+
+def real_values(data, reg):
+    info = rsz.parse(data)
+    walked, _ = rsz.walk_current(info, rsz.Schema(), reg)
+    return info, {(i.type_id, f[0]): v for i in walked if i.fields for f, v in zip(i.fields, i.values)}
+
+
+def test_avp_from_before_the_weapon_settings_takes_the_game_file_with_the_mods_values():
+    mod, game, reg, root = avp_files(0xD8684E78)  # its layout lacks five _ArmorWpOnSetting references
+    plan = rsz.plan("004_000_avp.user.3", mod, game, reg)
+    assert (plan.state, plan.method) == ("fixable", "원본 교체")
+    info, values = real_values(plan.data, reg)
+    assert info.insts[-1] == (root, reg.crc(root))
+    assert values[(root, "_DispOffHear")] == b"\x01" and values[(root, "_HeadObjScale")] == f32(0.8)  # kept
+    assert values[(root, "_ArmorWpOnSettingHelm")] != s32(0)  # the game's own part
+    assert any("옮겼습니다" in n for n in plan.notes)
+
+
+def test_avp_missing_one_flag_is_rebuilt():
+    mod, game, reg, root = avp_files(0x394F5631)  # only _IsEffectCallCatchSlinger is new
+    plan = rsz.plan("004_000_avp.user.3", mod, game, reg)
+    assert (plan.state, plan.method) == ("fixable", "재구성")
+    info, values = real_values(plan.data, reg)
+    assert info.insts[-1] == (root, reg.crc(root))
+    assert values[(root, "_DispOffHear")] == b"\x01" and values[(root, "_HeadObjScale")] == f32(0.8)
+    assert any("_IsEffectCallCatchSlinger" in n for n in plan.notes)
