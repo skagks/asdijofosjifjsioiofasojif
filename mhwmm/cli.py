@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 from . import __version__, fsutil, steam
 from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
 from .manager import InstallError, ModManager, acquire_instance_lock, prepare_data_dir, setup_logging
+from .matfix import MatfixError
 
 KIND_NAMES = {
     "reframework": "REFramework", "pak": "PAK", "loose": "루스", "script": "스크립트",
@@ -321,6 +323,58 @@ def cmd_verify(manager: ModManager, args) -> int:
     return 1 if problems else 0
 
 
+MATERIAL_STATES = {"unchecked": "점검 전", "current": "현재 게임과 맞음", "stale": "복구 필요",
+                   "repaired": "복구됨", "declined": "복구하지 않음 (원래 파일 사용)"}
+
+
+def cmd_materials(manager: ModManager, args) -> int:
+    """Check, repair or undo the repair of materials that no longer fit the game."""
+    mods = _resolve(manager, args.mods) if args.mods else None
+    if args.action == "restore":
+        if not mods:
+            raise SystemExit("되돌릴 모드를 지정하세요: materials restore <모드>")
+        for mod in mods:
+            changed = manager.restore_materials(mod.id)
+            print(f"{'원래 재질 파일로 되돌림' if changed else '복구한 재질이 없음'}: {mod.name}")
+        return _maybe_deploy(manager, args)
+    jobs = manager.material_jobs([m.id for m in mods] if mods else None)
+    if not jobs:
+        print("재질(.mdf2)이나 PAK 파일이 있는 모드가 없습니다.")
+        return 0
+    repair = args.action == "repair"
+    shown = [0.0]
+
+    def progress(done, total, msg):
+        if time.time() - shown[0] > 1.0:  # the first check reads thousands of game files
+            shown[0] = time.time()
+            print(msg, file=sys.stderr)
+
+    run = manager.run_materials(jobs, repair=repair, progress=progress)
+    manager.finish_materials(run, jobs)
+    failed = 0
+    position = {m.id: i for i, m in enumerate(manager.mods, 1)}
+    for job in jobs:
+        if job.mod_id in run.errors:
+            print(f"{position.get(job.mod_id, '?')}. {job.name}: 점검하지 못함 ({run.errors[job.mod_id]})")
+            failed += 1
+            continue
+        state = manager.material_state(job.mod_id)
+        print(f"{position.get(job.mod_id, '?')}. {job.name}: {MATERIAL_STATES.get(state, state)}")
+        for r in run.results.get(job.mod_id, []):
+            if r.state == "error":
+                failed += 1
+                print(f"     {r.rel}: 오류 - {r.error}")
+            elif r.state == "fixable":
+                moved = f"  ->  {r.new_rel}" if r.new_rel != r.rel else ""
+                print(f"     {r.rel}: {', '.join(r.fixed) or '버전 번호'}{moved}")
+            if r.unresolved:
+                print(f"     {r.rel}: 같은 셰이더를 찾지 못해 그대로 둔 재질 - {', '.join(r.unresolved)}")
+    if not repair and any(manager.material_state(j.mod_id) == "stale" for j in jobs):
+        print("\n복구하려면: materials repair [모드]")
+    code = _maybe_deploy(manager, args) if repair else 0
+    return 1 if failed else code
+
+
 def cmd_game(manager: ModManager, args) -> int:
     path = Path(args.path) if args.path else manager.detect_game_dir()
     if path is None:
@@ -392,6 +446,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("purge", help="게임 폴더에서 모든 모드 파일 제거")
     sub.add_parser("verify", help="적용된 파일 점검")
 
+    p = sub.add_parser("materials", aliases=["matfix"],
+                       help="게임 업데이트로 맞지 않게 된 재질(.mdf2) 점검·복구·되돌리기")
+    p.add_argument("action", choices=("check", "repair", "restore"),
+                   help="check: 점검 · repair: 복구 (원래 파일은 그대로 둠) · restore: 원래 파일로 되돌리기")
+    p.add_argument("mods", nargs="*", help="모드 id, 번호 또는 이름 (생략하면 모든 모드)")
+    p.add_argument("--no-deploy", action="store_true")
+
     p = sub.add_parser("game", help="게임 폴더 설정 (경로 생략 시 자동 감지)")
     p.add_argument("path", nargs="?")
     p.add_argument("--force", action="store_true")
@@ -403,7 +464,7 @@ COMMANDS = {
     "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw,
     "nexus": cmd_nexus, "conflicts": cmd_conflicts, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
-    "verify": cmd_verify, "game": cmd_game,
+    "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
 }
 
 
@@ -442,7 +503,7 @@ def main(argv=None) -> int:
     logging.getLogger().addHandler(_stderr_handler())
     try:
         return COMMANDS[args.cmd](manager, args)
-    except (DeployError, InstallError) as exc:
+    except (DeployError, InstallError, MatfixError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # archive errors and other failures

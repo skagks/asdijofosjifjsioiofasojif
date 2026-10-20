@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import logging
 import logging.handlers
 import os
@@ -16,11 +17,14 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from . import fsutil, nexus, requirements, steam
+from . import fsutil, matfix, nexus, requirements, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
 from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_URL, REFW_ORIGIN
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
+from .matfix import MatfixError
+from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
+from .matfix.repair import MDF2_RE, FileResult, check_mod, is_material_file
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +34,8 @@ STALE_TEMP_SECONDS = 2 * 3600
 DATA_DIR_NAME = "MHWildsModManager_data"  # next to the exe
 DEFAULT_PROFILE = "기본"
 MAX_PROFILE_NAME = 40
+MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
+MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
 
 
 class InstallError(Exception):
@@ -253,6 +259,7 @@ class Settings:
     window_zoomed: bool = False
     sash_ratio: float = 0.58
     log_visible: bool = True
+    check_materials: bool = True  # look for outdated materials at startup and after installs
 
 
 @dataclass
@@ -354,6 +361,24 @@ class Conflicts:
         return wins, losses
 
 
+@dataclass
+class MaterialJob:
+    """One mod for a material check or repair, taken on the caller's thread."""
+    mod_id: str
+    name: str
+    stamp: str  # changes when the mod is reinstalled
+    files: list  # [(source key, game path, original file)]
+    stage: Path | None = None  # where the repaired files are written (repairs only)
+
+
+@dataclass
+class MaterialRun:
+    game: str  # fingerprint of the game files checked against
+    repair: bool
+    results: dict = field(default_factory=dict)  # mod id -> [FileResult]
+    errors: dict = field(default_factory=dict)  # mod id -> why it could not be checked
+
+
 class InstallSession:
     """An extracted archive (or folder) waiting for the user to pick variants."""
 
@@ -407,6 +432,9 @@ class ModManager:
         self._entries_cache: dict[str, dict[str, tuple[Path, str]]] = {}
         self._option_cache: dict[tuple[str, str], list[str]] = {}
         self._size_cache: dict[str, int] = {}
+        self._material_cache: dict[str, list[tuple[str, str, Path]]] = {}
+        self._record_cache: dict[str, dict] = {}
+        self._game_version: tuple[str, str] | None = None
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.mods_dir.mkdir(exist_ok=True)
         self.load()
@@ -455,6 +483,8 @@ class ModManager:
     def _invalidate(self, mod_id: str) -> None:
         self._entries_cache.pop(mod_id, None)
         self._size_cache.pop(mod_id, None)
+        self._material_cache.pop(mod_id, None)
+        self._record_cache.pop(mod_id, None)
         for key in [k for k in self._option_cache if k[0] == mod_id]:
             del self._option_cache[key]
 
@@ -652,15 +682,24 @@ class ModManager:
         """Files the mod puts into the game: game path -> (stored file, source key).
 
         For a mod with options these are the files of the selected options; when two
-        options contain the same path the later option wins."""
+        options contain the same path the later option wins. Repaired materials take
+        the place of the mod's own files (under the game path the current game uses)."""
         entries = self._entries_cache.get(mod_id)
         if entries is not None:
             return entries
         mod = self.get(mod_id)
+        repaired = self.repaired_materials(mod_id)
+
+        def entry(base: Path, rel: str, key: str) -> tuple[str, tuple[Path, str]]:
+            if key in repaired:
+                new_rel, path = repaired[key]
+                return new_rel, (path, f"{MATFIX_DIR}/{key}")
+            return rel, (base / rel, key)
+
         entries = {}
         if not mod.options:
             base = self.files_dir(mod_id)
-            entries = {rel: (base / rel, rel) for rel in list_files(base)}
+            entries = dict(entry(base, rel, rel) for rel in list_files(base))
         else:
             by_key: dict[str, str] = {}
             for opt in mod.options:
@@ -668,11 +707,12 @@ class ModManager:
                     continue
                 base = self.option_dir(mod_id, opt["id"])
                 for rel in self.option_files(mod_id, opt["id"]):
+                    rel, item = entry(base, rel, f"{opt['id']}/{rel}")
                     k = path_key(rel)
                     if k in by_key:
                         del entries[by_key[k]]
                     by_key[k] = rel
-                    entries[rel] = (base / rel, f"{opt['id']}/{rel}")
+                    entries[rel] = item
         self._entries_cache[mod_id] = entries
         return entries
 
@@ -915,6 +955,219 @@ class ModManager:
         else:
             log.info("설치 완료: %s (%d개 파일)", mod.name, len(self.mod_files(mod_id)))
         return mod
+
+    # ------------------------------------------------------------- materials
+    def game_version(self, refresh: bool = False) -> str:
+        """Fingerprint of the game's pak files ("" without a game): it changes with every game update."""
+        game = str(self.game_dir) if self.game_dir else ""
+        if refresh or self._game_version is None or self._game_version[0] != game:
+            try:
+                found = game_fingerprint(self.game_dir) if self.game_dir and self.game_dir.is_dir() else ""
+            except OSError:
+                found = ""
+            self._game_version = (game, found)
+        return self._game_version[1]
+
+    def material_files(self, mod_id: str) -> list[tuple[str, str, Path]]:
+        """(source key, game path, original file) of the mod's materials (.mdf2) and PAKs, every option
+        included. Of several versions of one material only the newest counts: the game reads one of them."""
+        cached = self._material_cache.get(mod_id)
+        if cached is not None:
+            return cached
+        mod = self.get(mod_id)
+        if mod.options:
+            scopes = [(f"{o['id']}/", self.option_dir(mod_id, o["id"]), self.option_files(mod_id, o["id"]))
+                      for o in mod.options]
+        else:
+            scopes = [("", self.files_dir(mod_id), list_files(self.files_dir(mod_id)))]
+        found = []
+        for prefix, base, rels in scopes:
+            newest: dict[str, tuple[int, str]] = {}
+            for rel in rels:
+                if not is_material_file(rel):
+                    continue
+                m = MDF2_RE.search(rel)
+                if m is None:
+                    found.append((prefix + rel, rel, base / rel))
+                    continue
+                stem = path_key(rel[:m.start()])
+                if stem not in newest or int(m.group(1)) > newest[stem][0]:
+                    newest[stem] = (int(m.group(1)), rel)
+            found += [(prefix + rel, rel, base / rel) for _, rel in newest.values()]
+        self._material_cache[mod_id] = found
+        return found
+
+    def _material_record(self, mod_id: str) -> dict:
+        record = self._record_cache.get(mod_id)
+        if record is None:
+            record = fsutil.read_json(self.mod_dir(mod_id) / MATFIX_RECORD, {})
+            record = record if isinstance(record, dict) else {}
+            self._record_cache[mod_id] = record
+        return record
+
+    def _save_material_record(self, mod_id: str, record: dict) -> None:
+        fsutil.atomic_write_json(self.mod_dir(mod_id) / MATFIX_RECORD, record)
+        self._invalidate(mod_id)
+
+    def repaired_materials(self, mod_id: str) -> dict[str, tuple[str, Path]]:
+        """Source key -> (game path, repaired file) of the repairs in use."""
+        applied = self._material_record(mod_id).get("applied")
+        out = {}
+        for key, item in (applied.items() if isinstance(applied, dict) else ()):
+            if isinstance(item, dict) and isinstance(item.get("rel"), str) and isinstance(item.get("file"), str) \
+                    and item["file"].startswith(MATFIX_DIR + "/"):
+                path = self.mod_dir(mod_id) / item["file"]
+                if path.is_file():
+                    out[key] = (item["rel"], path)
+        return out
+
+    def material_results(self, mod_id: str) -> list[FileResult]:
+        """What the last check found, per file (an empty list before the first check)."""
+        results = self._material_record(mod_id).get("results")
+        found = [FileResult.from_dict(r) for r in results if isinstance(r, dict)] if isinstance(results, list) else []
+        return [r for r in found if r is not None]
+
+    def material_state(self, mod_id: str) -> str:
+        """"none" (no materials or PAKs), "unchecked" (not against this game version), "current",
+        "stale" (outdated materials, not repaired), "repaired" or "declined" (the user undid the repair)."""
+        if not self.material_files(mod_id):
+            return "none"
+        record = self._material_record(mod_id)
+        game = self.game_version()
+        if not game or record.get("game") != game:
+            return "unchecked"
+        fixable = {r.key for r in self.material_results(mod_id) if r.state == "fixable"}
+        if not fixable:
+            return "current"
+        if record.get("applied_game") == game and fixable <= set(self.repaired_materials(mod_id)):
+            return "repaired"
+        return "declined" if record.get("declined") else "stale"
+
+    def stale_material_mods(self, enabled_only: bool = False) -> list[Mod]:
+        return [m for m in self.mods if (m.enabled or not enabled_only) and self.material_state(m.id) == "stale"]
+
+    def materials_to_offer(self) -> list[Mod]:
+        """Stale mods not yet offered for repair for this game version (offered once, see mark_offered)."""
+        game = self.game_version()
+        return [m for m in self.stale_material_mods() if self._material_record(m.id).get("offered") != game]
+
+    def mark_materials_offered(self, mods: list[Mod]) -> None:
+        game = self.game_version()
+        for m in mods:
+            record = dict(self._material_record(m.id))
+            if record.get("offered") != game:
+                record["offered"] = game
+                self._save_material_record(m.id, record)
+
+    @staticmethod
+    def _stamp(mod: Mod) -> str:
+        return f"{mod.installed_at}|{mod.updated_at}"
+
+    def material_jobs(self, mod_ids: list[str] | None = None, unchecked_only: bool = False) -> list[MaterialJob]:
+        """Mods to check (or repair): the given ones, or all; with ``unchecked_only`` only those not
+        checked against the current game yet."""
+        jobs = []
+        if unchecked_only:
+            self.game_version(refresh=True)  # the game may have been updated since
+        for mod_id in (mod_ids if mod_ids is not None else [m.id for m in self.mods]):
+            mod = self.get(mod_id)
+            files = self.material_files(mod_id)
+            if files and not (unchecked_only and self.material_state(mod_id) != "unchecked"):
+                jobs.append(MaterialJob(mod_id, mod.name, self._stamp(mod), list(files)))
+        return jobs
+
+    def run_materials(self, jobs: list[MaterialJob], repair: bool = False,
+                      progress: ProgressFn | None = None) -> MaterialRun:
+        """Check (or repair) the jobs' mods against the current game; finish_materials stores the outcome.
+
+        Thread-safe: reads the game's paks and the mods' own files, and writes repaired files
+        only to new folders under temp."""
+        progress = progress or (lambda done, total, msg: None)
+        if not self.game_dir or not self.game_dir.is_dir():
+            raise MatfixError("게임 폴더가 설정되지 않았습니다.")
+        if not matfix.available():
+            raise MatfixError("게임 파일의 압축(zstd)을 풀 수 있는 모듈이 없어 재질을 점검할 수 없습니다.")
+        game = GameIndex(self.game_dir, self.data_dir / "cache", progress)
+        shaders = ShaderIndex(game, progress)
+        run = MaterialRun(game.fingerprint, repair)
+        verb = "복구" if repair else "점검"
+        for n, job in enumerate(jobs):
+            progress(n, len(jobs), f"재질 {verb} 중... {job.name}")
+            out = None
+            if repair:
+                job.stage = self.temp_root / f"matfix-{job.mod_id}-{uuid.uuid4().hex[:6]}"
+                numbers = itertools.count(1)
+                out = lambda result, stage=job.stage, numbers=numbers: \
+                    stage / f"{next(numbers):03d}_{result.new_rel.rsplit('/', 1)[-1]}"
+            try:
+                run.results[job.mod_id] = check_mod(job.files, game, shaders, out)
+            except Exception as exc:  # one broken mod must not stop the others
+                log.warning("%s: 재질을 %s하지 못했습니다: %s", job.name, verb, exc)
+                run.errors[job.mod_id] = str(exc)
+        progress(len(jobs), len(jobs), f"재질 {verb}을 마쳤습니다")
+        return run
+
+    def finish_materials(self, run: MaterialRun, jobs: list[MaterialJob]) -> list[Mod]:
+        """Store what a run found; a repair also switches the mods to their repaired files.
+        Returns the mods whose deployed files change."""
+        changed = []
+        now = int(time.time())
+        self.game_version(refresh=True)
+        for job in jobs:
+            try:
+                mod = self.get(job.mod_id)
+            except KeyError:
+                mod = None
+            results = run.results.get(job.mod_id)
+            try:
+                if mod is None or results is None or self._stamp(mod) != job.stamp:
+                    continue  # removed or reinstalled meanwhile, or could not be read
+                record = dict(self._material_record(mod.id))
+                record.update(game=run.game, checked=now, results=[r.to_dict() for r in results])
+                had = bool(self.repaired_materials(mod.id))
+                target = self.mod_dir(mod.id) / MATFIX_DIR
+                if run.repair:
+                    applied = {r.key: {"rel": r.new_rel, "file": f"{MATFIX_DIR}/{r.file.name}"}
+                               for r in results if r.state == "fixable" and r.file is not None}
+                    fsutil.rmtree(target)
+                    if applied:
+                        os.replace(job.stage, target)
+                    record.update(applied=applied, applied_game=run.game if applied else "", declined=False)
+                    if applied or had:
+                        changed.append(mod)
+                    if applied:
+                        log.info("재질 복구: %s (%d개 파일)", mod.name, len(applied))
+                elif had and not any(r.state == "fixable" for r in results):
+                    # the mod's own files fit this game version: the repaired copies are not needed now
+                    fsutil.rmtree(target)
+                    record.update(applied={}, applied_game="")
+                    changed.append(mod)
+                self._save_material_record(mod.id, record)
+            except OSError as exc:
+                log.error("%s: 재질 복구 결과를 저장하지 못했습니다: %s", job.name, exc)
+            finally:
+                if job.stage is not None:
+                    fsutil.rmtree(job.stage)
+        if changed:
+            self.revision += 1
+            self.dirty = self.dirty or any(m.enabled for m in changed)
+            self.save()
+        return changed
+
+    def restore_materials(self, mod_id: str) -> bool:
+        """Use the mod's own material files again (it no longer counts as a problem).
+        Returns True when the deployed files change."""
+        mod = self.get(mod_id)
+        record = dict(self._material_record(mod_id))
+        had = bool(self.repaired_materials(mod_id))
+        fsutil.rmtree(self.mod_dir(mod_id) / MATFIX_DIR)
+        record.update(applied={}, applied_game="", declined=True)
+        self._save_material_record(mod_id, record)
+        if had:
+            self.revision += 1
+            self.dirty = self.dirty or mod.enabled
+        self.save()
+        return had
 
     # ------------------------------------------------------------- requirements
     @staticmethod

@@ -16,15 +16,16 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, fsutil, nexus, refw, steam, updater
+from . import __version__, fsutil, matfix, nexus, refw, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL,
                         STEAM_APP_ID)
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .helptext import SECTIONS as HELP_SECTIONS
-from .manager import (InstallError, InstallSession, Mod, ModManager, acquire_instance_lock,
-                      prepare_data_dir, resolve_data_dir, setup_logging)
+from .manager import (InstallError, InstallSession, MaterialJob, MaterialRun, Mod, ModManager,
+                      acquire_instance_lock, prepare_data_dir, resolve_data_dir, setup_logging)
+from .matfix import MatfixError
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
 from .updater import Release, UpdateError
 
@@ -70,7 +71,7 @@ FILTER_UPDATES = "업데이트 있음"
 FILTER_MISSING = "필요한 모드 없음"
 FILTER_PROBLEMS = "문제 있음"
 # Errors that are shown to the user without a traceback in the log.
-EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, OSError, ValueError)
+EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, MatfixError, OSError, ValueError)
 
 
 KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
@@ -608,6 +609,64 @@ class RequirementsDialog(Dialog):
         self.bind("<Return>", lambda e: self.cancel())
 
 
+def material_summary(results: list) -> str:
+    """What a repair changes in one mod, in a line."""
+    fixable = [r for r in results if r.state == "fixable"]
+    names = sorted({n for r in fixable for n in r.fixed}, key=str.casefold)
+    parts = [f"파일 {len(fixable)}개"]
+    if names:
+        parts.append("재질 " + ", ".join(names[:5]) + (f" 외 {len(names) - 5}개" if len(names) > 5 else ""))
+    renamed = sum(1 for r in fixable if r.new_rel and r.new_rel != r.rel)
+    if renamed:
+        parts.append(f"버전 번호를 바꿀 파일 {renamed}개")
+    return " · ".join(parts)
+
+
+class MaterialsDialog(Dialog):
+    """Mods whose materials no longer fit the game; result is the ids of those to repair."""
+
+    def __init__(self, parent, theme: Theme, manager: ModManager, mods: list[Mod]):
+        super().__init__(parent, theme, "재질 복구")
+        px = theme.px
+        self.mods = mods
+        ttk.Label(self.body, text="재질이 현재 게임과 맞지 않는 모드", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.body, text="게임 업데이트로 재질(.mdf2) 구조가 바뀌어 아래 모드는 텍스처가 깨지거나 검게·하얗게 보일 "
+                                  "수 있습니다. 복구하면 현재 게임의 재질 구조에 모드의 텍스처와 설정을 옮겨 담은 파일을 "
+                                  "대신 적용합니다. 모드의 원래 파일은 그대로 두므로 언제든 되돌릴 수 있고, 나중에 고치려면 "
+                                  "모드를 오른쪽 클릭해 '재질 복구'를 고르세요.",
+                  style="Muted.TLabel", wraplength=px(580), justify="left").pack(anchor="w", pady=(px(4), px(10)))
+        card = theme.mark(tk.Frame(self.body), "card")
+        card.pack(fill="both", expand=True)
+        self.on, self.off = theme.image("check_on", 20), theme.image("check_off", 20)
+        self.tree = ttk.Treeview(card, columns=("detail",), show="tree headings", selectmode="none",
+                                 height=min(8, max(3, len(mods))))
+        self.tree.heading("#0", text="모드", anchor="w")
+        self.tree.heading("detail", text="복구할 내용", anchor="w")
+        self.tree.column("#0", width=px(230), anchor="w")
+        self.tree.column("detail", width=px(350), anchor="w")
+        self.checked = {m.id for m in mods}
+        for mod in mods:
+            self.tree.insert("", "end", iid=mod.id, text=" " + mod.name, image=self.on,
+                             values=(material_summary(manager.material_results(mod.id)),))
+        self.tree.bind("<Button-1>", self._toggle)
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=autohide(sb, side="right", fill="y"))
+        self.tree.pack(side="left", fill="both", expand=True)
+        ttk.Label(self.body, text=matfix.CREDIT, style="Muted.TLabel", font=theme.fonts["small"]).pack(
+            anchor="w", pady=(px(10), 0))
+        self.buttons("선택한 모드 복구", self.ok, "나중에")
+
+    def _toggle(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.checked ^= {item}
+            self.tree.item(item, image=self.on if item in self.checked else self.off)
+
+    def ok(self):
+        self.result = [m.id for m in self.mods if m.id in self.checked]
+        self.destroy()
+
+
 def requirement_note(req: dict) -> str:
     """Short status of a requirement for the user."""
     if req["state"] == "off":
@@ -663,6 +722,7 @@ class SettingsDialog(Dialog):
         check(right, "enable_on_install", "설치한 모드를 바로 활성화")
         check(right, "confirm_remove", "모드를 삭제하기 전에 확인")
         check(right, "check_game_running", "적용 전에 게임 실행 여부 확인")
+        check(right, "check_materials", "시작할 때와 설치한 뒤 재질 점검")
         ttk.Label(right, text=f"PAK 모드는 게임 폴더의 {PAK_MODS_DIR} 폴더에 넣고, REFramework가 불러옵니다.",
                   style="Muted.TLabel", font=theme.fonts["small"], wraplength=px(300),
                   justify="left").pack(anchor="w", padx=(px(4), 0), pady=(px(10), 0))
@@ -762,6 +822,9 @@ class App:
         self._mod_check_error: str | None = None
         self._req_notices: list[str] = []  # just installed mods to tell about missing requirements
         self._problems: dict[str, list[str]] = {}  # enabled mods that cannot fully work, with the reasons
+        self._matfix_running = False  # a background material check is running
+        self._matfix_again = False  # ... and another one was asked for meanwhile
+        self._offer_scheduled = False
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -800,6 +863,8 @@ class App:
             root.after(1500, lambda: self.check_mod_updates(manual=False))  # reads requirements too
         else:
             root.after(2000, self._fetch_unread_requirements)
+        if manager.settings.check_materials:
+            root.after(4000, self.check_materials_background)
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -903,6 +968,7 @@ class App:
         m.add_command(label="게임에 적용", accelerator="Ctrl+S", command=self.apply)
         m.add_command(label="적용 상태 점검", command=self.verify)
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
+        m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
         m.add_command(label="게임 폴더에서 모든 모드 파일 제거", command=self.purge)
         m.add_separator()
         m.add_command(label="모두 활성화", command=lambda: self.set_enabled_all(True))
@@ -1155,6 +1221,8 @@ class App:
             info.tag_bind(tag, "<Button-1>", lambda e, action=action: self._open_nexus(action))
         info.tag_bind("nexus_set", "<Button-1>", lambda e: self.link_nexus())
         info.tag_bind("nexus_search", "<Button-1>", lambda e: self._search_nexus())
+        for action in ("check", "repair", "restore"):
+            info.tag_bind(f"matfix_{action}", "<Button-1>", lambda e, action=action: self._material_action(action))
         info.tag_bind("link", "<Enter>", lambda e: info.configure(cursor="hand2"))
         info.tag_bind("link", "<Leave>", lambda e: info.configure(cursor="arrow"))
         ct = self.conflict_text
@@ -1759,6 +1827,8 @@ class App:
                 reasons.append("옵션을 하나도 켜지 않아 아무 파일도 적용되지 않습니다")
             if mod.id in missing:
                 reasons.append("필요한 모드가 없거나 꺼져 있습니다: " + ", ".join(r["name"] for r in missing[mod.id]))
+            if self.manager.material_state(mod.id) == "stale":
+                reasons.append("재질이 현재 게임과 맞지 않아 텍스처가 이상하게 보일 수 있습니다 (오른쪽 클릭 → 재질 복구)")
             if reasons:
                 problems[mod.id] = reasons
         for mod in self.manager.hidden_mods(self._conflicts):
@@ -1837,6 +1907,11 @@ class App:
             chips.append(("옵션 선택 필요", "chip_warn"))
         if mod.update:
             chips.append(("새 버전 있음", "chip_info"))
+        material = m.material_state(mod.id)
+        if material == "stale":
+            chips.append(("재질 복구 필요", "chip_warn"))
+        elif material == "repaired":
+            chips.append(("재질 복구됨", "chip_info"))
         chips += [(KIND_LABELS[k], "chip") for k in KIND_LABELS if k in self._display_kinds(mod)]
         if mod.version:
             chips.append((f"v{mod.version}" if mod.version[:1].isdigit() else mod.version, "chip"))
@@ -1875,6 +1950,33 @@ class App:
                 checked = time.strftime("%Y-%m-%d %H:%M", time.localtime(mod.nexus_checked))
                 chunks.append((f"   {checked} 확인", ("value", "muted")))
             chunks.append(("\n", "value"))
+        if material != "none":
+            results = m.material_results(mod.id)
+            repaired = len(m.repaired_materials(mod.id))
+            chunks.append(("재질\t", "key"))
+            if material == "unchecked":
+                if matfix.available():
+                    chunks += [("아직 점검하지 않음   ", ("value", "muted")), ("지금 점검", ("value", "link", "matfix_check"))]
+                else:
+                    chunks.append(("점검할 수 없음 (zstd 모듈 없음)", ("value", "muted")))
+            elif material == "current":
+                chunks += [("현재 게임과 맞음", "value")]
+            elif material == "stale":
+                chunks += [("✕ ", ("value", "req_missing")), ("현재 게임과 맞지 않음   ", "value"),
+                           ("재질 복구", ("value", "link", "matfix_repair"))]
+            elif material == "repaired":
+                chunks += [("✓ ", ("value", "req_ok")), (f"복구한 파일 {repaired}개 사용 중   ", "value")]
+            else:
+                chunks += [("복구하지 않고 원래 파일 사용 중   ", ("value", "muted")),
+                           ("재질 복구", ("value", "link", "matfix_repair"))]
+            if repaired and material != "unchecked":
+                chunks += [("  ·  ", ("value", "muted")), ("원래대로 되돌리기", ("value", "link", "matfix_restore"))]
+            chunks.append(("\n", "value"))
+            if material in ("stale", "repaired", "declined"):
+                chunks.append(("\t" + material_summary(results) + "\n", ("value", "muted")))
+            errors = sum(1 for r in results if r.state == "error")
+            if errors:
+                chunks.append((f"\t읽지 못한 파일 {errors}개 (자세한 내용은 로그)\n", ("value", "muted")))
         if mod.update:
             new = mod.update
             what = " · ".join(x for x in (str(new.get("version") or ""), str(new.get("file") or ""),
@@ -1888,6 +1990,11 @@ class App:
             chunks += [("\n", None), ("필요한 모드가 없습니다\n", ("warn", "warn_title")),
                        (f"{names} — 설치하거나 켜야 이 모드가 제대로 작동합니다. 위 '필요한 모드'의 이름을 누르면 "
                         "Nexus 페이지가 열립니다.\n", "warn")]
+        if material == "stale":
+            chunks += [("\n", None), ("재질이 현재 게임과 맞지 않습니다\n", ("warn", "warn_title")),
+                       ("게임 업데이트로 재질(.mdf2) 구조가 바뀌어 텍스처가 깨지거나 검게·하얗게 보일 수 있습니다. "
+                        "위 '재질 복구'를 누르면 모드의 텍스처와 설정을 현재 게임의 재질 구조에 옮겨 담은 파일을 대신 "
+                        "적용합니다. 모드의 원래 파일은 그대로 둡니다.\n", "warn")]
         if mod.needs_option:
             chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
                        ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
@@ -2030,6 +2137,8 @@ class App:
                 if conflicts and key in conflicts.owners:
                     status += " (우선)"
                 tag = "" if applied else "pending"
+            if rel in entries and entries[rel][1].startswith("matfix/"):
+                status += " · 재질 복구본"
             tags = [t for t in (tag, "odd" if i % 2 else "") if t]
             self.files_tree.insert("", "end", values=(rel, status), tags=tags)
         if len(files) > MAX_FILE_ROWS:
@@ -2254,6 +2363,7 @@ class App:
                 log.info("이전 게임 폴더에서 모드를 해제했습니다 (%s)", report.summary())
             self.refresh()
             self.request_apply()
+            self.check_materials_background()
 
         self.run_task("game", "게임 폴더 변경 중...", lambda p: self.manager.set_game_dir(path, p), on_done=done)
 
@@ -2293,6 +2403,7 @@ class App:
             self._installing = False
             self.refresh()
             self._flush_requirement_notices()
+            self.check_materials_background()
             if self._apply_pending:
                 self._apply_pending = False
                 self.apply()
@@ -2661,7 +2772,8 @@ class App:
                       on_done=done, on_error=lambda exc: self.show_error("업데이트", str(exc)))
 
     def show_about(self):
-        messagebox.showinfo("정보", f"{APP_TITLE}\n버전 {__version__}\n\n데이터 폴더:\n{self.manager.data_dir}", parent=self.root)
+        messagebox.showinfo("정보", f"{APP_TITLE}\n버전 {__version__}\n\n데이터 폴더:\n{self.manager.data_dir}\n\n"
+                                    f"{matfix.CREDIT}", parent=self.root)
 
     # ------------------------------------------------------------------ tree interaction
     def _on_press(self, event):
@@ -2735,11 +2847,226 @@ class App:
                     if mods[0].nexus_id:
                         menu.add_command(label="Nexus 페이지 열기", command=lambda: self._open_nexus(lambda m: m.nexus_url))
                     menu.add_command(label="Nexus 링크 설정...", command=self.link_nexus)
+            states = {i: self.manager.material_state(i) for i in ids}
+            with_materials = [i for i in ids if states[i] != "none"]
+            if with_materials:
+                menu.add_separator()
+                menu.add_command(label="재질 점검", command=lambda: self.check_materials(with_materials))
+                fixable = [i for i in with_materials if states[i] in ("stale", "declined")]
+                if fixable:
+                    menu.add_command(label="재질 복구", command=lambda: self.repair_materials(fixable))
+                if len(ids) == 1 and self.manager.repaired_materials(ids[0]):
+                    menu.add_command(label="원래 재질로 되돌리기", command=lambda: self.restore_materials(ids[0]))
             menu.add_separator()
             menu.add_command(label="삭제", command=self.remove_selected)
         else:
             menu.add_command(label="모드 추가...", command=self.add_files)
         menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------------ materials
+    def _modal_open(self) -> bool:
+        try:
+            return self.root.grab_current() is not None
+        except (tk.TclError, KeyError):
+            return False
+
+    def _material_action(self, action: str):
+        mod = self._selected_mod()
+        if mod is None:
+            return
+        if action == "check":
+            self.check_materials([mod.id])
+        elif action == "repair":
+            self.repair_materials([mod.id])
+        else:
+            self.restore_materials(mod.id)
+
+    def _materials_ready(self) -> bool:
+        if not self._idle():
+            return False
+        if self._matfix_running:
+            self.root.bell()
+            self.status_var.set("재질 점검이 끝난 뒤에 다시 시도하세요.")
+            return False
+        if not self.manager.game_dir:
+            messagebox.showwarning("재질", "먼저 게임 폴더를 지정하세요.", parent=self.root)
+            return False
+        if not matfix.available():
+            messagebox.showerror("재질", "게임 파일의 압축(zstd)을 풀 수 있는 모듈이 없어 재질을 점검할 수 없습니다.",
+                                 parent=self.root)
+            return False
+        return True
+
+    def check_materials_background(self):
+        """Check the mods not checked against the current game yet, without blocking (startup, installs)."""
+        m = self.manager
+        if self._closed or not m.settings.check_materials or not matfix.available() \
+                or not m.game_dir or not m.game_dir.is_dir():
+            return
+        if self._matfix_running:
+            self._matfix_again = True
+            return
+        if self.busy == "matfix":  # a check or repair the user started: one reader of the game at a time
+            self.root.after(2000, self.check_materials_background)
+            return
+        jobs = m.material_jobs(unchecked_only=True)
+        if not jobs:
+            self._offer_materials()
+            return
+        self._matfix_running = True
+
+        def progress(done, total, msg):
+            self.events.put(("call", self._matfix_status, msg))
+
+        def worker():
+            try:
+                run = m.run_materials(jobs, progress=progress)
+            except Exception as exc:  # reported in the log only: nobody asked for this check
+                self.events.put(("call", self._on_materials_checked, None, jobs, exc))
+            else:
+                self.events.put(("call", self._on_materials_checked, run, jobs, None))
+
+        log.info("재질 점검: 모드 %d개를 현재 게임과 비교합니다", len(jobs))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _matfix_status(self, msg: str):
+        if self.busy is None and self._matfix_running:
+            self.status_var.set(msg if len(msg) < 90 else "…" + msg[-88:])
+
+    def _on_materials_checked(self, run: MaterialRun | None, jobs: list[MaterialJob], error: Exception | None):
+        if self._closed:
+            return
+        if self.busy is not None or self._installing:  # stored only while nothing else touches the mods
+            self.root.after(500, lambda: self._on_materials_checked(run, jobs, error))
+            return
+        self._matfix_running = False
+        self.status_var.set("준비")
+        if error is not None:
+            log.warning("재질을 점검하지 못했습니다: %s", error)
+        else:
+            changed = self.manager.finish_materials(run, jobs)
+            self._log_materials(run, jobs)
+            self.refresh()
+            if any(mod.enabled for mod in changed):
+                self.request_apply()
+        if self._matfix_again:
+            self._matfix_again = False
+            self.check_materials_background()
+        else:
+            self._offer_materials()
+
+    def _offer_materials(self):
+        """Ask once per game version about the mods whose materials no longer fit."""
+        if self._offer_scheduled or self._closed or not self.manager.materials_to_offer():
+            return
+        if self.busy is not None or self._installing or self._modal_open():
+            self._offer_scheduled = True
+
+            def again():
+                self._offer_scheduled = False
+                self._offer_materials()
+
+            self.root.after(1000, again)
+            return
+        mods = self.manager.materials_to_offer()
+        self.manager.mark_materials_offered(mods)
+        chosen = MaterialsDialog(self.root, self.theme, self.manager, mods).show()
+        if chosen:
+            self.repair_materials(chosen)
+
+    def _log_materials(self, run: MaterialRun, jobs: list[MaterialJob]):
+        names = {j.mod_id: j.name for j in jobs}
+        for mod_id, error in run.errors.items():
+            log.warning("'%s': 재질을 점검하지 못했습니다: %s", names[mod_id], error)
+        for mod_id, results in run.results.items():
+            for r in results:
+                where = f"'{names[mod_id]}' {r.rel}"
+                what = ", ".join(r.fixed) or "버전 번호"
+                if r.state == "error":
+                    log.warning("%s: 읽거나 고치지 못했습니다: %s", where, r.error)
+                elif r.state == "fixable" and run.repair:
+                    moved = f" → {r.new_rel}" if r.new_rel != r.rel else ""
+                    log.info("%s: 재질을 복구했습니다 (%s)%s", where, what, moved)
+                elif r.state == "fixable":
+                    log.warning("%s: 재질이 현재 게임과 맞지 않습니다 (%s)", where, what)
+                if r.unresolved:
+                    log.info("%s: 현재 게임에서 같은 셰이더를 찾지 못해 그대로 둔 재질: %s", where, ", ".join(r.unresolved))
+                if run.repair:
+                    for note in r.notes:
+                        log.info("%s: %s", where, note)
+
+    def check_materials(self, mod_ids: list[str] | None = None):
+        """Check mods (all by default) against the current game and offer to repair what is stale."""
+        if not self._materials_ready():
+            return
+        m = self.manager
+        jobs = m.material_jobs(mod_ids)
+        if not jobs:
+            messagebox.showinfo("재질 점검", "재질(.mdf2)이나 PAK 파일이 있는 모드가 없습니다.", parent=self.root)
+            return
+
+        def done(run: MaterialRun):
+            changed = m.finish_materials(run, jobs)
+            self._log_materials(run, jobs)
+            self.refresh()
+            if any(mod.enabled for mod in changed):
+                self.request_apply()
+            stale = [m.get(j.mod_id) for j in jobs
+                     if j.mod_id in run.results and m.material_state(j.mod_id) in ("stale", "declined")]
+            if stale:
+                m.mark_materials_offered(stale)
+                chosen = MaterialsDialog(self.root, self.theme, m, stale).show()
+                if chosen:
+                    self.repair_materials(chosen)
+                return
+            repaired = sum(1 for j in jobs if m.material_state(j.mod_id) == "repaired")
+            failed = len(run.errors) + sum(1 for rs in run.results.values() for r in rs if r.state == "error")
+            text = f"모드 {len(jobs)}개를 점검했습니다. 현재 게임과 맞지 않는 재질이 없습니다."
+            if repaired:
+                text += f"\n(이미 복구한 모드 {repaired}개 포함)"
+            if failed:
+                text += f"\n\n읽지 못한 파일 {failed}개가 있습니다. 자세한 내용은 로그를 보세요."
+            messagebox.showinfo("재질 점검", text, parent=self.root)
+
+        self.run_task("matfix", "재질 점검 준비 중...", lambda p: m.run_materials(jobs, progress=p), on_done=done)
+
+    def repair_materials(self, mod_ids: list[str]):
+        if not mod_ids or not self._materials_ready():
+            return
+        m = self.manager
+        jobs = m.material_jobs(mod_ids)
+        if not jobs:
+            return
+
+        def done(run: MaterialRun):
+            changed = m.finish_materials(run, jobs)
+            self._log_materials(run, jobs)
+            self.refresh(select=jobs[0].mod_id if len(jobs) == 1 else None)
+            if any(mod.enabled for mod in changed):
+                self.request_apply()
+            fixed = sum(1 for j in jobs if m.material_state(j.mod_id) == "repaired")
+            failed = len(run.errors) + sum(1 for rs in run.results.values() for r in rs if r.state == "error")
+            if fixed:
+                text = (f"모드 {fixed}개의 재질을 복구했습니다. 게임에 적용하면 바로 반영됩니다.\n\n모드의 원래 파일은 "
+                        "그대로 있습니다. 문제가 생기면 모드를 오른쪽 클릭해 '원래 재질로 되돌리기'를 고르세요.")
+            else:
+                text = "복구한 모드가 없습니다."
+            if failed:
+                text += f"\n\n복구하지 못한 파일 {failed}개가 있습니다. 자세한 내용은 로그를 보세요."
+            (messagebox.showinfo if fixed and not failed else messagebox.showwarning)("재질 복구", text, parent=self.root)
+
+        self.run_task("matfix", "재질 복구 준비 중...", lambda p: m.run_materials(jobs, repair=True, progress=p),
+                      on_done=done)
+
+    def restore_materials(self, mod_id: str):
+        if not self._idle():
+            return
+        mod = self.manager.get(mod_id)
+        if self.manager.restore_materials(mod_id):
+            log.info("'%s': 원래 재질 파일로 되돌렸습니다", mod.name)
+            self._changed(select=mod_id)
+        else:
+            self.refresh(select=mod_id)
 
     # ------------------------------------------------------------------ closing
     def on_close(self):

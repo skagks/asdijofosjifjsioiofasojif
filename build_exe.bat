@@ -7,6 +7,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --name MHWildsModManager ^
     --icon assets\icon.ico ^
     --collect-all tkinterdnd2 ^
+    --collect-submodules zstandard ^
     MHWildsModManager.pyw || goto :error
 echo.
 echo 완료: dist\MHWildsModManager.exe

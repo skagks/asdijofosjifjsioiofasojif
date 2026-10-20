@@ -2,3 +2,4 @@
 tkinterdnd2>=0.4     # 탐색기에서 파일 끌어 놓기
 Pillow>=10           # JPG 미리보기 이미지
 py7zr>=0.21          # 7-Zip 없이 .7z 압축 풀기
+zstandard>=0.22      # 재질 복구 (게임 pak 파일의 압축 풀기)
