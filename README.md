@@ -179,6 +179,14 @@ v1.2.0부터는 프로그램이 켜질 때 새 버전을 확인합니다. 새 �
 
   모든 결과는 현재 필드 구성으로 다시 읽어 확인한 뒤에 씁니다. 타입 정보는 `mhwmm/matfix/rsz_types.json.xz`에 들어 있고
   (`tools/make_rsz_types.py`로 다시 만듦), 게임 원본 파일이 그 정보로 정확히 읽히지 않으면 그 파일에는 쓰지 않습니다.
+
+  MHWmodfixer가 실제 게임에서 확인한 규칙을 따릅니다: CRC가 모두 현재 게임과 같은 파일은 건드리지 않고, 인스턴스를 새로 끼워
+  넣지 않으며, 체인 물리 설정(`app.ChainSetting` 등)은 다시 쓰지 않고, 원본 교체 때도 모드가 가리키던 다른 장비의 `.user`
+  설정 파일은 그대로 둡니다. 고칠 수 없는 파일은 단계별로 왜 안 됐는지 정보 탭과 로그에 남기고, 오른쪽 클릭 →
+  **재질 진단 파일 저장**으로 모드 파일·게임 원본 파일·점검 결과를 zip으로 저장할 수 있습니다.
+
+  게임이 업데이트되어 들어 있는 타입 정보가 게임과 맞지 않으면, 이 저장소의 최신 `rsz_types.json.xz`(REasy가 새 덤프를 내면
+  GitHub Actions가 매일 확인해 다시 만듦)를 받아 데이터 폴더의 `cache\`에 두고, 고치지 못했던 파일을 다시 점검합니다.
 - 고친 파일은 데이터 폴더의 `mods\<id>\matfix\`에 따로 두고, 모드의 원래 파일은 그대로 둡니다. 오른쪽 클릭 →
   **원래 재질로 되돌리기**로 언제든 되돌릴 수 있고, 게임이 다시 업데이트되면 원래 파일에서 다시 복구합니다.
 - 처음 점검할 때는 게임 pak 파일 목록을 읽느라 시간이 걸립니다. 목록은 데이터 폴더의 `cache\`에 저장해 두고 게임이 업데이트될 때만 다시 만듭니다.
@@ -237,6 +245,7 @@ python -m mhwmm conflicts [--files]           # 같은 파일을 바꾸는 모�
 python -m mhwmm materials check [모드...]     # 재질이 현재 게임과 맞는지 점검 (생략하면 모든 모드)
 python -m mhwmm materials repair [모드...]    # 맞지 않는 재질 복구 (원래 파일은 그대로)
 python -m mhwmm materials restore "모드 이름"  # 원래 재질 파일로 되돌리기
+python -m mhwmm materials report "모드 이름" --out 진단.zip   # 진단 파일 저장
 python -m mhwmm deploy | purge | verify
 ```
 

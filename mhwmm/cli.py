@@ -330,6 +330,17 @@ MATERIAL_STATES = {"unchecked": "점검 전", "current": "현재 게임과 맞�
 def cmd_materials(manager: ModManager, args) -> int:
     """Check, repair or undo the repair of materials that no longer fit the game."""
     mods = _resolve(manager, args.mods) if args.mods else None
+    if args.action == "report":
+        if not mods or len(mods) != 1:
+            raise SystemExit("진단 파일을 만들 모드 하나를 지정하세요: materials report <모드> [--out 파일.zip]")
+        (job,) = manager.material_jobs([mods[0].id]) or [None]
+        if job is None:
+            print("이 모드에는 재질이나 .user·.pfb 파일이 없습니다.")
+            return 0
+        out = Path(args.out or f"{mods[0].id}_matfix_report.zip")
+        count = manager.export_material_report(job, out)
+        print(f"저장했습니다: {out} (.user·.pfb 파일 {count}개)")
+        return 0
     if args.action == "restore":
         if not mods:
             raise SystemExit("되돌릴 모드를 지정하세요: materials restore <모드>")
@@ -371,6 +382,8 @@ def cmd_materials(manager: ModManager, args) -> int:
                 if item.get("reason"):
                     failed += 1
                     print(f"     {item['label']}: {item['kind']} 복구 불가 - {item['reason']}")
+                    if item.get("detail"):
+                        print(f"       ({item['detail']})")
                 elif r.state != "error":
                     moved = f"  ->  {r.new_rel}" if r.kind != "pak" and r.new_rel != r.rel else ""
                     print(f"     {item['label']}: {item['kind']} {'복구' if repair else '복구 필요'} ({item['method']}){moved}")
@@ -455,8 +468,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("materials", aliases=["matfix"],
                        help="게임 업데이트로 맞지 않게 된 재질(.mdf2) 점검·복구·되돌리기")
-    p.add_argument("action", choices=("check", "repair", "restore"),
-                   help="check: 점검 · repair: 복구 (원래 파일은 그대로 둠) · restore: 원래 파일로 되돌리기")
+    p.add_argument("action", choices=("check", "repair", "restore", "report"),
+                   help="check: 점검 · repair: 복구 (원래 파일은 그대로 둠) · restore: 원래 파일로 되돌리기 · "
+                        "report: 진단 파일(zip) 저장")
+    p.add_argument("--out", help="report: 저장할 zip 파일")
     p.add_argument("mods", nargs="*", help="모드 id, 번호 또는 이름 (생략하면 모든 모드)")
     p.add_argument("--no-deploy", action="store_true")
 

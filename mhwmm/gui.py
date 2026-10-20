@@ -1231,7 +1231,7 @@ class App:
             info.tag_bind(tag, "<Button-1>", lambda e, action=action: self._open_nexus(action))
         info.tag_bind("nexus_set", "<Button-1>", lambda e: self.link_nexus())
         info.tag_bind("nexus_search", "<Button-1>", lambda e: self._search_nexus())
-        for action in ("check", "repair", "restore"):
+        for action in ("check", "repair", "restore", "report"):
             info.tag_bind(f"matfix_{action}", "<Button-1>", lambda e, action=action: self._material_action(action))
         info.tag_bind("link", "<Enter>", lambda e: info.configure(cursor="hand2"))
         info.tag_bind("link", "<Leave>", lambda e: info.configure(cursor="arrow"))
@@ -2015,11 +2015,14 @@ class App:
                         "검은 화면에서 멈출 수 있습니다. 위 '재질 복구'를 누르면 모드의 내용을 현재 게임의 구조에 옮겨 "
                         "담은 파일을 대신 적용합니다. 모드의 원래 파일은 그대로 둡니다.\n", "warn")]
         if stuck:
-            shown = "\n".join(f"• {i['label'].rsplit('/', 1)[-1]}: {i['reason']}" for i in stuck[:4])
+            shown = "\n".join(f"• {i['label'].rsplit('/', 1)[-1]}: {i['reason']}" +
+                              (f"\n   ({i['detail']})" if i.get("detail") else "") for i in stuck[:4])
             more = f"\n… 외 {len(stuck) - 4}개" if len(stuck) > 4 else ""
             chunks += [("\n", None), ("고칠 수 없는 파일이 있습니다\n", ("warn", "warn_title")),
                        ("현재 게임과 맞지 않지만 안전하게 고칠 방법을 찾지 못해 그대로 둔 파일입니다. 게임이 검은 화면에서 "
-                        f"멈추면 이 모드를 끄고 모드 업데이트를 확인하세요.\n{shown}{more}\n", "warn")]
+                        f"멈추면 이 모드를 끄고 모드 업데이트를 확인하세요.\n{shown}{more}\n", "warn"),
+                       ("진단 파일 저장", ("warn", "link", "matfix_report")),
+                       (" — 모드 파일, 게임 원본 파일, 점검 결과를 zip 하나로 저장합니다\n", "warn")]
         if mod.needs_option:
             chunks += [("\n", None), ("옵션을 활성화해 주세요\n", ("warn", "warn_title")),
                        ("이 모드에는 옵션이 여러 개 있습니다. '옵션' 탭에서 사용할 옵션을 켜기 전에는 "
@@ -2882,6 +2885,8 @@ class App:
                     menu.add_command(label="재질 복구", command=lambda: self.repair_materials(fixable))
                 if len(ids) == 1 and self.manager.repaired_materials(ids[0]):
                     menu.add_command(label="원래 재질로 되돌리기", command=lambda: self.restore_materials(ids[0]))
+                if len(ids) == 1:
+                    menu.add_command(label="재질 진단 파일 저장...", command=lambda: self.export_material_report(ids[0]))
             menu.add_separator()
             menu.add_command(label="삭제", command=self.remove_selected)
         else:
@@ -2903,6 +2908,8 @@ class App:
             self.check_materials([mod.id])
         elif action == "repair":
             self.repair_materials([mod.id])
+        elif action == "report":
+            self.export_material_report(mod.id)
         else:
             self.restore_materials(mod.id)
 
@@ -2974,6 +2981,8 @@ class App:
             self.refresh()
             if any(mod.enabled for mod in changed):
                 self.request_apply()
+            if run.registry_updated:
+                self._matfix_again = True  # check what could not be repaired again with the new data
         if self._matfix_again:
             self._matfix_again = False
             self.check_materials_background()
@@ -3019,6 +3028,8 @@ class App:
                     target = f"'{names[mod_id]}' {item['label']}"
                     if item.get("reason"):
                         log.warning("%s: %s 복구 불가 (%s)", target, item["kind"], item["reason"])
+                        if item.get("detail"):
+                            log.info("%s: 자세히 - %s", target, item["detail"])
                     elif r.state == "error":
                         continue
                     elif run.repair:
@@ -3049,6 +3060,8 @@ class App:
             self.refresh()
             if any(mod.enabled for mod in changed):
                 self.request_apply()
+            if run.registry_updated:
+                self.root.after(500, self.check_materials_background)
             stale = [m.get(j.mod_id) for j in jobs
                      if j.mod_id in run.results and m.material_state(j.mod_id) in ("stale", "declined")]
             if stale:
@@ -3084,6 +3097,8 @@ class App:
             changed = m.finish_materials(run, jobs)
             self._log_materials(run, jobs)
             self.refresh(select=jobs[0].mod_id if len(jobs) == 1 else None)
+            if run.registry_updated:
+                self.root.after(500, self.check_materials_background)
             if any(mod.enabled for mod in changed):
                 self.request_apply()
             fixed = sum(1 for j in jobs if m.material_state(j.mod_id) == "repaired")
@@ -3101,6 +3116,28 @@ class App:
 
         self.run_task("matfix", "재질 복구 준비 중...", lambda p: m.run_materials(jobs, repair=True, progress=p),
                       on_done=done)
+
+    def export_material_report(self, mod_id: str):
+        """Save the mod's .user/.pfb/.scn files, the game's copies and the check results to a zip."""
+        if not self._materials_ready():
+            return
+        mod = self.manager.get(mod_id)
+        jobs = self.manager.material_jobs([mod_id])
+        if not jobs:
+            messagebox.showinfo("재질 진단", "이 모드에는 재질이나 .user·.pfb 파일이 없습니다.", parent=self.root)
+            return
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", mod.name).strip() or "mod"
+        path = filedialog.asksaveasfilename(parent=self.root, title="재질 진단 파일 저장", defaultextension=".zip",
+                                            initialfile=f"{safe}_재질진단.zip", filetypes=[("zip", "*.zip")])
+        if not path:
+            return
+
+        def done(count: int):
+            log.info("재질 진단 파일을 저장했습니다: %s (.user·.pfb 파일 %d개)", path, count)
+            messagebox.showinfo("재질 진단", f"저장했습니다 (.user·.pfb 파일 {count}개):\n{path}", parent=self.root)
+
+        self.run_task("matfix", "재질 진단 파일 만드는 중...",
+                      lambda p: self.manager.export_material_report(jobs[0], Path(path), p), on_done=done)
 
     def restore_materials(self, mod_id: str):
         if not self._idle():

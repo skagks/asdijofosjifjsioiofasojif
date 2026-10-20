@@ -4,6 +4,8 @@ older layout from the history, falling back to the game's own file, and refusing
 import json
 import struct
 
+import pytest
+
 from mhwmm.matfix import rsz
 
 PARAM, CHILD, EXTRA = 0xA1, 0xB1, 0xC1
@@ -130,19 +132,26 @@ def test_old_layout_is_rebuilt_keeping_the_mods_values():
     assert any("_NewFlag" in n for n in plan.notes)
 
 
-def test_crc_unchanged_but_fields_added_at_the_end():
-    short = PARAM_FIELDS[:-1]  # the game added _Child without a new CRC
+def test_unchanged_crcs_are_left_alone():
+    short = PARAM_FIELDS[:-1]  # reads differently from the registry, but every CRC is the game's
     mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, short, param(short, scale=3.0))])
+    assert rsz.plan("a.user.3", mod, game_file(), registry()).state == "current"
+
+
+def test_unknown_old_crc_missing_the_last_fields_is_rebuilt():
+    short = PARAM_FIELDS[:-1]  # an older CRC the history does not know; the only way it reads
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, 0x1999, short, param(short, scale=3.0))])
     game = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(7)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, child=0))])
     plan = rsz.plan("a.user.3", mod, game, registry())
     assert (plan.state, plan.method) == ("fixable", "재구성")
-    values, _ = fields_of(plan.data)
+    values, info = fields_of(plan.data)
+    assert info.insts[2] == (PARAM, NEW_CRC)
     assert values[(2, "_Scale")] == f32(3.0) and values[(2, "_Child")] == s32(0)
 
 
 def test_new_reference_falls_back_to_the_game_file_with_the_mods_values():
     short = PARAM_FIELDS[:-1]
-    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, short, param(short, scale=3.0))])
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NO_CHILD_CRC, short, param(short, scale=3.0))])
     plan = rsz.plan("a.user.3", mod, game_file(), registry())  # the game's _Child points at its own instance
     assert (plan.state, plan.method) == ("fixable", "원본 교체")
     values, _ = fields_of(plan.data)
@@ -278,3 +287,71 @@ def test_avp_missing_one_flag_is_rebuilt():
     assert info.insts[-1] == (root, reg.crc(root))
     assert values[(root, "_DispOffHear")] == b"\x01" and values[(root, "_HeadObjScale")] == f32(0.8)
     assert any("_IsEffectCallCatchSlinger" in n for n in plan.notes)
+
+
+def test_newer_registry_is_downloaded_and_preferred(tmp_path, monkeypatch):
+    import io
+    import lzma
+
+    def blob(date):
+        return lzma.compress(json.dumps({"meta": {"reasy_date": date}, "types": {"a1": ["1", "x", "[]"]}}).encode())
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(rsz.TypeRegistry, "updates", tmp_path)
+    assert rsz.download_registry(tmp_path, opener=lambda url: Response(blob("2000-01-01"))) is None  # older
+    assert rsz.TypeRegistry.path() == rsz.REGISTRY_FILE
+    assert rsz.download_registry(tmp_path, opener=lambda url: Response(blob("2099-01-01"))) == "2099-01-01"
+    assert rsz.TypeRegistry.path() == tmp_path / rsz.REGISTRY_NAME
+    with pytest.raises((lzma.LZMAError, ValueError, EOFError)):
+        rsz.download_registry(tmp_path, opener=lambda url: Response(b"broken"))
+    assert rsz.registry_date(tmp_path / rsz.REGISTRY_NAME) == "2099-01-01"  # a broken download changes nothing
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_nothing_is_written_when_the_game_file_does_not_read():
+    broken_game = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS + CHILD_FIELDS, [s32(7), s32(8)]),  # registry disagrees
+                             (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS))])
+    mod = user_file([(CHILD, CHILD_OLD, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS))])
+    plan = rsz.plan("a.user.3", mod, broken_game, registry())
+    assert plan.state == "stuck" and plan.data is None and plan.game_unreadable
+    assert "형식 정보" in plan.reason and "읽기가 어긋남" in plan.detail
+
+
+def test_another_sets_settings_file_is_kept_when_replacing():
+    short = PARAM_FIELDS[:-1]
+    mine = "GameDesign/Equip/_Prefab/Armor/Female/036/000/036_000_avp.user"
+    theirs = "GameDesign/Equip/_Prefab/Armor/Female/041/001/041_001_avp.user"
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NO_CHILD_CRC, short, param(short))],
+                    resources=(mine,))
+    game = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(7)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS))],
+                     resources=(theirs,))
+    plan = rsz.plan("a.user.3", mod, game, registry())
+    assert (plan.state, plan.method) == ("fixable", "원본 교체")
+    strings = rsz.parse(plan.data).strings()
+    assert mine in strings and theirs not in strings  # the borrowed reference stays (MHWmodfixer #30)
+
+
+def test_chain_physics_settings_are_not_rewritten():
+    chain = {format(PARAM, "x"): [format(NEW_CRC, "x"), "app.ChainSetting", json.dumps(PARAM_FIELDS)]}
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]),
+                     (PARAM, OLD_CRC, OLD_PARAM, param(OLD_PARAM, scale=2.5))])
+    plan = rsz.plan("a.pfb.18", mod, game_file(), registry(**chain))
+    assert plan.method == "원본 교체" and any("체인" in n for n in plan.notes)
+
+
+def test_unknown_old_crc_needs_clean_padding_for_a_crc_update():
+    mod = bytearray(user_file([(CHILD, 0x3000, CHILD_FIELDS, [s32(42)]),
+                               (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, scale=2.5))]))
+    info = rsz.parse(bytes(mod))
+    walked, clean = rsz.walk_current(info, rsz.Schema(), registry())
+    param_inst = walked[2]
+    pad = param_inst.start + 4 + 1 + 1  # after _Scale, _HideHair, _NewFlag: padding before _Mesh
+    mod[pad] = 0x7F  # garbage where the current layout expects padding
+    plan = rsz.plan("a.user.3", bytes(mod), game_file(), registry())
+    assert plan.method != "CRC 갱신"

@@ -508,3 +508,49 @@ def test_records_of_the_previous_version_are_checked_again(library, game, tmp_pa
     assert [j.mod_id for j in library.material_jobs(unchecked_only=True)] == [mod.id]
     run(library, unchecked_only=True)
     assert library.material_state(mod.id) == "stale" and library.materials_to_offer() == [mod]
+
+
+def test_diagnostics_report_holds_both_files(library, game, tmp_path, types, capsys):
+    import json
+    import zipfile
+
+    from mhwmm.cli import main
+
+    shipped = old_avp()
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: shipped, BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, repair=True)
+    (job,) = library.material_jobs([mod.id])
+    out = tmp_path / "report.zip"
+    assert library.export_material_report(job, out) == 1
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+        assert {f"mod/{AVP}", f"game/{AVP}", f"repaired/{AVP}", "report.json"} <= names
+        assert zf.read(f"mod/{AVP}") == shipped and zf.read(f"game/{AVP}") == R.game_file()
+        report = json.loads(zf.read("report.json"))
+    assert report["mod"] == "Lepus" and report["record"]["format"] == 2
+    assert main(["--data-dir", str(library.data_dir), "materials", "report", "Lepus", "--out", str(tmp_path / "cli.zip")]) == 0
+    assert (tmp_path / "cli.zip").is_file() and "1개" in capsys.readouterr().out
+
+
+def test_stuck_files_are_checked_again_with_newer_type_data(library, game, tmp_path, types, monkeypatch):
+    from mhwmm.matfix import repair, rsz
+
+    extra = {format(R.EXTRA, "x"): ["4444", "app.CustomChain", R.json.dumps(R.CHILD_FIELDS)]}
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry(**extra))
+    short = R.PARAM_FIELDS[:-1]
+    shipped = R.user_file([(R.EXTRA, 0x4444, R.CHILD_FIELDS, [R.s32(1)]),
+                           (R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(42)]),
+                           (R.PARAM, R.NO_CHILD_CRC, short, R.param(short))])
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: shipped})
+    downloads = []
+    monkeypatch.setattr(repair.RszContext, "matches_game", lambda self: False)  # the game moved past our data
+    monkeypatch.setattr(rsz, "download_registry", lambda folder: downloads.append(folder) or "2099-01-01")
+    jobs = library.material_jobs([mod.id])
+    found = library.run_materials(jobs)
+    assert found.registry_updated == "2099-01-01" and len(downloads) == 1
+    library.finish_materials(found, jobs)
+    assert library.material_stuck(mod.id)
+    run(library)  # tried for this game version already: no second download
+    assert len(downloads) == 1
+    monkeypatch.setattr(library, "registry_date", lambda refresh=False: "2099-01-01")
+    assert library.material_state(mod.id) == "unchecked"  # the new data may repair it

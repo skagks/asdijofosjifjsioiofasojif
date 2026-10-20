@@ -1,0 +1,45 @@
+name: RSZ types
+
+# Re-bake mhwmm/matfix/rsz_types.json.xz (the .user/.pfb type data for material repair)
+# whenever REasy publishes a newer MH Wilds dump. The app downloads this file from the
+# default branch when the data it shipped with no longer matches the installed game, so a
+# game update does not have to wait for a new release.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Is REasy's dump newer than ours?
+        id: check
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://github.com/seifhassine/REasy reasy
+          latest="$(git -C reasy log -1 --format=%H -- resources/data/dumps/rszmhwilds.json)"
+          ours="$(python3 -c 'import lzma, re; head = lzma.open("mhwmm/matfix/rsz_types.json.xz", "rt").read(4096); print(re.search(r"\"reasy_commit\"\s*:\s*\"([0-9a-f]+)\"", head).group(1))')"
+          echo "REasy: $latest, ours: $ours"
+          if [ -n "$latest" ] && [ "$latest" != "$ours" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; else echo "changed=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Re-bake
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          curl -sSfL -o modfixer.json.gz https://raw.githubusercontent.com/PoeticJustice79/MHWmodfixer/HEAD/tools/rsz_fields_mhwilds.json.gz
+          python tools/make_rsz_types.py reasy modfixer.json.gz
+      - name: Commit
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mhwmm/matfix/rsz_types.json.xz
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git commit -m "Update the RSZ type registry from REasy"
+          git push

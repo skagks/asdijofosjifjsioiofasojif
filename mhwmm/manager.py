@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import logging
 import logging.handlers
+import lzma
 import os
 import re
 import subprocess
@@ -14,6 +16,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+import zipfile
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +28,7 @@ from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_
 from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, is_root_pak, path_key
 from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
-from .matfix.repair import FileResult, check_mod, is_material_file
+from .matfix.repair import RSZ_RE, FileResult, RszContext, check_mod, is_material_file, rsz_sources
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ MAX_PROFILE_NAME = 40
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
 MATFIX_FORMAT = 2  # 2: .user/.pfb/.scn are checked too; records of an older check count as unchecked
+REGISTRY_RETRY = 3 * 86400  # how long to wait before looking for newer .user/.pfb type data again
 VERSIONED_RE = re.compile(r"\.(mdf2|user|pfb|scn)\.(\d+)$", re.IGNORECASE)  # the game reads one version number
 
 
@@ -381,6 +385,8 @@ class MaterialRun:
     repair: bool
     results: dict = field(default_factory=dict)  # mod id -> [FileResult]
     errors: dict = field(default_factory=dict)  # mod id -> why it could not be checked
+    registry: str = ""  # date of the .user/.pfb type data used
+    registry_updated: str = ""  # newer type data downloaded during the run (used from the next check)
 
 
 class InstallSession:
@@ -439,7 +445,9 @@ class ModManager:
         self._material_cache: dict[str, list[tuple[str, str, Path]]] = {}
         self._record_cache: dict[str, dict] = {}
         self._game_version: tuple[str, str] | None = None
+        self._registry_date: str | None = None
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        rsz.TypeRegistry.updates = self.data_dir / "cache"
         self.mods_dir.mkdir(exist_ok=True)
         self.load()
         self._cleanup_temp()
@@ -1032,6 +1040,12 @@ class ModManager:
         found = [FileResult.from_dict(r) for r in results if isinstance(r, dict)] if isinstance(results, list) else []
         return [r for r in found if r is not None]
 
+    def registry_date(self, refresh: bool = False) -> str:
+        """Date of the .user/.pfb type data in use (the bundled one or a newer download)."""
+        if refresh or self._registry_date is None:
+            self._registry_date = rsz.registry_date(rsz.TypeRegistry.path())
+        return self._registry_date
+
     def material_stuck(self, mod_id: str) -> list[dict]:
         """RSZ files (.user/.pfb/.scn) that no longer fit this game version and could not be repaired:
         [{"label", "kind", "reason"}] (empty unless checked against the current game)."""
@@ -1048,7 +1062,10 @@ class ModManager:
         game = self.game_version()
         if not game or record.get("game") != game or record.get("format", 1) < MATFIX_FORMAT:
             return "unchecked"
-        fixable = {r.key for r in self.material_results(mod_id) if r.state == "fixable"}
+        results = self.material_results(mod_id)
+        if any(r.stuck for r in results) and record.get("registry", "") < self.registry_date():
+            return "unchecked"  # newer .user/.pfb type data may repair what could not be repaired
+        fixable = {r.key for r in results if r.state == "fixable"}
         if not fixable:
             return "current"
         if record.get("applied_game") == game and fixable <= set(self.repaired_materials(mod_id)):
@@ -1108,14 +1125,48 @@ class ModManager:
         shaders = ShaderIndex(game, progress)
         run = MaterialRun(game.fingerprint, repair)
         verb = "복구" if repair else "점검"
+        context = RszContext(game)
         try:
-            self._run_jobs(jobs, game, shaders, run, verb, progress)
+            if any(RSZ_RE.search(rel) or is_root_pak(rel) for job in jobs for _key, rel, _path in job.files):
+                self._update_registry(game, context, run, progress, only_if_outdated=True)
+            run.registry = rsz.registry_date(rsz.TypeRegistry.path())
+            self._run_jobs(jobs, game, shaders, run, verb, progress, context)
+            if context.game_unreadable and not run.registry_updated:
+                self._update_registry(game, context, run, progress)
         finally:
             rsz.TypeRegistry.release()
         progress(len(jobs), len(jobs), f"재질 {verb}을 마쳤습니다")
         return run
 
-    def _run_jobs(self, jobs, game, shaders, run, verb, progress) -> None:
+    def _update_registry(self, game: GameIndex, context: RszContext, run: MaterialRun, progress,
+                         only_if_outdated: bool = False) -> None:
+        """Download newer .user/.pfb type data when the bundled data does not match the game
+        (at most once per game version every few days)."""
+        cache = self.data_dir / "cache"
+        state_file = cache / "rsz_update.json"
+        state = fsutil.read_json(state_file, {})
+        state = state if isinstance(state, dict) else {}
+        if state.get("game") == game.fingerprint and time.time() - float(state.get("tried") or 0) < REGISTRY_RETRY:
+            return
+        try:
+            if only_if_outdated and context.matches_game() is not False:
+                return
+        except (OSError, ValueError, EOFError) as exc:
+            log.warning(".user·.pfb 형식 정보를 읽지 못했습니다: %s", exc)
+            return
+        fsutil.atomic_write_json(state_file, {"game": game.fingerprint, "tried": time.time()})
+        progress(0, 0, "새 .user·.pfb 형식 정보를 찾는 중...")
+        try:
+            date = rsz.download_registry(cache)
+        except (OSError, ValueError, EOFError, lzma.LZMAError) as exc:
+            log.info("새 .user·.pfb 형식 정보를 받지 못했습니다: %s", exc)
+            return
+        if date:
+            rsz.TypeRegistry.release()
+            run.registry_updated = date
+            log.info("새 .user·.pfb 형식 정보를 받았습니다 (%s 기준)", date)
+
+    def _run_jobs(self, jobs, game, shaders, run, verb, progress, context) -> None:
         for n, job in enumerate(jobs):
             progress(n, len(jobs), f"재질 {verb} 중... {job.name}")
             out = None
@@ -1125,10 +1176,55 @@ class ModManager:
                 out = lambda result, stage=job.stage, numbers=numbers: \
                     stage / f"{next(numbers):03d}_{result.new_rel.rsplit('/', 1)[-1]}"
             try:
-                run.results[job.mod_id] = check_mod(job.files, game, shaders, out, provided=job.provided)
+                run.results[job.mod_id] = check_mod(job.files, game, shaders, out, provided=job.provided,
+                                                    rszs=context)
             except Exception as exc:  # one broken mod must not stop the others
                 log.warning("%s: 재질을 %s하지 못했습니다: %s", job.name, verb, exc)
                 run.errors[job.mod_id] = str(exc)
+
+    def export_material_report(self, job: MaterialJob, target: Path, progress: ProgressFn | None = None) -> int:
+        """Write a zip with the mod's .user/.pfb/.scn files, the current game's copies of them, the
+        repaired versions in use and what the last check found - to find out why one could not be
+        repaired. Thread-safe (``job`` from material_jobs). Returns the number of files compared."""
+        from . import __version__
+
+        progress = progress or (lambda done, total, msg: None)
+        if not self.game_dir or not self.game_dir.is_dir():
+            raise MatfixError("게임 폴더가 설정되지 않았습니다.")
+        if not matfix.available():
+            raise MatfixError("게임 파일의 압축(zstd)을 풀 수 있는 모듈이 없습니다.")
+        game = GameIndex(self.game_dir, self.data_dir / "cache", progress)
+        record = fsutil.read_json(self.mod_dir(job.mod_id) / MATFIX_RECORD, {})
+        registry_meta = {}
+        try:
+            registry_meta = rsz.TypeRegistry.load().meta
+        except (OSError, ValueError) as exc:
+            registry_meta = {"error": str(exc)}
+        finally:
+            rsz.TypeRegistry.release()
+        count = 0
+        partial = target.with_name(target.name + ".partial")
+        try:
+            with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
+                for label, kind, mod_bytes, donor_path, donor_bytes in rsz_sources(job.files, game):
+                    progress(count, 0, f"진단 파일 만드는 중... {label.rsplit('/', 1)[-1]}")
+                    name = label.replace("#", "_")
+                    zf.writestr(f"mod/{name}", mod_bytes)
+                    if donor_bytes is not None:
+                        zf.writestr(f"game/{name}", donor_bytes)
+                    count += 1
+                for key, (rel, path) in self.repaired_materials(job.mod_id).items():
+                    if not rel.lower().endswith(".pak"):
+                        zf.write(path, f"repaired/{rel}")
+                zf.writestr("report.json", json.dumps({
+                    "app_version": __version__, "mod": job.name, "game": game.fingerprint,
+                    "game_paks": [p.name for p in game.paks], "registry": registry_meta, "record": record,
+                }, ensure_ascii=False, indent=2))
+            os.replace(partial, target)
+        except BaseException:
+            fsutil.remove_file(partial)
+            raise
+        return count
 
     def finish_materials(self, run: MaterialRun, jobs: list[MaterialJob]) -> list[Mod]:
         """Store what a run found; a repair also switches the mods to their repaired files.
@@ -1136,6 +1232,7 @@ class ModManager:
         changed = []
         now = int(time.time())
         self.game_version(refresh=True)
+        self.registry_date(refresh=True)
         for job in jobs:
             try:
                 mod = self.get(job.mod_id)
@@ -1146,7 +1243,8 @@ class ModManager:
                 if mod is None or results is None or self._stamp(mod) != job.stamp:
                     continue  # removed or reinstalled meanwhile, or could not be read
                 record = dict(self._material_record(mod.id))
-                record.update(game=run.game, format=MATFIX_FORMAT, checked=now, results=[r.to_dict() for r in results])
+                record.update(game=run.game, format=MATFIX_FORMAT, registry=run.registry, checked=now,
+                              results=[r.to_dict() for r in results])
                 had = bool(self.repaired_materials(mod.id))
                 target = self.mod_dir(mod.id) / MATFIX_DIR
                 if run.repair:

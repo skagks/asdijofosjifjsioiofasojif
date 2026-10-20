@@ -330,12 +330,13 @@ def is_material_file(rel: str) -> bool:
     return bool(MDF2_RE.search(rel) or RSZ_RE.search(rel)) or (rel.lower().endswith(".pak") and "/" not in rel)
 
 
-class _Rsz:
-    """The type registry and whether its CRCs are this game version's (read once per check)."""
+class RszContext:
+    """The type registry and whether its CRCs are this game version's (read once per check run)."""
 
     def __init__(self, game: GameIndex):
         self.game = game
         self._registry = self._trust = None
+        self.game_unreadable = 0  # game files the registry could not read: it may be out of date
 
     @property
     def registry(self) -> rsz.TypeRegistry:
@@ -345,26 +346,37 @@ class _Rsz:
 
     @property
     def trust(self) -> bool:
+        return self.matches_game() is True
+
+    def matches_game(self) -> bool | None:
+        """Whether the registry's CRCs are this game version's, by a game pfb they all know
+        (None when that file is not in the game)."""
         if self._trust is None:
-            self._trust = False
             sample = self.game.read_hash(SAMPLE_PFB)
             info = rsz.parse(sample) if sample else None
-            if info is not None and info.types:
+            if info is None or not info.types:
+                self._trust = "unknown"
+            else:
                 self._trust = all(self.registry.crc(t) == c for t, c in rsz.crc_map(info).items())
-        return self._trust
+        return None if self._trust == "unknown" else self._trust
 
     def plan(self, label, data, donor, provided=None):
-        return rsz.plan(label, data, donor, self.registry, provided, self.trust)
+        p = rsz.plan(label, data, donor, self.registry, provided, self.trust)
+        if p is not None and p.game_unreadable:
+            self.game_unreadable += 1
+        return p
 
 
 def _rsz_item(plan: rsz.RszPlan, label: str) -> dict:
     item = {"label": label, "kind": plan.kind, "method": plan.method}
     if plan.state == "stuck":
         item["reason"] = plan.reason or "안전하게 고칠 방법을 찾지 못했습니다"
+        if plan.detail:
+            item["detail"] = plan.detail
     return item
 
 
-def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: _Rsz,
+def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: RszContext,
                provided) -> tuple[FileResult, bytes | None]:
     """The result for a loose .user/.pfb/.scn file and the repaired bytes (None: nothing to write)."""
     m = RSZ_RE.search(rel)
@@ -393,7 +405,7 @@ def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: _Rsz,
     return result, (p.data if p.state == "fixable" else None)
 
 
-def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: _Rsz):
+def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: RszContext):
     """(mdf2 units, RSZ plans) of a mod pak's entries."""
     units, plans = [], []
     for i, h in enumerate(pak.hashes):
@@ -420,14 +432,15 @@ def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: _Rsz):
 
 
 def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: ShaderIndex | None,
-              out=None, progress=None, provided: set[str] | None = None) -> list[FileResult]:
+              out=None, progress=None, provided: set[str] | None = None,
+              rszs: RszContext | None = None) -> list[FileResult]:
     """Look at (key, game path, stored file) of one mod. With ``out`` (result -> path)
     the repaired files are also written there. ``provided``: lower-cased names (without
     version number) of every file the mod ships, for mods in custom character slots.
     Files other than .mdf2, .user, .pfb, .scn and .pak are ignored."""
     progress = progress or (lambda done, total, msg: None)
     whole_game = shaders.find if shaders is not None else None
-    rszs = _Rsz(game)
+    rszs = rszs or RszContext(game)
     results: list[FileResult] = []
     rsz_files: list[tuple[FileResult, bytes | None]] = []
     loose: list[tuple[str, EntryPlan]] = []
@@ -505,6 +518,34 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
             result.state = "unresolved"
         results.append(result)
     return results
+
+
+def rsz_sources(files: list[tuple[str, str, Path]], game: GameIndex):
+    """(label, kind, the mod's bytes, the game file's path or None, its bytes or None) of every
+    .user/.pfb/.scn of a mod, loose or inside its PAKs - for a diagnostics report."""
+    for _key, rel, path in files:
+        try:
+            m = RSZ_RE.search(rel)
+            if m:
+                ext, version = m.group(1).lower(), int(m.group(2))
+                found = None
+                for candidate in candidate_paths(rel[:m.start()]):
+                    found = game.read_versioned(candidate, ext, prefer=(version,))
+                    if found is not None:
+                        break
+                yield rel, ext, path.read_bytes(), found[0] if found else None, found[1] if found else None
+            elif is_material_file(rel) and not MDF2_RE.search(rel):
+                pak = PakFile(path)
+                for i, h in enumerate(pak.hashes):
+                    try:
+                        head = pak.head(i)
+                        if head in rsz.MAGICS:
+                            kind = rsz.MAGICS[head]
+                            yield f"{rel}#{h:016X}.{kind}", kind, pak.read(i), f"#{h:016X}", game.read_hash(h)
+                    except MatfixError:
+                        continue
+        except (OSError, MatfixError):
+            continue
 
 
 def _rebuild_pak(pak: PakFile, fixed: dict[int, bytes], target: Path) -> None:
