@@ -48,6 +48,15 @@ _RAW = {
 }
 
 
+def pillow() -> bool:
+    """Can pictures be made (is Pillow installed)?"""
+    try:
+        _pil()
+    except EquipError:
+        return False
+    return True
+
+
 def _pil():
     try:
         from PIL import Image

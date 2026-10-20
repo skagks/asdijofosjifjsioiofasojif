@@ -229,6 +229,7 @@ MH Wilds RSZ 덤프와 그 기록을 바탕으로 만들었습니다.
   `cache\`에 저장해 둡니다. 게임 파일을 이 프로그램에 넣어 배포하지 않으며, 게임이 업데이트되면 다시 읽습니다.
   게임 폴더가 없거나 게임 파일을 읽을 수 없으면 게임 안의 번호(예: `방어구 004-001`)로 보여 줍니다.
 - 게임에서 이름과 그림을 읽으려면 zstandard가, 그림을 보려면 Pillow도 필요합니다 (exe에는 모두 들어 있습니다).
+- 장비 이름이나 그림이 나오지 않으면 창 오른쪽 아래 **⋯ → 진단 파일 저장**으로 만든 zip을 보내 주세요.
 
 텍스트 파일 형식은 [REMSG_Converter](https://github.com/dtlnor/REMSG_Converter)(dtlnor, MIT)와 REasy(MIT)를,
 텍스처의 GDeflate 압축은 [DirectStorage](https://github.com/microsoft/DirectStorage)(Apache-2.0)와 NVIDIA

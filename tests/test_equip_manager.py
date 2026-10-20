@@ -200,3 +200,18 @@ def test_equipment_window(equip_manager, monkeypatch):
     finally:
         gc.collect()
         root.destroy()
+
+
+def test_diagnostics_report(equip_manager, tmp_path):
+    import zipfile
+
+    m, _mods = equip_manager
+    overview(m)
+    target = tmp_path / "report.zip"
+    m.export_equipment_report(target)
+    with zipfile.ZipFile(target) as zf:
+        names = set(zf.namelist())
+        report = zf.read("report.txt").decode("utf-8")
+    assert "report.txt" in names and "equip-scans.json" in names and any(n.startswith("equip-catalog-") for n in names)
+    assert "ArmorThumbnailTextureData: " in report and "read ok" in report
+    assert "it0200_0083_IMLM4" in report

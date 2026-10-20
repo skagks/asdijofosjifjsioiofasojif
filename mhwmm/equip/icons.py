@@ -33,7 +33,7 @@ Reader = Callable[[str], "bytes | None"]
 
 # Raise when the pictures made from the game's textures can change (icons.py, tex.py, gdeflate.py), so that
 # the cached ones (cache/equip-pictures in the app's data folder) are made again.
-PICTURE_FORMAT = 1
+PICTURE_FORMAT = 2  # 2: icons for armor parts, kinsects and palicos
 PALETTE_PATH = "natives/STM/GUI/colorPreset.gcp.2"
 ATLAS_PATH = "natives/STM/GUI/ui_texture/tex000000/tex000201_1_IMLM4.tex.241106027"
 RARE_PRESET = 22  # app.ColorPreset.TYPE RARE_01; RARE_n = 21 + n
@@ -45,6 +45,10 @@ WEAPON_ROW = 16
 # atlas column -> app.WeaponDef.TYPE (the atlas is not in TYPE order)
 WEAPON_COLUMNS = {6: 1, 7: 0, 8: 3, 9: 2, 10: 6, 11: 7, 12: 4, 13: 5, 14: 8, 15: 9, 16: 10, 17: 11, 18: 12,
                   19: 13}
+# other glyphs of the same atlas (row, column), as a real game's icon sheet shows them: the five armor
+# pieces before the weapons in row 16, the kinsect first in row 17, the palico's face first in row 18
+OTHER_CELLS = {"helm": (16, 0), "body": (16, 1), "arm": (16, 2), "waist": (16, 3), "leg": (16, 4),
+               "kinsect": (17, 0), "palico": (18, 0)}
 
 
 def _read(read: Reader, path: str) -> bytes | None:
@@ -193,6 +197,38 @@ def weapon_type_icons(read: Reader, size: int = 32) -> dict:
         return out
     except Exception as exc:  # noqa: BLE001 - best effort: the window falls back to its own icons
         log.debug("무기 아이콘을 만들지 못했습니다: %s", exc)
+        return {}
+
+
+def other_icons(read: Reader, size: int = 32) -> dict:
+    """"helm" ... "leg", "kinsect", "palico" (OTHER_CELLS) -> a white glyph with alpha like
+    weapon_type_icons; a cell that does not look like a glyph is left out."""
+    try:
+        from PIL import Image
+
+        found = _atlas(read, need_rows=max(r for r, _c in OTHER_CELLS.values()) + 1)
+        if found is None:
+            return {}
+        tex, level, cell = found
+        first = min(r for r, _c in OTHER_CELLS.values())
+        band = tex.band(first * cell, (max(r for r, _c in OTHER_CELLS.values()) + 1) * cell, level)
+        out = {}
+        for name, (row, col) in OTHER_CELLS.items():
+            im = band.crop((col * cell, (row - first) * cell, (col + 1) * cell, (row - first + 1) * cell))
+            what = _check_cell(im)
+            if what != "ok":
+                log.info("아이콘이 예상과 다릅니다 (%s): %s", name, what)
+                continue
+            shape = _shape(im)
+            left, top, right, bottom = shape.point(lambda v: 255 if v > 16 else 0).getbbox()
+            side = min(cell, max(right - left, bottom - top) + 2)
+            x0 = min(max(0, (left + right - side) // 2), cell - side)
+            y0 = min(max(0, (top + bottom - side) // 2), cell - side)
+            glyph = _glyph(shape.crop((x0, y0, x0 + side, y0 + side)))
+            out[name] = glyph.resize((size, size), Image.LANCZOS) if side != size else glyph
+        return out
+    except Exception as exc:  # noqa: BLE001 - best effort, like weapon_type_icons
+        log.debug("아이콘을 만들지 못했습니다: %s", exc)
         return {}
 
 

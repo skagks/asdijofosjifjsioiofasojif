@@ -272,9 +272,10 @@ def test_rarity_colors():
     assert icons.rarity_colors(broken) == {}
 
 
-def atlas_file(kind="good", fmt=28, gdeflate=False):
+def atlas_file(kind="good", fmt=28, gdeflate=False, others=False):
     """A 512x512 atlas (cell 25 px): glyphs of different shapes in row 16, columns 6-19 - white with
-    a grey part and (RGBA only) a half-transparent black shadow, like the game's."""
+    a grey part and (RGBA only) a half-transparent black shadow, like the game's; ``others``: also in
+    the cells of the armor pieces, the kinsect and the palico."""
     from PIL import Image, ImageDraw
 
     im = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
@@ -299,12 +300,26 @@ def atlas_file(kind="good", fmt=28, gdeflate=False):
             draw.rectangle((x + 3, y + 4 + col % 5, x + 4 + col, y + 20), fill=(255, 255, 255, 255))
             draw.line((x + 3, y + 3, x + 21, y + 3 + col % 7), fill=(255, 255, 255, 255), width=2)
             draw.rectangle((x + 16, y + 12, x + 20, y + 16), fill=(128, 128, 128, 255))
+    for n, (row, col) in enumerate(icons.OTHER_CELLS.values() if others else ()):
+        x, y = col * cell, row * cell
+        draw.rectangle((x + 1, y + 1, x + 23, y + 23), fill=(0, 0, 0, 120))
+        draw.ellipse((x + 3, y + 3, x + 12 + n, y + 21), fill=(255, 255, 255, 255))
     if fmt == 28:
         mips = [im.tobytes()]
     else:  # BC1 keeps the shapes: one colour a block, 1-bit alpha
         px = im.load()
         mips = [F.bc1_image(512, 512, lambda x, y: px[x, y][:3] if px[x, y][3] else None)]
     return F.build_tex(512, 512, fmt, mips, gdeflate=gdeflate)
+
+
+def test_icons_of_armor_pieces_kinsects_and_palicos():
+    pytest.importorskip("PIL")
+    got = icons.other_icons(reader({icons.ATLAS_PATH: atlas_file(others=True)}), 24)
+    assert sorted(got) == sorted(icons.OTHER_CELLS)
+    assert all(im.size == (24, 24) and im.getchannel("A").getbbox() for im in got.values())
+    # cells that hold no glyph (here: small dark squares) are left out one by one
+    assert icons.other_icons(reader({icons.ATLAS_PATH: atlas_file()}), 24) == {}
+    assert icons.other_icons(reader({}), 24) == {}
 
 
 def test_weapon_type_icons_and_tint():

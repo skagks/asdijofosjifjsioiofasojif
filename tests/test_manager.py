@@ -235,6 +235,11 @@ def test_options_keep_their_own_pictures(manager, tmp_path):
     assert manager.option_preview(mod.id, {"preview": "previews/../mod.json"}) is None
     assert manager.option_preview(mod.id, {"preview": "preview.jpg"}) is None
     assert manager.option_preview(mod.id, {"preview": 3}) is None
+    # the picture that shows the mod as it is used: the selected option's, else the mod's
+    assert manager.mod_picture(mod.id) == manager.screenshot_path(mod)
+    red = next(o["id"] for o in mod.options if o["name"] == "Red")
+    manager.set_options(mod.id, [red])
+    assert manager.mod_picture(mod.id).read_text() == "red picture"
 
     # an update brings the pictures of the new archive
     update = make_zip(tmp_path / "v2" / "Colors.zip", {

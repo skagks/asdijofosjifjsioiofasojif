@@ -66,6 +66,7 @@ class EquipmentWindow(tk.Toplevel):
         menu = t.mark(tk.Menu(self.more, tearoff=False), "menu")
         menu.add_command(label="게임 데이터 다시 읽기", command=lambda: self.reload(rebuild=True))
         menu.add_command(label="아이콘 확인용 그림 저장...", command=self.save_icon_sheet)
+        menu.add_command(label="진단 파일 저장...", command=self.save_report)
         self.more.configure(menu=menu)
 
         self.geometry(f"{px(1200)}x{px(780)}")
@@ -232,24 +233,40 @@ class EquipmentWindow(tk.Toplevel):
         self.render()
         self.app._update_details()  # the info tab's 외형 row could not be shown while this was read
 
-    def _icon(self, wtype: int):
-        """The game's icon for a weapon type, in the theme's text colour (the game's glyphs are white)."""
-        key = (wtype, self.theme.name)
+    def _icon(self, name: str, color: str = "text", size: int = 18):
+        """One of the game's icons ("w<type>" for a weapon type, "helm"... "leg", "kinsect", "palico") in a
+        theme colour (the game's glyphs are white); None when the game's icon could not be read."""
+        key = (name, self.theme.name, color, size)
         if key not in self.icons:
             self.icons[key] = None
-            path = (self.ui.get("weapon_icons") or {}).get(str(wtype))
+            if name.startswith("w"):
+                path = (self.ui.get("weapon_icons") or {}).get(name[1:])
+            else:
+                path = (self.ui.get("icons") or {}).get(name)
             if path and Image is not None:
                 try:
                     from .equip.icons import tint
 
-                    color = self.winfo_rgb(self.theme.p["text"])
-                    size = self.theme.px(18)
+                    rgb = tuple(c // 256 for c in self.winfo_rgb(self.theme.p[color]))
+                    px = self.theme.px(size)
                     with Image.open(path) as img:
-                        glyph = tint(img.convert("RGBA"), tuple(c // 256 for c in color))
-                    self.icons[key] = ImageTk.PhotoImage(glyph.resize((size, size), Image.LANCZOS), master=self)
+                        glyph = tint(img.convert("RGBA"), rgb)
+                    self.icons[key] = ImageTk.PhotoImage(glyph.resize((px, px), Image.LANCZOS), master=self)
                 except Exception as exc:  # no icon is fine
-                    log.debug("무기 아이콘을 읽지 못했습니다: %s", exc)
+                    log.debug("아이콘을 읽지 못했습니다 (%s): %s", name, exc)
         return self.icons[key]
+
+    def _group_icon(self, group: str):
+        if group.startswith("weapon/"):
+            return self._icon("w" + str(int(group[7:]))) if group[7:].isdigit() else None
+        name = {"armor": "body", "weapon": "w0", "kinsect": "kinsect", "palico": "palico"}.get(group)
+        return self._icon(name) if name else None
+
+    def _chip(self, parent, part: str, style: str) -> ttk.Label:
+        """A part label; armor pieces with the game's icon in the label's colour."""
+        color = {"PartOn.TLabel": "chip_text", "PartConflict.TLabel": "danger"}.get(style, "subtle")
+        image = self._icon(part, color, 13) if part in ARMOR_PARTS[:5] else None
+        return ttk.Label(parent, text=PART_LABELS.get(part, part), style=style, image=image or "", compound="left")
 
     # ------------------------------------------------------------------ rendering
     def _visible_items(self) -> list[ov.Item]:
@@ -307,7 +324,7 @@ class EquipmentWindow(tk.Toplevel):
         entries = [(ALL, "전체", len(items))] + groups
         for key, label, count in entries:
             sub = "/" in key
-            image = self._icon(int(key[7:])) if key.startswith("weapon/") and key[7:].isdigit() else None
+            image = self._group_icon(key)
             button = ttk.Button(self.nav, text=f"{label}  {count}", compound="left", image=image or "",
                                 style="NavActive.TButton" if key == self.group else "Nav.TButton",
                                 command=lambda k=key: self._set_group(k))
@@ -407,13 +424,14 @@ class EquipmentWindow(tk.Toplevel):
         ttk.Label(text, text=item.name, style="TileTitle.TLabel").pack(anchor="w")
         ttk.Label(text, text=item.subtitle, style="TileMuted.TLabel").pack(anchor="w")
         if item.parts or item.changed:
-            row = ttk.Frame(text, style="Tile.TFrame")
-            row.pack(anchor="w", pady=(px(5), 0))
+            row = ttk.Frame(text, style="Tile.TFrame", height=px(22))
+            row.pack(fill="x", pady=(px(5), 0))
             changed = set(item.changed)
             for part in self._parts_shown(item):
                 style = "PartConflict.TLabel" if part in conflicts else (
                     "PartOn.TLabel" if part in changed else "PartOff.TLabel")
-                ttk.Label(row, text=PART_LABELS.get(part, part), style=style).pack(side="left", padx=(0, px(4)))
+                self._chip(row, part, style)
+            self._flow(row, px(4))
         mods = [u for u in item.uses if u.enabled or not self.enabled_var.get()]
         names = " · ".join(u.name if u.enabled else f"{u.name} (꺼짐)" for u in mods[:4])
         if len(mods) > 4:
@@ -434,6 +452,25 @@ class EquipmentWindow(tk.Toplevel):
             widget.bind("<Button-1>", click, add="+")
             widget.bind("<Double-Button-1>", open_mod, add="+")
         return tile
+
+    @staticmethod
+    def _flow(frame, gap: int):
+        """Lay the frame's children out left to right, going on in a new line when one does not fit."""
+        def layout(_event=None):
+            width = frame.winfo_width()
+            if width <= 1:
+                return
+            x = y = line = 0
+            for child in frame.winfo_children():
+                w, h = child.winfo_reqwidth(), child.winfo_reqheight()
+                if x and x + w > width:
+                    x, y, line = 0, y + line + gap, 0
+                child.place(x=x, y=y)
+                x, line = x + w + gap, max(line, h)
+            if int(frame.cget("height")) != y + line:
+                frame.configure(height=y + line)
+
+        frame.bind("<Configure>", layout, add="+")
 
     @staticmethod
     def _parts_shown(item: ov.Item) -> list[str]:
@@ -505,16 +542,20 @@ class EquipmentWindow(tk.Toplevel):
         conflicts = item.conflicts()
         for use in item.uses:
             row = ttk.Frame(d, style="Card.TFrame")
-            row.pack(fill="x", pady=(px(6), 0))
-            ttk.Button(row, text="목록에서 보기", style="Link.TButton",
-                       command=lambda mod_id=use.mod_id: self.app.show_mod(mod_id)).pack(side="right")
+            row.pack(fill="x", pady=(px(8), 0))
+            self._mod_picture(row, use)
+            text = ttk.Frame(row, style="Card.TFrame")
+            text.pack(side="left", fill="x", expand=True)
             title = use.name + ("" if use.enabled else "  (꺼짐)")
-            ttk.Label(row, text=title, style="Card.TLabel", font=t.fonts["bold"], wraplength=px(196),
+            ttk.Label(text, text=title, style="Card.TLabel", font=t.fonts["bold"], wraplength=px(190),
                       justify="left").pack(anchor="w")
             parts = [PART_LABELS.get(p, p) for p in (item.parts or ()) if p in use.parts]
             parts += [PART_LABELS.get(p, p) for p in use.parts if p and p not in (item.parts or ())]
             detail = (" · ".join(parts) + " · " if parts else "") + f"파일 {use.files}개"
-            ttk.Label(d, text=detail, style="CardMuted.TLabel", font=t.fonts["small"]).pack(anchor="w")
+            ttk.Label(text, text=detail, style="CardMuted.TLabel", font=t.fonts["small"], wraplength=px(190),
+                      justify="left").pack(anchor="w")
+            ttk.Button(text, text="목록에서 보기", style="Link.TButton",
+                       command=lambda mod_id=use.mod_id: self.app.show_mod(mod_id)).pack(anchor="w")
         if conflicts:
             self._section(d, "겹치는 부위")
             ttk.Label(d, text=self._conflict_text(conflicts), style="CardMuted.TLabel", wraplength=px(296),
@@ -528,6 +569,25 @@ class EquipmentWindow(tk.Toplevel):
             anchor="w", pady=(px(16), 0))
         self._bind_wheel(d, self.detail_canvas)
         self.detail_canvas.yview_moveto(0)
+
+    def _mod_picture(self, parent, use: ov.ModUse):
+        """The mod's own preview picture (what it looks like applied, as its author shows it); a click
+        shows it large."""
+        try:
+            path = self.manager.mod_picture(use.mod_id)
+        except KeyError:  # removed meanwhile
+            path = None
+        if path is None:
+            return
+        px = self.theme.px
+        image = self.app._thumbnail(path, px(96), px(72))
+        if image is None:
+            return
+        label = ttk.Label(parent, image=image, style="Card.TLabel", cursor="hand2")
+        label.image = image
+        label.pack(side="left", anchor="n", padx=(0, px(10)))
+        label.bind("<Button-1>", lambda e: self.app.show_picture(path, use.name))
+        Tooltip(self.theme, label, "모드에 들어 있는 미리보기 그림 · 누르면 크게 봅니다")
 
     def _section(self, parent, title: str):
         ttk.Label(parent, text=title, style="Section.TLabel").pack(anchor="w", pady=(self.theme.px(16), 0))
@@ -677,6 +737,34 @@ class EquipmentWindow(tk.Toplevel):
             self.app.events.put(("call", self._icon_sheet_saved, target, result))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def save_report(self):
+        """A zip of what the window worked out and how the game's files read (to send to the developer
+        when names or pictures are missing)."""
+        target = filedialog.asksaveasfilename(parent=self, title="장비 외형 진단 파일 저장", defaultextension=".zip",
+                                              initialfile="mhwilds-equipment-report.zip", filetypes=[("zip", "*.zip")])
+        if not target:
+            return
+        self.status_var.set("진단 파일 저장 중...")
+
+        def worker():
+            try:
+                self.manager.export_equipment_report(Path(target))
+                result = True
+            except Exception as exc:  # reported in the window
+                result = exc
+            self.app.events.put(("call", self._report_saved, target, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _report_saved(self, target: str, result):
+        if self.closed:
+            return
+        self.status_var.set("")
+        if isinstance(result, Exception):
+            messagebox.showerror("진단 파일", str(result), parent=self)
+        else:
+            messagebox.showinfo("진단 파일", f"저장했습니다:\n{target}", parent=self)
 
     def _icon_sheet_saved(self, target: str, result):
         if self.closed:

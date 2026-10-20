@@ -56,7 +56,8 @@ from .userdata import USER, read_user, rows
 
 log = logging.getLogger(__name__)
 
-CATALOG_FORMAT = 1  # raise when the result of build() changes, so that cached catalogs are made again
+CATALOG_FORMAT = 2  # raise when the result of build() changes, so that cached catalogs are made again
+# 2: thumbnails also without the GUI thumbnail tables (their names follow the TextureId)
 NATIVES = "natives/STM/"
 USER_VERSION, MSG_VERSION, PFB_VERSION, TEX_VERSION = ".3", ".23", ".18", ".241106027"
 USER_EXT, MSG_EXT = ".user" + USER_VERSION, ".msg" + MSG_VERSION
@@ -138,6 +139,38 @@ def _path(value) -> str:
 
 def _user_path(value) -> str:
     return value.get(USER, "") if isinstance(value, dict) and isinstance(value.get(USER), str) else ""
+
+
+# GUI thumbnail prefab of a TextureId, as the game names them (used when a thumbnail table cannot be read)
+_THUMB_PREFAB = "GameDesign/GUI/Common/_Prefab/Thumbnail/{0}/Thumbnail_{1}.pfb"
+
+
+def thumb_texture(prefab: str) -> str:
+    """The texture a GUI thumbnail prefab is named after (full path with version); "" for another prefab."""
+    m = _GUI_THUMB.match(prefab[1:] if prefab.startswith("@") else prefab)
+    if not m:
+        return ""
+    folder = "Character" if m.group(1)[:2].lower() == "ch" else "Item"
+    return f"{NATIVES}{GUI_THUMBS}{folder}/{m.group(1)}/tex_{m.group(2)}_IMLM4{TEX_EXT}"
+
+
+def armor_thumb_prefab(tid: int) -> str:
+    """B*1e7 + XX*1e5 + SERIES*100 + G*10 + P -> Thumbnail_ch0B_XX_SSS_G_P."""
+    body = tid // 10 ** 7
+    name = f"ch0{body}_{tid // 10 ** 5 % 100:02d}_{tid // 100 % 1000:03d}_{tid // 10 % 10}_{tid % 10}"
+    return _THUMB_PREFAB.format(f"ch0{body}", name)
+
+
+def item_thumb_prefab(tid: int) -> str:
+    """TYPE*1e6 + SS*1e4 + NNNN (weapons, kinsects) -> Thumbnail_it<TT><SS>_<NNNN>."""
+    wtype, rest = divmod(tid, 10 ** 6)
+    return _THUMB_PREFAB.format(f"it{wtype:02d}", f"it{wtype:02d}{rest // 10 ** 4:02d}_{rest % 10 ** 4:04d}")
+
+
+def palico_thumb_prefab(tid: int) -> str:
+    """5e5 + NNN*100 + X*10 -> Thumbnail_ch05_NNN_X0."""
+    number, slot = divmod(tid - 500000, 100)
+    return _THUMB_PREFAB.format("ch05", f"ch05_{number:03d}_{slot:02d}")
 
 
 def _unique(names) -> list[str]:
@@ -278,12 +311,8 @@ class _Builder:
         """The texture (full path with version) a GUI thumbnail prefab shows."""
         prefab = prefab[1:] if prefab.startswith("@") else prefab
         if prefab not in self._thumbs:
-            tex = None
-            m = _GUI_THUMB.match(prefab)
-            if m:
-                folder = "Character" if m.group(1)[:2].lower() == "ch" else "Item"
-                path = f"{NATIVES}{GUI_THUMBS}{folder}/{m.group(1)}/tex_{m.group(2)}_IMLM4{TEX_EXT}"
-                tex = path if self.read_has(path) else None
+            path = thumb_texture(prefab)
+            tex = path if path and self.read_has(path) else None
             self._thumbs[prefab] = tex or self.texture(prefab)
         return self._thumbs[prefab]
 
@@ -385,7 +414,7 @@ class _Builder:
                     for s in members:
                         value = plain.get(s.fixed)
                         tid = (2 if body == "m" else 3) * 10 ** 7 + (value or 0) * 100 + (design - 1) * 10 + p
-                        prefab = thumbs.get(tid) if value is not None and value >= 0 else None
+                        prefab = (thumbs.get(tid) or armor_thumb_prefab(tid)) if value is not None and value >= 0 else None
                         tex = self.thumb(prefab) if prefab else None
                         if tex:
                             entry["thumbs"][part] = tex
@@ -459,7 +488,8 @@ class _Builder:
                 if in_tree:
                     entry["tree"] = in_tree.most_common(1)[0][0]
                 for _sort, _name, _rare, wtype, wid in members:
-                    prefab = thumbs.get(wtype * 10 ** 6 + wid) if wid is not None and wid > 0 else None
+                    tid = wtype * 10 ** 6 + wid if wid is not None and wid > 0 else None
+                    prefab = (thumbs.get(tid) or item_thumb_prefab(tid)) if tid is not None else None
                     tex = self.thumb(prefab) if prefab else None
                     if tex:
                         entry["thumb"] = tex
@@ -498,7 +528,8 @@ class _Builder:
         out = self.section("kinsect")
         for key, members in found.items():
             members.sort(key=lambda m: m[0])
-            prefab = thumbs.get(10 * 10 ** 6 + members[0][3])
+            tid = 10 * 10 ** 6 + members[0][3]
+            prefab = thumbs.get(tid) or item_thumb_prefab(tid)
             entry = {"names": _unique(m[1] for m in members)[:MAX_NAMES],
                      "rarity": min((m[2] for m in members if m[2]), default=None), "thumbs": {},
                      "thumb": self.thumb(prefab) if prefab else None}
@@ -540,7 +571,8 @@ class _Builder:
                 name = next((pieces[m[1]][part] for m in members if part in pieces.get(m[1], {})), "")
                 if name:
                     entry["pieces"][part] = name
-                prefab = thumbs.get(500000 + number * 100 + OTOMO_THUMB[part] * 10)
+                tid = 500000 + number * 100 + OTOMO_THUMB[part] * 10
+                prefab = thumbs.get(tid) or palico_thumb_prefab(tid)
                 tex = self.thumb(prefab) if prefab else None
                 if tex:
                     entry["thumbs"][part] = tex

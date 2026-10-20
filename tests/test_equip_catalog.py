@@ -478,8 +478,23 @@ def test_missing_tables_are_problems_and_other_sections_stay():
     assert any(p.startswith("방어구:") and "ArmorSeriesData.user.3" in p for p in cat.problems)
     assert any(p.startswith("몬스터:") and "EnemyText.msg.23" in p for p in cat.problems)
     assert any(p.startswith("무기:") and "WeaponThumbnailTextureData.user.3" in p for p in cat.problems)
-    assert cat.names(W("02/000029"))[0] == "새벽쌍검Ⅰ" and cat.thumb(W("02/000029")) is None
+    assert cat.names(W("02/000029"))[0] == "새벽쌍검Ⅰ"
+    assert cat.thumb(W("02/000029")) == thumb_tex("it02", "it0200_0083")  # found by its name all the same
     assert cat.names(Target("palico", "004")) == ["시험고양이"]
+
+
+def test_unreadable_thumbnail_tables_do_not_lose_the_pictures():
+    """A game update can change a table's layout so that it no longer reads: the pictures are named
+    after their TextureId and are found without it."""
+    tables = ("ArmorThumbnailTextureData", "WeaponThumbnailTextureData", "OtEquipThumnailTextureData")
+    whole, broken = build(), build(make_game(replace={N + f"GameDesign/GUI/Common/_UserData/{t}.user.3": b"USR\0 junk"
+                                                      for t in tables}))
+    for target in (A("f/004/001", "helm"), A("f/004/001", "body"), W("02/000029"), Target("palico", "004", "helm")):
+        assert broken.thumb(target) == whole.thumb(target), target
+    assert broken.thumb(A("f/004/001", "helm")) == thumb_tex("ch03", "ch03_00_005_1_0")
+    assert catalog.armor_thumb_prefab(30000510).endswith("/ch03/Thumbnail_ch03_00_005_1_0.pfb")
+    assert catalog.item_thumb_prefab(10030005).endswith("/it10/Thumbnail_it1003_0005.pfb")
+    assert catalog.palico_thumb_prefab(500410).endswith("/ch05/Thumbnail_ch05_004_10.pfb")
 
 
 def test_without_the_armor_list_both_bodies_are_assumed():

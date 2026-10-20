@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import itertools
 import json
 import logging
@@ -35,6 +36,7 @@ from .equip import overview as equip_overview
 from .equip import pathlist as equip_pathlist
 from .equip import scan as equip_scan
 from .equip import tex as equip_tex
+from .equip import userdata as equip_userdata
 from .equip.model import PART_LABELS
 from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
@@ -788,6 +790,17 @@ class ModManager:
         p = self.mod_dir(mod_id) / rel
         return p if p.is_file() else None
 
+    def mod_picture(self, mod_id: str) -> Path | None:
+        """The picture that shows a mod as it is used: the first selected option's own picture, else the
+        mod's (what the archive came with; None without one)."""
+        mod = self.get(mod_id)
+        for opt in mod.options:
+            if opt["id"] in mod.selected:
+                found = self.option_preview(mod_id, opt)
+                if found is not None:
+                    return found
+        return self.screenshot_path(mod)
+
     def conflicts(self) -> Conflicts:
         owners: dict[str, list[str]] = {}
         paths: dict[str, str] = {}
@@ -1521,36 +1534,97 @@ class ModManager:
             return None
 
     def equipment_ui(self) -> dict:
-        """The game's rarity colours ({"1": "#rrggbb"...}) and weapon-type icons ({type: PNG path}),
-        cached per game version; {} when the game's UI files cannot be read."""
+        """The game's rarity colours ({"1": "#rrggbb"...}), weapon-type icons ({type: PNG path}) and the
+        icons of armor pieces, kinsects and palicos ({"helm"...: PNG path}), cached per game version; {}
+        when the game's UI files cannot be read."""
         folder = self._picture_dir()
         if folder is None:
             return {}
         saved = folder / "ui.json"
         try:
             ui = json.loads(saved.read_text(encoding="utf-8"))
-            if all(Path(p).is_file() for p in ui.get("weapon_icons", {}).values()):
+            icons = [*ui.get("weapon_icons", {}).values(), *ui.get("icons", {}).values()]
+            if all(Path(p).is_file() for p in icons):
                 return ui
         except (OSError, ValueError, AttributeError):
             pass
         game = self._equip_game()
         if game is None:
             return {}
-        ui = {"rarity": {}, "weapon_icons": {}}
+        ui = {"rarity": {}, "weapon_icons": {}, "icons": {}}
         colors = equip_icons.rarity_colors(game.read)
         ui["rarity"] = {str(n): "#%02x%02x%02x" % tuple(rgb[:3]) for n, rgb in colors.items()}
-        for wtype, image in equip_icons.weapon_type_icons(game.read, 48).items():
-            path = folder / f"weapon-type-{wtype}.png"
-            try:
-                image.save(path, "PNG")
-                ui["weapon_icons"][str(wtype)] = str(path)
-            except OSError:
-                pass
+        for key, icons, prefix in (("weapon_icons", equip_icons.weapon_type_icons(game.read, 48), "weapon-type-"),
+                                   ("icons", equip_icons.other_icons(game.read, 48), "icon-")):
+            for name, image in icons.items():
+                path = folder / f"{prefix}{name}.png"
+                try:
+                    image.save(path, "PNG")
+                    ui[key][str(name)] = str(path)
+                except OSError:
+                    pass
         try:
             fsutil.atomic_write_json(saved, ui)
         except OSError:
             pass
         return ui
+
+    def export_equipment_report(self, target: Path) -> None:
+        """A zip to find out why names or pictures are missing on a real game: the cached results, a
+        check of the game files they come from, the icon sheet and the log. Thread-safe."""
+        from . import __version__
+
+        lines = [f"app {__version__}", f"game {self.game_version()}", f"registry {self.registry_date()}",
+                 f"game folder {self.game_dir}", f"zstd {matfix.available()}", f"pillow {equip_tex.pillow()}"]
+        catalog = self.equipment_catalog(build=False)
+        game = self._equip_game()
+        if catalog is not None:
+            lines.append("problems: " + "; ".join(catalog.problems))
+            for kind in ("armor", "weapon", "kinsect", "palico", "seikret", "npc", "monster"):
+                items = catalog.data.get("items", {}).get(kind, {})
+                lines.append(f"{kind}: {len(items)} items, {sum(1 for e in items.values() if e.get('thumb'))} "
+                             "with a picture")
+        if game is not None:
+            registry = rsz.TypeRegistry.load()
+            try:
+                for name in ("ArmorThumbnailTextureData", "WeaponThumbnailTextureData", "OtEquipThumnailTextureData"):
+                    path = f"natives/STM/GameDesign/GUI/Common/_UserData/{name}.user.3"
+                    data = game.read(path) if game.has(path) else None
+                    root = equip_userdata.read_user(data, registry) if data else None
+                    info = rsz.parse(data) if data else None
+                    lines.append(f"{name}: {'missing' if data is None else len(data)} bytes, "
+                                 f"read {'ok' if root is not None else 'FAILED'}, "
+                                 f"types {sorted(registry.name(t) for t in info.types) if info else '-'}")
+            finally:
+                rsz.TypeRegistry.release()
+            for prefab in (equip_catalog.item_thumb_prefab(2000083), equip_catalog.armor_thumb_prefab(30000510),
+                           equip_catalog.palico_thumb_prefab(500100)):
+                tex = equip_catalog.thumb_texture(prefab)
+                lines.append(f"{tex}: {'found' if game.has(tex) else 'not in the game'}")
+        partial = target.with_name(target.name + ".partial")
+        try:
+            with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("report.txt", "\n".join(lines) + "\n")
+                cache = self.data_dir / "cache"
+                for path in [*cache.glob("equip-catalog-*.json"), cache / "equip-scans.json"]:
+                    if path.is_file():
+                        zf.write(path, path.name)
+                folder = self._picture_dir()
+                if folder is not None and (folder / "ui.json").is_file():
+                    zf.write(folder / "ui.json", "ui.json")
+                sheet = equip_icons.icon_sheet(game.read) if game is not None else None
+                if sheet is not None:
+                    buffer = io.BytesIO()
+                    sheet.save(buffer, "PNG")
+                    zf.writestr("icons.png", buffer.getvalue())
+                log_file = self.data_dir / "manager.log"
+                if log_file.is_file():
+                    zf.writestr("manager.log", "\n".join(log_file.read_text(encoding="utf-8", errors="replace")
+                                                          .splitlines()[-2000:]))
+            os.replace(partial, target)
+        except BaseException:
+            fsutil.remove_file(partial)
+            raise
 
     def save_equipment_icon_sheet(self, target: Path, progress: ProgressFn | None = None) -> bool:
         """The game's icon atlas with a labelled grid (to confirm the weapon-icon positions)."""
