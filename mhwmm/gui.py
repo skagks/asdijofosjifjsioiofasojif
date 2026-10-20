@@ -2270,8 +2270,10 @@ class App:
         thumb.configure(image=image, text="", cursor="hand2")
         thumb.bind("<Button-1>", lambda e: self.show_picture(path, name))
 
-    def show_picture(self, path: Path, title: str):
-        ImageDialog(self.root, self.theme, title, path).show()
+    def show_picture(self, path: Path, title: str, parent=None):
+        """A picture shown large, over ``parent`` (the window it was clicked in; a dialog belongs to a
+        window, and Windows brings that window to the front with it)."""
+        ImageDialog(parent or self.root, self.theme, title, path).show()
 
     def _bind_wheel(self, widget, canvas: tk.Canvas):
         def wheel(event):

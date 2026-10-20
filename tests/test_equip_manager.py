@@ -192,6 +192,22 @@ def test_equipment_window(equip_manager, monkeypatch):
         app.show_mod(mods["Blades"].id)
         assert app.tree.selection() == (mods["Blades"].id,)
 
+        # a mod's own picture opens over the window it was clicked in (not over the main window,
+        # which Windows would bring to the front with the picture)
+        blades = m.get(mods["Blades"].id)
+        picture = tk.PhotoImage(master=root, width=32, height=18)
+        picture.put("#3060c0", to=(0, 0, 32, 18))
+        picture.write(str(m.mod_dir(blades.id) / "preview.png"), format="png")
+        blades.screenshot = "preview.png"
+        shown = []
+        monkeypatch.setattr(gui.ImageDialog, "show", lambda self: shown.append(self.master) or self.destroy())
+        window.select(Target("weapon", "02/000029"))
+        label = next(w for w in window._descendants(window.detail)
+                     if isinstance(w, gui.ttk.Label) and str(w.cget("cursor")) == "hand2")
+        label.event_generate("<Button-1>")
+        root.update()
+        assert shown == [window]
+
         # switching a mod off in the main list reloads the window
         app.toggle([mods["Blades"].id])
         pump(lambda: not window.overview.items[-1].enabled if window.overview.items else False)

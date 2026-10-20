@@ -72,6 +72,7 @@ class EquipmentWindow(tk.Toplevel):
         self.geometry(f"{px(1200)}x{px(780)}")
         set_dark_titlebar(self, t.name == "dark")
         self.deiconify()
+        self.bring_to_front()
         self.reload()
 
     # ------------------------------------------------------------------ layout
@@ -586,7 +587,7 @@ class EquipmentWindow(tk.Toplevel):
         label = ttk.Label(parent, image=image, style="Card.TLabel", cursor="hand2")
         label.image = image
         label.pack(side="left", anchor="n", padx=(0, px(10)))
-        label.bind("<Button-1>", lambda e: self.app.show_picture(path, use.name))
+        label.bind("<Button-1>", lambda e: self.app.show_picture(path, use.name, parent=self))
         Tooltip(self.theme, label, "모드에 들어 있는 미리보기 그림 · 누르면 크게 봅니다")
 
     def _section(self, parent, title: str):
@@ -717,9 +718,25 @@ class EquipmentWindow(tk.Toplevel):
         """Bring the window up, optionally showing only one mod's equipment."""
         if mod_id is not None:
             self.filter_mod(mod_id)
-        self.deiconify()
-        self.lift()
-        self.focus_set()
+        self.bring_to_front()
+
+    def bring_to_front(self):
+        """In front of the main window. Opened by a click in the main window, which Windows brings
+        back to the front once the click is over: so once more a moment later."""
+        def front():
+            if self.closed:
+                return
+            self.deiconify()
+            self.lift()
+            try:  # Windows does not always let lift() put a window over the active one
+                self.attributes("-topmost", True)
+                self.attributes("-topmost", False)
+            except tk.TclError:
+                pass
+            self.focus_force()
+
+        front()
+        self.after(150, front)
 
     # ------------------------------------------------------------------ misc
     def save_icon_sheet(self):
