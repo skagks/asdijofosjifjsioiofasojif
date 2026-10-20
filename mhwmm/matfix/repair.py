@@ -337,6 +337,7 @@ class RszContext:
         self.game = game
         self._registry = self._trust = None
         self.game_unreadable = 0  # game files the registry could not read: it may be out of date
+        self.registry_outdated = 0  # game files with CRCs the registry does not have as current
 
     @property
     def registry(self) -> rsz.TypeRegistry:
@@ -364,6 +365,8 @@ class RszContext:
         p = rsz.plan(label, data, donor, self.registry, provided, self.trust)
         if p is not None and p.game_unreadable:
             self.game_unreadable += 1
+        if p is not None and p.registry_outdated:
+            self.registry_outdated += 1
         return p
 
 

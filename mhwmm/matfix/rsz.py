@@ -41,8 +41,6 @@ REFERENCE_KINDS = {"Object", "UserData"}  # values are indexes into the file's o
 CHAIN_TYPES = ("app.ChainSetting", "via.motion.Chain", "via.motion.ChildSecondary")  # see plan(): never rewritten
 MAX_COUNT = 1 << 20
 MAX_STRING_DIFF = 2  # resource strings that may differ before a file no longer counts as "the same file"
-SEARCH_BUDGET = 20000  # field reads allowed while looking for how a changed instance was laid out
-MAX_SEARCH_INSTANCES = 800  # larger files are only read with known layouts (no guessing)
 _GENERIC_NAME = re.compile(r"^v\d+$")
 _CODE_RE = re.compile(r"[a-z]{2}\d{2}", re.IGNORECASE)
 
@@ -191,6 +189,12 @@ class RszInfo:
     inst_table: int  # file offset of the instance table
     external: set  # instances that are references to other .user files (no inline data)
     data_start: int  # file offset of the instance data, which runs to the end of the file
+    objects: list = field(default_factory=list)  # the object table: instances the file starts from
+
+    @property
+    def go_refs(self) -> int:
+        """GameObjectRef infos of a .pfb (which fields point at which game objects)."""
+        return struct.unpack_from("<I", self.data, 12)[0] if self.kind == "pfb" else 0
 
     @property
     def types(self) -> set[int]:
@@ -248,7 +252,10 @@ def parse(data: bytes) -> RszInfo | None:
         count, userdata, inst_off, data_off, user_off = header
         insts = [struct.unpack_from("<II", data, off + inst_off + i * 8) for i in range(count)]
         external = {struct.unpack_from("<i", data, off + user_off + i * 16)[0] for i in range(userdata)}
-        return RszInfo(bytes(data), kind, off, insts, off + inst_off, external, off + data_off)
+        n_objects = struct.unpack_from("<I", data, off + 8)[0]
+        objects = list(struct.unpack_from(f"<{n_objects}i", data, off + 48)) if off + 48 + 4 * n_objects <= inst_off + off \
+            else []
+        return RszInfo(bytes(data), kind, off, insts, off + inst_off, external, off + data_off, objects)
     return None
 
 
@@ -283,20 +290,12 @@ class Schema:
     def variable(self, kind: str) -> bool:
         return kind == "String" or (kind == "Resource" and self.resource_string)
 
-    def reference(self, kind: str) -> bool:
-        """Values that only mean something inside one file: instance indexes, and Resource
-        fields read as indexes into the file's own resource table."""
-        return kind in REFERENCE_KINDS or kind == "GameObjectRef" or (kind == "Resource" and not self.resource_string)
-
-
-class Budget:
-    def __init__(self, reads: int = SEARCH_BUDGET):
-        self.reads = reads
-
-    def spend(self):
-        self.reads -= 1
-        if self.reads < 0:
-            raise LayoutError("search budget exhausted")
+    def reference(self, kind: str, size: int = 0) -> bool:
+        """Values that only mean something inside one file: instance indexes (also the native
+        4-byte "Data" fields REasy treats as possible ones), game object references, and
+        Resource fields read as indexes into the file's own resource table."""
+        return kind in REFERENCE_KINDS or kind == "GameObjectRef" or (kind == "Data" and size == 4) or \
+            (kind == "Resource" and not self.resource_string)
 
 
 def _u32(data: bytes, pos: int, end: int) -> int:
@@ -326,15 +325,15 @@ def _read_one(data, pos, end, kind, size, schema, strict=False) -> tuple[bytes, 
 
 
 def read_values(data: bytes, pos: int, end: int, fields, schema: Schema, registry: TypeRegistry,
-                budget: Budget | None = None, strict: bool = False) -> tuple[list, int, bool]:
+                strict: bool = False) -> tuple[list, int, bool]:
     """Values of one instance (or struct) starting at ``pos``: raw bytes for a single field,
     a list of elements for an array (a struct element is a list of values).
     Returns (values, end position, whether every padding byte was zero). ``strict``: reject
     strings without their closing NUL (to tell a layout that only fits by length)."""
     values, clean = [], True
     for _name, kind, size, align, is_array in fields:
-        if budget is not None:
-            budget.spend()
+        if kind == "RuntimeType":
+            raise LayoutError("RuntimeType fields are not supported")  # REasy reads them as UTF-8 strings
         if is_array:
             pos, ok = _pad(data, pos, 4)
             clean &= ok
@@ -351,7 +350,7 @@ def read_values(data: bytes, pos: int, end: int, fields, schema: Schema, registr
                     pos, ok = _pad(data, pos, align)
                     clean &= ok
                 for _ in range(count):
-                    elem, pos, ok = read_values(data, pos, end, sub, schema, registry, budget, strict)
+                    elem, pos, ok = read_values(data, pos, end, sub, schema, registry, strict)
                     clean &= ok
                     elems.append(elem)
             else:
@@ -448,69 +447,12 @@ def _why(why: list[str] | None, text: str) -> None:
 def walk_mod(info: RszInfo, schema: Schema, registry: TypeRegistry, current_crc,
              why: list[str] | None = None) -> list[Instance] | None:
     """The mod's instances, each read with the layout it was written with: the current one
-    when its CRC is current, the historical one for an older CRC, or failing those the
-    current layout without some of its last fields (fields are added at the end of a class).
-    Requires exactly one way of reading the whole data block; None otherwise."""
-    end = len(info.data)
-    known = _walk_known(info, schema, registry, current_crc, why)
-    if known is not None or len(info.insts) > MAX_SEARCH_INSTANCES:
-        return known
-    budget = Budget()
-    solutions: list[list[Instance]] = []
-
-    def candidates(i, t, c):
-        out = []
-        now = registry.fields(t, schema.alt)
-        cur = current_crc(t)
-        if now is not None and (cur is None or cur == c):
-            return [(now, "current")]  # an unchanged CRC: the type is read as it is now
-        old = registry.old_fields(t, c, schema.alt)
-        if old is not None:
-            return [(old, "old")]
-        if now:
-            # an older CRC the history does not know: maybe only the CRC changed, maybe fields
-            # were added at the end (the only guess made, and only when it is the one way to read the file)
-            out.append((now, "assumed"))
-            out += [(now[:len(now) - k], "short") for k in range(1, len(now))]
-        return out
-
-    def step(i, pos, acc):
-        if len(solutions) > 1:
-            return
-        if i == len(info.insts):
-            if pos == end:
-                solutions.append(list(acc))
-            return
-        t, c = info.insts[i]
-        if i == 0 or not t or i in info.external:
-            acc.append(Instance(i, t, c, None, None, pos, pos))
-            step(i + 1, pos, acc)
-            acc.pop()
-            return
-        for fields, how in candidates(i, t, c):
-            try:
-                values, new, clean = read_values(info.data, pos, end, fields, schema, registry, budget,
-                                                 strict=how != "current")
-            except LayoutError as exc:
-                if "budget" in str(exc):
-                    raise
-                continue
-            if how != "current" and not clean:
-                continue  # a guessed layout must not read nonzero bytes as padding
-            acc.append(Instance(i, t, c, fields, values, pos, new, how))
-            step(i + 1, new, acc)
-            acc.pop()
-            if solutions and how != "short":
-                return  # a known layout explains this instance: no need to guess
-
-    try:
-        step(0, info.data_start, [])
-    except (LayoutError, RecursionError):
-        _why(why, "다른 구성도 찾아봤지만 시간 안에 끝나지 않음")
-        return None
-    if len(solutions) > 1:
-        _why(why, "다른 구성으로 읽는 방법이 여럿이라 하나로 정할 수 없음")
-    return solutions[0] if len(solutions) == 1 else None
+    when its CRC is current, the historical one for an older CRC, or the current one assumed
+    for an older CRC the history does not know (only when that leaves its padding zero).
+    Never guessed beyond that: fields are often inserted in the middle of a class, so "the
+    current layout minus its last fields" is not a safe guess (MHWmodfixer #22). None when
+    the whole data block does not read exactly."""
+    return _walk_known(info, schema, registry, current_crc, why)
 
 
 def _walk_known(info: RszInfo, schema: Schema, registry: TypeRegistry, current_crc,
@@ -632,6 +574,7 @@ class RszPlan:
     reason: str = ""  # why a stale file cannot be repaired
     detail: str = ""  # why each kind of repair did not apply (stuck files)
     game_unreadable: bool = False  # the game's own file did not read with the registry (it may be out of date)
+    registry_outdated: bool = False  # the game's own file has CRCs the registry does not know as current
 
 
 def _rebuild(info: RszInfo, instances: list[Instance], schema: Schema, registry: TypeRegistry,
@@ -662,9 +605,45 @@ def _clean_read(data: bytes, inst: Instance, schema: Schema, registry: TypeRegis
     return clean and stop == inst.end
 
 
-def _verify(data: bytes, schema: Schema, registry: TypeRegistry) -> bool:
+def _ref_values(fields, values, schema: Schema, registry: TypeRegistry):
+    """(kind, index) of every Object/UserData value of an instance, struct elements included."""
+    for f, v in zip(fields, values):
+        kind = f[1]
+        if kind.startswith("Struct:"):
+            sub = registry.struct_fields(kind[7:]) or ()
+            for elem in v:
+                yield from _ref_values(sub, elem, schema, registry)
+        elif kind in REFERENCE_KINDS:
+            for b in (v if isinstance(v, list) else [v]):
+                yield kind, struct.unpack("<i", b)[0]
+
+
+def _verify(data: bytes, schema: Schema, registry: TypeRegistry, crcs: dict[int, int] | None = None,
+            source: RszInfo | None = None) -> bool:
+    """The output reads exactly under the current layout, every Object value points at an
+    earlier inline instance and every UserData value at an external one (REasy's save checks),
+    every CRC is the current one, and the instances are those of the file it was made from."""
     info = parse(data)
-    return info is not None and walk_current(info, schema, registry) is not None
+    walked = walk_current(info, schema, registry) if info is not None else None
+    if walked is None:
+        return False
+    if source is not None and [t for t, _c in info.insts] != [t for t, _c in source.insts]:
+        return False
+    if crcs and any(i and t in crcs and crcs[t] != c for i, (t, c) in enumerate(info.insts)):
+        return False
+    for inst in walked[0]:
+        if inst.fields is None:
+            continue
+        for kind, target in _ref_values(inst.fields, inst.values, schema, registry):
+            if target == 0:
+                continue
+            if not 0 < target < len(info.insts):
+                return False
+            if kind == "UserData" and target not in info.external:
+                return False
+            if kind == "Object" and (target in info.external or target >= inst.index):
+                return False
+    return True
 
 
 def _occurrences(instances: list[Instance]) -> dict[int, list[Instance]]:
@@ -699,32 +678,104 @@ def _same_field(a, b) -> bool:
     return _norm(a[0]) == _norm(b[0]) and a[1] == b[1] and a[2] == b[2] and a[4] == b[4]
 
 
-def _migrate(mod: RszInfo, walked: list[Instance], donor_insts: list[Instance] | None, schema: Schema,
-             registry: TypeRegistry, notes: list[str], why: list[str] | None = None) -> list[Instance] | None:
+def _keyed(fields, values) -> dict[tuple[str, int], tuple]:
+    """Field -> (field, value) by (name, n-th field of that name): 41 types repeat a name."""
+    out, seen = {}, {}
+    for f, v in zip(fields, values):
+        name = _norm(f[0])
+        n = seen.get(name, 0)
+        seen[name] = n + 1
+        out[(name, n)] = (f, v)
+    return out
+
+
+def _ref_paths(info: RszInfo, instances: list[Instance]) -> dict[int, tuple]:
+    """How each inline instance is reached from the object table: (root type, n-th root of that
+    type), then (field name, n-th of that name, array position) per step - what a mod's and
+    the game's copy of the same thing share even when entries were added in between."""
+    by_index = {i.index: i for i in instances if i.fields is not None}
+    paths: dict[int, tuple] = {}
+    queue, roots = [], {}
+    for idx in info.objects:
+        inst = by_index.get(idx)
+        if inst is not None and idx not in paths:
+            n = roots.get(inst.type_id, 0)
+            roots[inst.type_id] = n + 1
+            paths[idx] = ((inst.type_id, n),)
+            queue.append(idx)
+    while queue:
+        inst = by_index[queue.pop(0)]
+        for (name, n), (f, v) in _keyed(inst.fields, inst.values).items():
+            if f[1] != "Object":
+                continue
+            items = v if isinstance(v, list) else [v]
+            for j, b in enumerate(items):
+                target = struct.unpack("<i", b)[0]
+                if target in by_index and target not in paths:
+                    # with the array length: when an update inserted entries, positions no longer match
+                    paths[target] = paths[inst.index] + ((name, n, j, len(items) if isinstance(v, list) else None),)
+                    queue.append(target)
+    return paths
+
+
+def _pair(a: RszInfo, a_insts: list[Instance], b: RszInfo, b_insts: list[Instance]) -> dict[int, Instance]:
+    """a's instance index -> b's instance standing for the same thing: the same type reached the
+    same way from the object table; failing that the n-th of its type, but only for types both
+    files have equally many of (when an update inserted entries, the n-th is another one)."""
+    a_paths, b_paths = _ref_paths(a, a_insts), _ref_paths(b, b_insts)
+    b_by_path = {(path, i.type_id): i for i in b_insts if i.fields is not None
+                 for path in [b_paths.get(i.index)] if path is not None}
+    pairs, used = {}, set()
+    for inst in a_insts:
+        path = a_paths.get(inst.index)
+        if inst.fields is not None and path is not None and (path, inst.type_id) in b_by_path:
+            pairs[inst.index] = b_by_path[(path, inst.type_id)]
+            used.add(pairs[inst.index].index)
+    a_rest, b_rest = _occurrences([i for i in a_insts if i.index not in pairs]), \
+        _occurrences([i for i in b_insts if i.index not in used])
+    a_all, b_all = _occurrences(a_insts), _occurrences(b_insts)
+    for t, pool in a_rest.items():
+        if len(a_all.get(t, [])) == len(b_all.get(t, [])) and len(pool) == len(b_rest.get(t, [])):
+            for x, y in zip(pool, b_rest[t]):
+                pairs[x.index] = y
+    return pairs
+
+
+def _struct_refs(kind: str, value, schema: Schema, registry: TypeRegistry) -> bool:
+    """Whether a struct array holds a non-null reference anywhere."""
+    sub = registry.struct_fields(kind[7:]) or ()
+    for elem in value:
+        for f, v in zip(sub, elem):
+            if f[1].startswith("Struct:") and _struct_refs(f[1], v, schema, registry):
+                return True
+            if schema.reference(f[1], f[2]) and not _is_null(v):
+                return True
+    return False
+
+
+def _migrate(mod: RszInfo, walked: list[Instance], donor: RszInfo | None, donor_insts: list[Instance] | None,
+             schema: Schema, registry: TypeRegistry, notes: list[str],
+             why: list[str] | None = None) -> list[Instance] | None:
     """The mod's instances in the current layout. An instance whose bytes read exactly the same
     way under the current layout keeps them (an older dump often only described the same bytes
-    with other names or types); otherwise fields are matched by name: the mod's own value for
-    every field that still exists, the current game file's value for new ones, and the instance
-    is marked "mapped". None when that cannot be done safely (unnamed fields that changed, a new
-    field pointing into the game file's own instances or at an undeclared path)."""
+    with other names or types); otherwise fields are matched by name - the mod's own value for
+    every field that still exists, the current game file's value for new ones - and the
+    instance is marked "mapped". Only managed (app.*) types read exactly with a historical
+    layout are rewritten. None when that cannot be done safely."""
+    pairs = _pair(mod, walked, donor, donor_insts) if donor is not None and donor_insts else {}
     donors = _occurrences(donor_insts or [])
-    seen: dict[int, int] = {}
     manifest = {_strip_at(s).lower() for s in mod.resources()}
     out, added, dropped = [], set(), set()
     end = len(mod.data)
     for inst in walked:
         if inst.fields is None or inst.layout in ("current", "assumed"):
             out.append(inst)
-            if inst.fields is not None:
-                seen[inst.type_id] = seen.get(inst.type_id, 0) + 1
             continue
         now = registry.fields(inst.type_id, schema.alt)
         name = registry.name(inst.type_id)
         if now is None:
             _why(why, f"{name}: 현재 타입 정보가 없음")
             return None
-        k = seen.get(inst.type_id, 0)
-        seen[inst.type_id] = k + 1
         named = not any(_GENERIC_NAME.match(f[0]) for f in (*inst.fields, *now))
         same_names = [_norm(f[0]) for f in inst.fields] == [_norm(f[0]) for f in now]
         if not named or same_names:
@@ -735,24 +786,33 @@ def _migrate(mod: RszInfo, walked: list[Instance], donor_insts: list[Instance] |
             if stop == inst.end and clean:  # the same bytes, described differently: keep them
                 out.append(Instance(inst.index, inst.type_id, inst.crc, now, values, inst.start, inst.end))
                 continue
-            if not named:
-                _why(why, f"{name}: 이름 없는 필드의 구성이 실제로 바뀌어 맞출 수 없음")
-                return None
-        pool = donors.get(inst.type_id, [])
-        donor = pool[k] if k < len(pool) else (pool[0] if pool else None)
-        mine = {_norm(f[0]): (f, v) for f, v in zip(inst.fields, inst.values)}
-        theirs = {_norm(f[0]): v for f, v in zip(donor.fields, donor.values)} if donor is not None else {}
+        if not named:
+            _why(why, f"{name}: 이름 없는 필드의 구성이 실제로 바뀌어 맞출 수 없음")
+            return None
+        if name.startswith("via."):
+            _why(why, f"{name}: 엔진 내장 타입은 다시 쓰지 않음 (형식 정보가 덜 정확함)")
+            return None
+        if not _clean_read(mod.data, inst, schema, registry):
+            _why(why, f"{name}: 옛 구성으로 읽으면 빈 칸이 0이 아님")
+            return None
+        if mod.go_refs and any(f[1] == "GameObjectRef" for f in now):
+            _why(why, f"{name}: 게임 오브젝트를 가리키는 필드가 있어 다시 쓰지 않음")
+            return None
+        donor_inst = pairs.get(inst.index) or (donors.get(inst.type_id) or [None])[0]
+        mine = _keyed(inst.fields, inst.values)
+        theirs = {k: v for k, (_f, v) in _keyed(donor_inst.fields, donor_inst.values).items()} if donor_inst else {}
         values = []
-        for f in now:
-            have = mine.get(_norm(f[0]))
+        for key, (f, _v) in _keyed(now, [None] * len(now)).items():
+            have = mine.get(key)
             if have is not None and _same_field(have[0], f):
                 values.append(have[1])
                 continue
-            if _norm(f[0]) not in theirs:
+            if key not in theirs:
                 _why(why, f"{name}.{f[0]}: 새 필드인데 게임 원본에 같은 인스턴스가 없음")
                 return None  # a new field with no current value to take
-            value = theirs[_norm(f[0])]
-            if schema.reference(f[1]) and not _is_null(value):
+            value = theirs[key]
+            if (schema.reference(f[1], f[2]) and not _is_null(value)) or \
+                    (f[1].startswith("Struct:") and _struct_refs(f[1], value, schema, registry)):
                 _why(why, f"{name}.{f[0]}: 새 필드가 게임 원본에만 있는 구성요소를 가리킴")
                 return None  # points at instances only the game file has
             if schema.variable(f[1]) and any(p not in manifest for p in _paths_in(value)):
@@ -771,16 +831,26 @@ def _migrate(mod: RszInfo, walked: list[Instance], donor_insts: list[Instance] |
     return out
 
 
-def _transplant(donor: RszInfo, donor_insts: list[Instance], walked: list[Instance] | None,
-                schema: Schema, registry: TypeRegistry, notes: list[str]) -> bytes:
-    """The current game file with the mod's values copied in: for each instance of the same
-    type (in order) every field that still exists, except references to other instances and
-    paths the game file does not declare. Without the mod's values the game file as is."""
+def _null_shape(value) -> tuple:
+    """Which references are set, and how many: what a mod changes when it unhooks or adds parts."""
+    if isinstance(value, list):
+        return ("list", len(value), tuple(_is_null(v) for v in value))
+    return ("one", _is_null(value))
+
+
+def _transplant(mod: RszInfo, donor: RszInfo, donor_insts: list[Instance], walked: list[Instance] | None,
+                schema: Schema, registry: TypeRegistry, notes: list[str],
+                why: list[str] | None = None) -> bytes | None:
+    """The current game file with the mod's values copied in: each mod instance paired with the
+    game's instance standing for the same thing, every field that still exists, except
+    references, structs, chain physics and paths the game file does not declare. None when the
+    mod set its references differently (it unhooked or added parts on purpose: copying values
+    into the game's structure would quietly undo that, MHWmodfixer #30)."""
     if walked is None:
         notes.append("모드가 바꾼 값은 옮기지 못하고 게임 원본 값을 씁니다")
         return donor.data
-    mods = _occurrences(walked)
-    seen: dict[int, int] = {}
+    by_index = {x.index: x for x in walked}
+    pairs = {d.index: by_index[m] for m, d in _pair(mod, walked, donor, donor_insts).items()}
     manifest = {_strip_at(s).lower() for s in donor.resources()}
     kept = lost = 0
     out, chains = [], set()
@@ -792,18 +862,20 @@ def _transplant(donor: RszInfo, donor_insts: list[Instance], walked: list[Instan
             chains.add(registry.name(inst.type_id))  # rewritten chain settings broke at boot: keep the game's
             out.append(inst)
             continue
-        k = seen.get(inst.type_id, 0)
-        seen[inst.type_id] = k + 1
-        pool = mods.get(inst.type_id, [])
-        mine = pool[k] if k < len(pool) else None
+        mine = pairs.get(inst.index)
         values = list(inst.values)
         if mine is not None:
-            theirs = {f[0]: (f, v) for f, v in zip(mine.fields, mine.values)}
-            for j, f in enumerate(inst.fields):
-                have = theirs.get(f[0])
-                if have is None or not _same_field(have[0], f) or have[1] == values[j]:
+            theirs = _keyed(mine.fields, mine.values)
+            for j, (key, (f, _v)) in enumerate(_keyed(inst.fields, inst.values).items()):
+                have = theirs.get(key)
+                if have is None or not _same_field(have[0], f):
                     continue
-                if schema.reference(f[1]) or f[1].startswith("Struct:") or \
+                if f[1] in REFERENCE_KINDS and _null_shape(have[1]) != _null_shape(values[j]):
+                    _why(why, f"{registry.name(inst.type_id)}.{f[0]}: 모드와 게임 원본의 연결이 다름")
+                    return None
+                if have[1] == values[j]:
+                    continue
+                if schema.reference(f[1], f[2]) or f[1].startswith("Struct:") or \
                         (schema.variable(f[1]) and any(p not in manifest for p in _paths_in(have[1]))):
                     lost += 1
                     continue
@@ -811,14 +883,15 @@ def _transplant(donor: RszInfo, donor_insts: list[Instance], walked: list[Instan
                 kept += 1
         out.append(Instance(inst.index, inst.type_id, inst.crc, inst.fields, values, inst.start, inst.end,
                             "mapped" if values != inst.values else inst.layout))
+    matched = set(id(m) for m in pairs.values())
+    unpaired = {registry.name(m.type_id) for m in walked if m.fields is not None and id(m) not in matched}
     notes.append(f"모드가 바꾼 값 {kept}개를 옮겼습니다" + (f", {lost}개(다른 구성요소·경로를 가리키는 값)는 게임 원본 값을 씁니다"
                                                     if lost else ""))
     if chains:
         notes.append("체인 물리 설정은 게임 원본 값을 씁니다: " + ", ".join(sorted(chains)[:3]))
-    extra = {t: len(pool) - seen.get(t, 0) for t, pool in mods.items() if len(pool) > seen.get(t, 0)}
-    if extra:
-        notes.append("게임 원본보다 많은 모드 인스턴스 " + ", ".join(f"{registry.name(t)} {n}개" for t, n in sorted(extra.items())[:3])
-                     + "는 대응하는 것이 없어 빠집니다")
+    if unpaired:
+        notes.append("게임 원본에서 짝을 찾지 못한 모드 인스턴스는 값을 옮기지 못했습니다: " + ", ".join(sorted(unpaired)[:3]) +
+                     (f" 외 {len(unpaired) - 3}종" if len(unpaired) > 3 else ""))
     return _rebuild(donor, out, schema, registry, None)
 
 
@@ -879,6 +952,7 @@ def plan(label: str, mod_bytes: bytes, donor_bytes: bytes | None, registry: Type
     if donor is None and not trust_registry:
         return result  # nothing to compare with: leave it as it is
     donor_crcs = crc_map(donor) if donor is not None else {}
+    result.registry_outdated = any(registry.crc(t) not in (None, c) for t, c in donor_crcs.items())
 
     def current_crc(t):
         if t in donor_crcs:
@@ -944,7 +1018,7 @@ def plan(label: str, mod_bytes: bytes, donor_bytes: bytes | None, registry: Type
         for i, (t, c) in enumerate(mod.insts):
             if i and t in crcs and crcs[t] != c:
                 struct.pack_into("<I", patched, mod.inst_table + i * 8 + 4, crcs[t])
-        if _verify(bytes(patched), schema, registry):
+        if _verify(bytes(patched), schema, registry, crcs, mod):
             result.state, result.method, result.data = "fixable", "CRC 갱신", bytes(patched)
             return result
 
@@ -952,14 +1026,15 @@ def plan(label: str, mod_bytes: bytes, donor_bytes: bytes | None, registry: Type
     walked = walk_mod(mod, schema, registry, current_crc, trace)
     if walked is not None:
         notes: list[str] = []
-        migrated = _migrate(mod, walked, donor_insts if donor is not None else None, schema, registry, notes, trace)
+        migrated = _migrate(mod, walked, donor, donor_insts if donor is not None else None, schema, registry,
+                            notes, trace)
         chains = sorted({registry.name(i.type_id) for i in migrated or () if i.layout == "mapped"
                          and registry.name(i.type_id).startswith(CHAIN_TYPES)})
         if chains:
             trace.append("체인 물리 설정은 다시 쓰지 않음: " + ", ".join(chains[:3]))
         elif migrated is not None:
             data = _rebuild(mod, migrated, schema, registry, crcs)
-            if _verify(data, schema, registry):
+            if _verify(data, schema, registry, crcs, mod):
                 rewritten = sorted({registry.name(i.type_id) for i in migrated if i.layout == "mapped"})
                 same = data[mod.data_start:] == mod.data[mod.data_start:]
                 missing = sorted({registry.name(t) for t in donor.types - mod.types}) if donor is not None else []
@@ -986,16 +1061,19 @@ def plan(label: str, mod_bytes: bytes, donor_bytes: bytes | None, registry: Type
     notes = []
     if trace:
         notes.append("다시 쓰지 않은 이유: " + "; ".join(dict.fromkeys(trace)))
-    data = _transplant(donor, donor_insts, walked, schema, registry, notes)
-    if not _verify(data, schema, registry):
-        data = donor.data
-        notes = ["모드가 바꾼 값은 옮기지 못하고 게임 원본 값을 씁니다"]
+    data = _transplant(mod, donor, donor_insts, walked, schema, registry, notes, trace)
+    if data is None:
+        return stuck("모드와 게임 원본의 연결(다른 구성요소를 가리키는 필드)이 서로 달라 모드 값을 안전하게 옮길 수 없습니다")
+    method = "원본 교체"
+    if data == donor.data or not _verify(data, schema, registry, None, donor):
+        data, method = donor.data, "원본 그대로 교체"
+        notes = [n for n in notes if not n.startswith("모드가 바꾼 값")] + ["모드가 바꾼 값은 옮기지 못하고 게임 원본 값을 씁니다"]
     if match[1] is not None:
         data = apply_substitution(data, match[1][0], match[1][1], provided or set())
         notes.append(f"'{match[1][0]}' 경로를 모드의 '{match[1][1]}'(으)로 바꿨습니다")
     data = _carry_user_refs(data, mod, notes)
     if data is None:
         return stuck("모드가 게임 원본과 다른 설정 파일(.user)을 가리키고 있어 원본으로 바꿀 수 없습니다")
-    result.state, result.method, result.data = "fixable", "원본 교체", data
+    result.state, result.method, result.data = "fixable", method, data
     result.notes += notes
     return result

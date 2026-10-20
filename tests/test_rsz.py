@@ -140,15 +140,15 @@ def test_current_crcs_that_do_not_read_are_reported_not_changed():
     assert "app.user_data.TestArmorParam" in plan.detail
 
 
-def test_unknown_old_crc_missing_the_last_fields_is_rebuilt():
-    short = PARAM_FIELDS[:-1]  # an older CRC the history does not know; the only way it reads
+def test_fewer_fields_under_an_unknown_old_crc_are_not_guessed():
+    short = PARAM_FIELDS[:-1]  # an older CRC the history does not know, missing the last field
     mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, 0x1999, short, param(short, scale=3.0))])
     game = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(7)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, child=0))])
     plan = rsz.plan("a.user.3", mod, game, registry())
-    assert (plan.state, plan.method) == ("fixable", "재구성")
-    values, info = fields_of(plan.data)
-    assert info.insts[2] == (PARAM, NEW_CRC)
-    assert values[(2, "_Scale")] == f32(3.0) and values[(2, "_Child")] == s32(0)
+    # fields are often inserted mid-class, so "the current layout minus its last fields" is not
+    # guessed (MHWmodfixer #22): the game file is used, without the mod's values
+    assert (plan.state, plan.method) == ("fixable", "원본 그대로 교체")
+    assert any("옮기지 못하고" in n for n in plan.notes)
 
 
 def test_new_reference_falls_back_to_the_game_file_with_the_mods_values():
@@ -374,15 +374,58 @@ def test_unknown_old_crc_needs_clean_padding_for_a_crc_update():
 
 
 def test_unchanged_instances_keep_their_bytes_padding_included():
-    first = bytearray(encode(PARAM_FIELDS, param(PARAM_FIELDS), 0))
-    mod = bytearray(user_file([(PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS)),
+    first = bytearray(encode(PARAM_FIELDS, param(PARAM_FIELDS, child=0), 0))
+    mod = bytearray(user_file([(PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, child=0)),
                                (PARAM, OLD_CRC, OLD_PARAM, param(OLD_PARAM, scale=2.5))]))
     info = rsz.parse(bytes(mod))
     pad = info.data_start + 4 + 1 + 1  # padding before _Mesh in the first (current) instance
     assert mod[pad] == 0 and len(first) > 8
     mod[pad] = 0x55  # the game's own writer sometimes leaves such bytes
-    game = user_file([(PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, new=1)),
+    game = user_file([(PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, new=1, child=0)),
                       (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, new=1))])
     plan = rsz.plan("a.user.3", bytes(mod), game, registry())
     assert (plan.state, plan.method) == ("fixable", "재구성")
     assert plan.data[pad] == 0x55  # kept, not rewritten as zero
+
+
+def test_object_references_must_point_at_earlier_instances():
+    bad = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, child=2))])
+    good = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]), (PARAM, NEW_CRC, PARAM_FIELDS, param(PARAM_FIELDS, child=1))])
+    assert not rsz._verify(bad, rsz.Schema(), registry())  # points at itself
+    assert rsz._verify(good, rsz.Schema(), registry())
+    assert not rsz._verify(good, rsz.Schema(), registry(), {PARAM: 0x9999})  # a CRC that is not the current one
+
+
+def test_replacing_refuses_when_the_mod_unhooked_a_part():
+    short = PARAM_FIELDS[:-1]
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]),
+                     (PARAM, NO_CHILD_CRC, short, param(short))])
+    plain = rsz.plan("a.user.3", mod, game_file(), registry())
+    assert plain.method == "원본 교체"  # no reference the mod has differs from the game's
+    unhooked = [["_Base", "UserData", 4, 4, 0]] + PARAM_FIELDS
+    reg = registry(**{format(PARAM, "x"): [format(NEW_CRC, "x"), PARAM_NAME, json.dumps(unhooked)]})
+    reg._old[format(PARAM, "x")][format(NO_CHILD_CRC, "x")] = json.dumps(unhooked[:-1])
+    ext = 0xD1
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(42)]),
+                     (PARAM, NO_CHILD_CRC, unhooked[:-1], [s32(0)] + param(short))])  # _Base set to null on purpose
+    game = user_file([(ext, 0x7777, None, None), (CHILD, CHILD_CRC, CHILD_FIELDS, [s32(7)]),
+                      (PARAM, NEW_CRC, unhooked, [s32(1)] + param(PARAM_FIELDS, child=2))])
+    plan = rsz.plan("a.user.3", mod, game, reg)
+    assert plan.state == "stuck" and "연결" in plan.reason and "_Base" in plan.detail  # MHWmodfixer #30
+
+
+def test_entries_inserted_mid_table_do_not_receive_other_entries_values():
+    """An update inserted a skill in the middle of a table (and the table gained a reference, so
+    it cannot simply be rewritten): pairing the n-th entries would slide the mod's values onto
+    the wrong skills, so the game file is not filled in that way."""
+    table = [["_Items", "Object", 4, 4, 1], ["_Default", "Object", 4, 4, 0]]
+    old_table = [["_Items", "Object", 4, 4, 1]]
+    reg = registry(**{format(EXTRA, "x"): ["5555", "app.SkillTable", json.dumps(table)]})
+    reg._old[format(EXTRA, "x")] = {"5550": json.dumps(old_table)}
+    mod = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(100)]), (CHILD, CHILD_CRC, CHILD_FIELDS, [s32(200)]),
+                     (EXTRA, 0x5550, old_table, [[s32(1), s32(2)]])])
+    game = user_file([(CHILD, CHILD_CRC, CHILD_FIELDS, [s32(10)]), (CHILD, CHILD_CRC, CHILD_FIELDS, [s32(15)]),
+                      (CHILD, CHILD_CRC, CHILD_FIELDS, [s32(20)]),
+                      (EXTRA, 0x5555, table, [[s32(1), s32(2), s32(3)], s32(2)])])
+    plan = rsz.plan("skills.user.3", mod, game, reg)
+    assert plan.state == "stuck" and plan.data is None and "연결" in plan.reason

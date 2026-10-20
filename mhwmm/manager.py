@@ -1131,7 +1131,7 @@ class ModManager:
                 self._update_registry(game, context, run, progress, only_if_outdated=True)
             run.registry = rsz.registry_date(rsz.TypeRegistry.path())
             self._run_jobs(jobs, game, shaders, run, verb, progress, context)
-            if context.game_unreadable and not run.registry_updated:
+            if (context.game_unreadable or context.registry_outdated) and not run.registry_updated:
                 self._update_registry(game, context, run, progress)
         finally:
             rsz.TypeRegistry.release()

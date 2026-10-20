@@ -32,8 +32,17 @@ jobs:
       - name: Re-bake
         if: steps.check.outputs.changed == 'true'
         run: |
-          curl -sSfL -o modfixer.json.gz https://raw.githubusercontent.com/PoeticJustice79/MHWmodfixer/HEAD/tools/rsz_fields_mhwilds.json.gz
+          cp mhwmm/matfix/rsz_types.json.xz previous.json.xz
+          curl -sSfL -o modfixer.json.gz https://raw.githubusercontent.com/PoeticJustice79/MHWmodfixer/82e13a29b3bf338aa410014c2a1b67196296e4ad/tools/rsz_fields_mhwilds.json.gz
           python tools/make_rsz_types.py reasy modfixer.json.gz
+      - name: Check the new registry
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          pip install pytest zstandard
+          # a real game file (Female 004_001_avp.user.3), published in another mod manager's repository
+          curl -sSfL -o game_avp.user.3 https://raw.githubusercontent.com/Noplch0/mh-mod-manager/caf0a715f666c673b9bedb9b56f0eee70d97dbeb/src/MHSeries.ModManager/Data/Equipment/mhws_female_avp.user.bin
+          python tools/check_rsz_types.py previous.json.xz game_avp.user.3
+          python -m pytest -q tests/test_rsz.py tests/test_matfix.py
       - name: Commit
         if: steps.check.outputs.changed == 'true'
         run: |
