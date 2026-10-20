@@ -2237,20 +2237,18 @@ class App:
             self._option_vars.append((opt["id"], var))
             row = ttk.Frame(inner, style="Card.TFrame")
             row.pack(fill="x", pady=(px(12 if size else 10), 0))
-            if size:
+            path = pictures[opt["id"]]
+            if path:  # an option without a picture has no box
                 box = ttk.Frame(row, style="Thumb.TFrame", width=size[0], height=size[1])
                 box.pack_propagate(False)
                 box.pack(side="left", anchor="n", padx=(0, px(10)))
                 thumb = ttk.Label(box, style="Thumb.TLabel", anchor="center")
                 thumb.pack(fill="both", expand=True)
-                path = pictures[opt["id"]]
-                image = self._thumbnail(path, *size, load=False) if path else None
+                image = self._thumbnail(path, *size, load=False)
                 if image is not None:
                     self._show_option_thumb(thumb, path, opt["name"], image)
-                elif path:
-                    pending.append((thumb, path, opt["name"]))  # loaded once the tab is drawn
                 else:
-                    thumb.configure(text="그림 없음")
+                    pending.append((thumb, path, opt["name"]))  # loaded once the tab is drawn
             body = ttk.Frame(row, style="Card.TFrame")
             body.pack(side="left", fill="x", expand=True)
             line = ttk.Frame(body, style="Card.TFrame")
@@ -2295,7 +2293,7 @@ class App:
             if image is not None:
                 self._show_option_thumb(thumb, path, name, image)
             else:
-                thumb.configure(text="그림 없음")
+                thumb.master.destroy()  # unreadable: as without a picture
         if pending:
             self.root.after(1, lambda: self._load_option_thumbs(gen, pending, size))
 

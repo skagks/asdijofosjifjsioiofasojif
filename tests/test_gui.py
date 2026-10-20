@@ -146,11 +146,11 @@ def test_gui_options_show_pictures(root, manager, tmp_path, monkeypatch):
     assert {"모두 켜기", "모두 끄기"} <= set(texts(app.options_head))
     assert "모두 켜기" not in texts(app.options_inner)
 
-    # thumbnails load after the tab is drawn; an option without a picture keeps an empty box
+    # thumbnails load after the tab is drawn; an option without a picture has no box at all
     pump(root, lambda: len(app._option_images) == 2)
     thumbs = [w for w in widgets(app.options_inner) if isinstance(w, ttk.Label) and str(w.cget("style")) == "Thumb.TLabel"]
-    assert [bool(str(w.cget("image"))) for w in thumbs] == [True, False, True]  # One, Three, Two
-    assert str(thumbs[1].cget("text")) == "그림 없음"
+    assert [bool(str(w.cget("image"))) for w in thumbs] == [True, True]  # One, Two (Three has none)
+    assert "그림 없음" not in texts(app.options_inner)
 
     # switching an option rebuilds the list with the cached thumbnails right away
     app._option_vars[0][1].set(True)
