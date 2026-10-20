@@ -20,7 +20,9 @@ Fixed = 18 - n and shown as n + 1):
   it<TT>/<id // 10000>/<id % 10000>, _<Type> = the weapon's Fixed id) and Outer<Type>Data
   (layered), names from Excel_Equip/<Type> and Outer<Type>; the tree name from <Type>Tree (the
   row a weapon id sits in -> WeaponSeriesData).  Thumbnails: WeaponThumbnailTextureData,
-  TextureId = TYPE * 10^6 + the Fixed id (kinsects: 10 * 10^6 + _ModelID).
+  TextureId = TYPE * 10^6 + the Fixed id (+ ATTR * 1000 for an element's picture; kinsects:
+  10 * 10^6 + _ModelID).  A layered look whose row names no weapon (_<Type>Id INVALID) is pictured by
+  the weapon of its name ("<weapon>-<element>" -> that weapon's element picture).
 - palico: Otomo/DataParam/OtomoEquipSeriesData, whose _ModelId is the Fixed value of
   app.OtEquipDef.EQUIP_SERIES_ID; no game file maps that to the ch05 folder number, so the
   numbers below are embedded: taken from dtlnor's enum dump (Enums_Internal.json,
@@ -56,8 +58,9 @@ from .userdata import USER, read_user, rows
 
 log = logging.getLogger(__name__)
 
-CATALOG_FORMAT = 3  # raise when the result of build() changes, so that cached catalogs are made again
-# 2: thumbnails also without the GUI thumbnail tables (their names follow the TextureId); 3: rarity per name
+CATALOG_FORMAT = 4  # raise when the result of build() changes, so that cached catalogs are made again
+# 2: thumbnails also without the GUI thumbnail tables (their names follow the TextureId); 3: rarity per name;
+# 4: layered weapons of a look of their own take the picture of the weapon they are named after
 NATIVES = "natives/STM/"
 USER_VERSION, MSG_VERSION, PFB_VERSION, TEX_VERSION = ".3", ".23", ".18", ".241106027"
 USER_EXT, MSG_EXT = ".user" + USER_VERSION, ".msg" + MSG_VERSION
@@ -190,6 +193,31 @@ def _named(pairs, limit: int = MAX_NAMES) -> dict:
     names = list(rarity)[:limit]
     return {"names": names, "rarities": [rarity[n] for n in names], "rarity": min(every, default=None),
             "rarity_max": max(every, default=None)}
+
+
+# a weapon's grade at the end of its name: 호프대거Ⅰ, Hope Daggers I
+_GRADE = re.compile(r"(?:\s*[\u2160-\u216b]+|\s+(?:I{1,3}|IV|VI{0,3}|IX|X))$")
+# the element a layered look is named after, "<weapon>-화" (app.WeaponDef.ATTR: a weapon's element
+# picture is TextureId + ATTR * 1000)
+_ELEMENTS = {"화": 1, "수": 2, "빙": 3, "뇌": 4, "용": 5, "독": 6, "비": 7, "면": 8, "폭": 9}
+
+
+def _without_grade(name: str) -> str:
+    return _GRADE.sub("", name)
+
+
+def _named_after(name: str, weapons: dict[str, int]) -> list[int]:
+    """TextureIds (without the weapon type) for a layered look that names no weapon of its own: the
+    weapon of the same name, or of the name before "-<something>" (its element's picture first)."""
+    if name in weapons:
+        return [weapons[name]]
+    base, dash, suffix = name.rpartition("-")
+    base = base.strip()
+    wid = (weapons.get(base) or weapons.get(_without_grade(base))) if dash and base else None
+    if not wid:
+        return []
+    element = _ELEMENTS.get(suffix.strip())
+    return ([element * 1000 + wid] if element else []) + [wid]
 
 
 def _unique(names) -> list[str]:
@@ -480,15 +508,18 @@ class _Builder:
             names = self.messages(f"GameDesign/Text/Excel_Equip/{file}") if data is not None else None
             tree = self._weapon_tree(file, trees) if data is not None and trees else {}
             found: dict[str, list] = {}
+            named: dict[str, int] = {}  # a weapon's name (also without its grade) -> its id
             for r in rows(data):
                 stored, model = _int(r.get("_Type")), _int(r.get("_ModelId"))
                 wtype = 14 - stored if stored is not None and 0 <= 14 - stored < len(WEAPON_TYPES) else t
                 if model is None or model < 0:
                     continue
-                wid = _int(r.get("_" + file))
+                wid, name = _int(r.get("_" + file)), self.text(names, r.get("_Name"))
                 found.setdefault(weapon_key(wtype, model), []).append(
-                    ((0, *_order(r, "_SortId", "_Index")), self.text(names, r.get("_Name")),
-                     _rarity(r.get("_Rare")), wtype, wid))
+                    ((0, *_order(r, "_SortId", "_Index")), name, _rarity(r.get("_Rare")), wtype, wid))
+                if wid is not None and wid > 0 and name:
+                    named.setdefault(name, wid)
+                    named.setdefault(_without_grade(name), wid)
             outer = self.user(f"GameDesign/Common/Weapon/Outer{file}Data")
             outer_names = self.messages(f"GameDesign/Text/Excel_Equip/Outer{file}") if outer is not None else None
             for r in rows(outer):
@@ -504,13 +535,13 @@ class _Builder:
                 in_tree = Counter(tree[m[4]] for m in members if m[4] in tree)
                 if in_tree:
                     entry["tree"] = in_tree.most_common(1)[0][0]
-                for _sort, _name, _rare, wtype, wid in members:
-                    tid = wtype * 10 ** 6 + wid if wid is not None and wid > 0 else None
-                    prefab = (thumbs.get(tid) or item_thumb_prefab(tid)) if tid is not None else None
-                    tex = self.thumb(prefab) if prefab else None
-                    if tex:
-                        entry["thumb"] = tex
-                        break
+                ids = [wtype * 10 ** 6 + wid for _sort, _name, _rare, wtype, wid in members
+                       if wid is not None and wid > 0]
+                # a layered look that names no weapon (e.g. 타일트크라이스): the picture of the weapon of its name
+                ids += [wtype * 10 ** 6 + look for _sort, name, _rare, wtype, wid in members
+                        if not (wid is not None and wid > 0) for look in _named_after(name, named)]
+                entry["thumb"] = next(filter(None, (self.thumb(thumbs.get(tid) or item_thumb_prefab(tid))
+                                                    for tid in ids)), None)
                 if entry["names"] or entry["thumb"]:
                     out[key] = entry
         if not read_any:

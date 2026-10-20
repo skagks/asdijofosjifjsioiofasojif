@@ -123,7 +123,11 @@ def weapon_files() -> dict:
         {"_Index": 1, "_Type": 12, "_ModelId": 31, "_TwinSword": 89, "_Name": g(33), "_SortId": 200}])
     users["GameDesign/Common/Weapon/OuterTwinSwordData"] = fx.app_table("OuterWeaponData", [
         {"_Index": 0, "_ModelId": 29, "_Name": g(40), "_SortId": 1, "_Rare": 11},  # inline Fixed: rarity 8
-        {"_Index": 1, "_ModelId": 2, "_Name": g(41), "_SortId": 2, "_Rare": 11}])
+        {"_Index": 1, "_ModelId": 2, "_Name": g(41), "_SortId": 2, "_Rare": 11},
+        # layered looks of their own that name no weapon: pictured by the weapon they are named after
+        {"_Index": 2, "_ModelId": 14, "_Name": g(42), "_SortId": 3, "_Rare": 11, "_TwinSwordId": 0},
+        {"_Index": 3, "_ModelId": 100009, "_Name": g(43), "_SortId": 4, "_Rare": 11},
+        {"_Index": 4, "_ModelId": 100010, "_Name": g(44), "_SortId": 5, "_Rare": 11}])
     users["GameDesign/Common/Weapon/TwinSwordTree"] = {
         fx.TYPE: "app.user_data.WeaponTree",
         "_WeaponTreeList": [{fx.TYPE: "app.user_data.WeaponTree.cWeaponTree", "_WeaponID": 83, "_RowDataLevel": 24}],
@@ -131,8 +135,9 @@ def weapon_files() -> dict:
     texts["GameDesign/Text/Excel_Equip/TwinSword"] = fx.names("TwinSword", {
         g(30): ("새벽쌍검Ⅰ", "Dawn Blades I"), g(31): ("황혼쌍검", "Dusk Blades"),
         g(32): ("첫걸음쌍검Ⅰ", "First Blades I"), g(33): ("<COLOR FF0000>#Rejected#</COLOR> TwinSword_89", "")})
-    texts["GameDesign/Text/Excel_Equip/OuterTwinSword"] = fx.names("OuterTwinSword", {g(40): ("새벽쌍검 덧입기", ""),
-                                                                                     g(41): ("덧입기 쌍검", "")})
+    texts["GameDesign/Text/Excel_Equip/OuterTwinSword"] = fx.names("OuterTwinSword", {
+        g(40): ("새벽쌍검 덧입기", ""), g(41): ("덧입기 쌍검", ""), g(42): ("황혼쌍검", ""), g(43): ("새벽쌍검-화", ""),
+        g(44): ("새벽쌍검-기", "")})
     users["GameDesign/Common/Equip/WeaponSeriesData"] = fx.app_table(
         "WeaponSeriesData", [{"_Series": fx.enum("app.WeaponDef.SERIES_Serializable", DAWN_TREE), "_Name": g(50)}])
     users["GameDesign/Player/EnumMaker/WeaponSeries"] = enum_maker(("ID_039", 39, DAWN_TREE))
@@ -145,7 +150,8 @@ def weapon_files() -> dict:
         {"_Index": 6, "_Name": g(60), "_ModelID": 30005, "_SortID": 7, "_Rare": fx.rare(4)}])
     texts["GameDesign/Text/Excel_Equip/RodInsect"] = fx.names("RodInsect", {g(60): ("시험벌레", "Test Kinsect")})
     return {"users": users, "msgs": texts,
-            "present": [thumb_tex("it02", "it0200_0083"), thumb_tex("it02", "it0200_0084"), thumb_tex("it10", "it1003_0005")]}
+            "present": [thumb_tex("it02", "it0200_0083"), thumb_tex("it02", "it0200_0084"), thumb_tex("it10", "it1003_0005"),
+                        thumb_tex("it02", "it0200_1083")]}  # the fire picture of 83 (TextureId + FIRE * 1000)
 
 
 def palico_files() -> dict:
@@ -360,7 +366,7 @@ def test_files_that_do_not_read_exactly_give_none():
 def test_a_complete_game_has_no_problems(cat):
     assert cat.problems == []
     assert {k: cat.count(k) for k in ("armor", "weapon", "kinsect", "palico", "seikret", "npc", "monster")} == \
-        {"armor": 5, "weapon": 3, "kinsect": 1, "palico": 2, "seikret": 3, "npc": 4, "monster": 2}
+        {"armor": 5, "weapon": 6, "kinsect": 1, "palico": 2, "seikret": 3, "npc": 4, "monster": 2}
 
 
 def test_armor_both_designs_and_bodies(cat):
@@ -401,6 +407,10 @@ def test_weapons_share_models_and_layered_ones_follow(cat):
     assert cat.entry(key)["tree"] == "새벽 파생"
     assert cat.names(W("02/000028")) == ["첫걸음쌍검Ⅰ"] and cat.thumb(W("02/000028")) is None
     assert cat.names(W("02/000002")) == ["덧입기 쌍검"] and cat.rarity(W("02/000002")) == 8
+    assert cat.thumb(W("02/000002")) is None  # named after no weapon
+    assert cat.names(W("02/000014")) == ["황혼쌍검"] and cat.thumb(W("02/000014")) == thumb_tex("it02", "it0200_0084")
+    assert cat.thumb(W("02/100009")) == thumb_tex("it02", "it0200_1083")  # 새벽쌍검-화: 새벽쌍검Ⅰ's fire picture
+    assert cat.thumb(W("02/100010")) == thumb_tex("it02", "it0200_0083")  # 새벽쌍검-기: no element, its plain picture
     assert cat.entry(W("02/000031")) is None  # only a #Rejected# name and no picture
     assert cat.weapon_type_name(2) == "쌍검(게임)"
     assert cat.weapon_type_name(5) == "수렵피리"  # not in the game's text: the built-in label
@@ -515,7 +525,7 @@ def test_unreadable_tables_and_a_crashing_section(monkeypatch):
     assert "오토모 장비: 정보를 읽는 중 오류가 났습니다" in cat.problems
     assert any(p.startswith("방어구:") and "ArmorData.user.3" in p for p in cat.problems)
     assert cat.names(A("f/004/001")) == ["시험", "Trial α"] and cat.entry(A("f/004/001"))["pieces"] == {}
-    assert cat.count("palico") == 0 and cat.count("weapon") == 3
+    assert cat.count("palico") == 0 and cat.count("weapon") == 6
 
 
 def test_reading_errors_from_the_game_are_contained():
