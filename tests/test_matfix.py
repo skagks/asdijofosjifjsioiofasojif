@@ -514,6 +514,7 @@ def test_diagnostics_report_holds_both_files(library, game, tmp_path, types, cap
     import json
     import zipfile
 
+    from mhwmm import manager
     from mhwmm.cli import main
 
     shipped = old_avp()
@@ -527,7 +528,7 @@ def test_diagnostics_report_holds_both_files(library, game, tmp_path, types, cap
         assert {f"mod/{AVP}", f"game/{AVP}", f"repaired/{AVP}", "report.json"} <= names
         assert zf.read(f"mod/{AVP}") == shipped and zf.read(f"game/{AVP}") == R.game_file()
         report = json.loads(zf.read("report.json"))
-    assert report["mod"] == "Lepus" and report["record"]["format"] == 2
+    assert report["mod"] == "Lepus" and report["record"]["format"] == manager.MATFIX_FORMAT
     assert main(["--data-dir", str(library.data_dir), "materials", "report", "Lepus", "--out", str(tmp_path / "cli.zip")]) == 0
     assert (tmp_path / "cli.zip").is_file() and "1개" in capsys.readouterr().out
 
@@ -554,3 +555,19 @@ def test_stuck_files_are_checked_again_with_newer_type_data(library, game, tmp_p
     assert len(downloads) == 1
     monkeypatch.setattr(library, "registry_date", lambda refresh=False: "2099-01-01")
     assert library.material_state(mod.id) == "unchecked"  # the new data may repair it
+
+
+def test_results_of_older_repair_rules_are_checked_again(library, game, tmp_path, types):
+    """v1.11.0 stored a .pfb as not repairable; v1.11.1 could repair it, but the record (same game,
+    same type data) kept the old result until the rules version was raised."""
+    from mhwmm import manager
+
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: old_avp()})
+    run(library)
+    record = dict(library._material_record(mod.id))
+    record["format"] = manager.MATFIX_FORMAT - 1
+    library._save_material_record(mod.id, record)
+    assert library.material_state(mod.id) == "unchecked"
+    assert [j.mod_id for j in library.material_jobs(unchecked_only=True)] == [mod.id]
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "stale" and library.materials_to_offer() == [mod]

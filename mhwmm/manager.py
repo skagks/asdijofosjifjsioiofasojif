@@ -40,7 +40,10 @@ DEFAULT_PROFILE = "기본"
 MAX_PROFILE_NAME = 40
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
-MATFIX_FORMAT = 2  # 2: .user/.pfb/.scn are checked too; records of an older check count as unchecked
+# Version of the check/repair rules: records made with older rules count as unchecked, so every
+# mod is checked again (and repairs offered again) after an update. Raise it whenever a change
+# can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3.
+MATFIX_FORMAT = 3
 REGISTRY_RETRY = 3 * 86400  # how long to wait before looking for newer .user/.pfb type data again
 VERSIONED_RE = re.compile(r"\.(mdf2|user|pfb|scn)\.(\d+)$", re.IGNORECASE)  # the game reads one version number
 
