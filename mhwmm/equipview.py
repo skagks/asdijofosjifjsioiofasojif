@@ -7,12 +7,15 @@ import logging
 import queue
 import threading
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .equip import look as equip_look
 from .equip import overview as ov
-from .equip.model import ARMOR_PARTS, BODIES, PART_LABELS, Target, parse_armor_key, parse_weapon_key
-from .gui import Image, ImageTk, Tooltip, autohide, load_image, set_dark_titlebar
+from .equip.model import (ARMOR_PARTS, BODIES, KIND_LABELS, PART_LABELS, Target, parse_armor_key,
+                          parse_weapon_key)
+from .gui import Dialog, Image, ImageTk, Tooltip, autohide, load_image, set_dark_titlebar
 
 log = logging.getLogger(__name__)
 
@@ -21,12 +24,17 @@ RARITY_COLORS = {1: "#c9c9c9", 2: "#ececec", 3: "#a7d46b", 4: "#5eb3dc", 5: "#a2
                  7: "#e9655b", 8: "#55cfd6", 9: "#f0cf55", 10: "#d9d8ff", 11: "#f58fc6", 12: "#fff1c9"}
 MAX_TILES = 120  # more tiles take long to draw (narrow the list with the groups or the search instead)
 ALL = "all"
+LOOK_NOTE = "간단한 3D 미리보기 · 게임과 색·광택이 다를 수 있습니다"
+LOOK_SHORT = {"hidden": "숨김", "no_mesh": "미리보기 없음", "unsupported": "지원 안 함", "too_big": "너무 큼",
+              "missing": "파일 누락", "error": "오류"}  # in the small "적용 후" pictures
 
 
 class EquipmentWindow(tk.Toplevel):
     THUMB = 72  # tile picture (logical px)
     PICTURE = 220  # picture in the detail panel
     PART = 52  # per-part pictures in the detail panel
+    LOOK = 52  # the "적용 후" 3D pictures under each mod in the detail panel
+    LOOK_FEW = 72  # ... when the mod changes three parts or fewer
 
     def __init__(self, app, mod_id: str | None = None):
         super().__init__(app.root)
@@ -54,6 +62,13 @@ class EquipmentWindow(tk.Toplevel):
         self._seen = None
         self._thumbs: queue.Queue = queue.Queue()
         threading.Thread(target=self._thumb_worker, daemon=True).start()
+        self.jobs: dict = {}  # mod id -> EquipJob of the last reload (for the 3D previews)
+        self.looks: dict[tuple, object] = {}  # look.Preview by request (see _want_look)
+        self.look_waiting: dict[tuple, list] = {}  # request -> callbacks waiting for it
+        self.look_cells: dict[tuple[str, str], ttk.Label] = {}  # (mod id, part) -> its "적용 후" picture
+        self._look_queue: deque = deque()  # (urgent, request, job, target, size, compare); a dialog's first
+        self._look_cv = threading.Condition()
+        threading.Thread(target=self._look_worker, daemon=True).start()
 
         self._build_header()
         self._build_body()
@@ -177,6 +192,7 @@ class EquipmentWindow(tk.Toplevel):
         state = self._mods_state()
         if state != self._seen:
             self._seen = state
+            self._drop_looks(cells=False)  # pictures not drawn yet may be of files the mods no longer use
             self.schedule_reload()
 
     def schedule_reload(self):
@@ -227,6 +243,8 @@ class EquipmentWindow(tk.Toplevel):
             self._message("장비 외형을 읽지 못했습니다", str(error))
             return
         self.catalog, self.ui = catalog, ui or {}
+        self.jobs = {j.mod_id: j for j in jobs}
+        self.looks.clear()  # a material repair changes the files without the stamp: ask the manager again
         self.overview = ov.build([(j.mod_id, j.name, j.enabled, j.order, scans[j.mod_id]) for j in jobs], catalog)
         self.icons = {}
         if self.mod_filter and not any(j.mod_id == self.mod_filter for j in jobs):
@@ -520,6 +538,7 @@ class EquipmentWindow(tk.Toplevel):
         t, px = self.theme, self.theme.px
         for child in self.detail.winfo_children():
             child.destroy()
+        self._drop_looks()
         item = next((i for i in (self.overview.items if self.overview else []) if i.target == self.selected), None)
         if item is None:
             ttk.Label(self.detail, text="장비를 고르면 자세한 내용이 보입니다.", style="CardMuted.TLabel",
@@ -556,6 +575,7 @@ class EquipmentWindow(tk.Toplevel):
                       justify="left").pack(anchor="w")
             ttk.Button(text, text="목록에서 보기", style="Link.TButton",
                        command=lambda mod_id=use.mod_id: self.app.show_mod(mod_id)).pack(anchor="w")
+            self._look_strip(d, item, use)
         if conflicts:
             self._section(d, "겹치는 부위")
             ttk.Label(d, text=self._conflict_text(conflicts), style="CardMuted.TLabel", wraplength=px(296),
@@ -588,6 +608,148 @@ class EquipmentWindow(tk.Toplevel):
         label.pack(side="left", anchor="n", padx=(0, px(10)))
         label.bind("<Button-1>", lambda e: self.app.show_picture(path, use.name, parent=self))
         Tooltip(self.theme, label, "모드에 들어 있는 미리보기 그림 · 누르면 크게 봅니다")
+
+    # ------------------------------------------------------------------ 3D previews ("적용 후")
+    @staticmethod
+    def _look_parts(item: ov.Item, use: ov.ModUse) -> list[str]:
+        """The parts a mod changes, in the game's order; "" for equipment drawn whole (no parts)."""
+        parts = [p for p in item.parts if p in use.parts]
+        parts += sorted(p for p in use.parts if p and p not in parts)
+        if parts or "" not in use.parts or item.target.kind == "armor":
+            return parts  # an armor's files of no part (its prefab settings) change no model
+        return ["main"] if item.target.kind == "weapon" else [""]
+
+    def _look_strip(self, parent, item: ov.Item, use: ov.ModUse):
+        """Small 3D pictures of the parts the mod changes, drawn with its files (in the background);
+        a click shows one next to the game's own look."""
+        job = self.jobs.get(use.mod_id)
+        parts = self._look_parts(item, use)
+        if job is None or not parts or Image is None:
+            return
+        t, px = self.theme, self.theme.px
+        size = px(self.LOOK_FEW if len(parts) <= 3 else self.LOOK)
+        box = ttk.Frame(parent, style="Card.TFrame")
+        box.pack(fill="x", pady=(px(8), 0))
+        ttk.Label(box, text="적용 후 · 간단한 3D", style="CardMuted.TLabel", font=t.fonts["small"]).pack(anchor="w")
+        row = ttk.Frame(box, style="Card.TFrame", height=size + px(22))
+        row.pack(fill="x", pady=(px(3), 0))
+        for part in parts:
+            cell = ttk.Frame(row, style="Card.TFrame")
+            frame = ttk.Frame(cell, style="Thumb.TFrame", width=size, height=size, cursor="hand2")
+            frame.pack_propagate(False)
+            frame.pack()
+            label = ttk.Label(frame, text="…", style="Thumb.TLabel", anchor="center", justify="center",
+                              wraplength=size - px(4), cursor="hand2")
+            label.pack(fill="both", expand=True)
+            label.look = None
+            name = PART_LABELS.get(part) or KIND_LABELS.get(item.target.kind, "")
+            label.caption = ttk.Label(cell, text=name, style="CardMuted.TLabel", font=t.fonts["small"])
+            label.caption.pack(pady=(px(2), 0))
+            for widget in (frame, label):
+                widget.bind("<Button-1>", lambda e, p=part: self.show_look(item, use, p))
+            Tooltip(t, label, lambda label=label: self._look_tip(label))
+            self.look_cells[(use.mod_id, part)] = label
+            self._want_look(job, item.target.with_part(part), size, False,
+                            lambda p, label=label: self._show_look(label, p, size))
+        self._flow(row, px(6))
+
+    def _show_look(self, label: ttk.Label, preview, size: int):
+        try:
+            if not label.winfo_exists():
+                return
+            label.look = preview
+            image = self._look_image(preview.after, size)
+            if image is not None:
+                label.configure(image=image, text="")
+            else:
+                label.configure(image="", text=LOOK_SHORT.get(preview.status, "미리보기 없음"))
+            if preview.status in ("missing", "error"):  # the game would hang or show it broken
+                caption = label.caption
+                caption.configure(text=f"{caption.cget('text')} ⚠", foreground=self.theme.p["danger"])
+        except tk.TclError:  # closed meanwhile
+            pass
+
+    def _look_image(self, path: Path | None, size: int):
+        """A preview PNG as a PhotoImage (kept: Tk drops unheld ones), None when there is none."""
+        if path is None:
+            return None
+        key = (str(path), size)
+        if key not in self.images:
+            self.images[key] = load_image(path, size, size)
+        return self.images[key]
+
+    @staticmethod
+    def _look_tip(label) -> str:
+        p = getattr(label, "look", None)
+        if p is None:
+            return "그리는 중... · 누르면 원래 모습과 나란히 봅니다"
+        lines = ([p.text] if p.text else []) + [n for n in p.notes[:4] if n != p.text]
+        return "\n".join(lines + ["누르면 원래 모습과 나란히 봅니다"])
+
+    def show_look(self, item: ov.Item, use: ov.ModUse, part: str):
+        """The comparison dialog of one part (원래 모습 | 적용 후), over this window."""
+        job = self.jobs.get(use.mod_id)
+        if job is not None and not self.closed:
+            LookDialog(self, item, use, part, job).show()
+
+    def _want_look(self, job, target: Target, size: int, compare: bool, done, urgent: bool = False) -> tuple:
+        """Call ``done(look.Preview)`` on the Tk thread once the 3D preview is drawn (at once when it is
+        known). ``urgent`` (the dialog) goes before the small pictures. Returns the request."""
+        request = (job.mod_id, job.stamp, target, size, compare)
+        found = self.looks.get(request)
+        if found is not None:
+            done(found)
+            return request
+        waiting = self.look_waiting.setdefault(request, [])
+        waiting.append(done)
+        if len(waiting) == 1:
+            with self._look_cv:
+                entry = (urgent, request, job, target, size, compare)
+                if urgent:
+                    self._look_queue.appendleft(entry)
+                else:
+                    self._look_queue.append(entry)
+                self._look_cv.notify()
+        return request
+
+    def _drop_looks(self, cells: bool = True):
+        """Forget the small pictures not drawn yet (the details now show something else, or will once the
+        changed mods are read again); ``cells``: also the pictures shown."""
+        with self._look_cv:
+            dropped = [e[1] for e in self._look_queue if not e[0]]
+            self._look_queue = deque(e for e in self._look_queue if e[0])
+        for request in dropped:
+            self.look_waiting.pop(request, None)
+        if cells:
+            self.look_cells = {}
+
+    def cancel_look(self, request: tuple):
+        """A dialog was closed before its picture came."""
+        with self._look_cv:
+            self._look_queue = deque(e for e in self._look_queue if e[1] != request)
+        self.look_waiting.pop(request, None)
+
+    def _look_worker(self):
+        while True:
+            with self._look_cv:
+                while not self.closed and not self._look_queue:
+                    self._look_cv.wait()
+                if self.closed:
+                    return
+                _urgent, request, job, target, size, compare = self._look_queue.popleft()
+            try:  # the small pictures show no swatches or colour chips: not made for them
+                preview = self.manager.equipment_preview(job, target, size, compare, extras=compare)
+            except Exception as exc:  # equipment_preview reports problems itself; this would be a bug
+                log.warning("3D 미리보기를 만들지 못했습니다: %s", exc, exc_info=True)
+                preview = equip_look.Preview("error", notes=[f"{equip_look.STATUS['error']}: {exc}"])
+            self.app.events.put(("call", self._look_ready, request, preview))
+
+    def _look_ready(self, request: tuple, preview):
+        if self.closed:
+            return
+        self.looks[request] = preview
+        for done in self.look_waiting.pop(request, []):
+            done(preview)
 
     def _names(self, parent, item: ov.Item):
         """Every equipment that looks like this, each in its rarity's colour (low rank, α, β ...)."""
@@ -777,15 +939,22 @@ class EquipmentWindow(tk.Toplevel):
             return
         self.status_var.set("진단 파일 저장 중...")
 
+        def progress(done, total, msg):  # the 3D preview's self-test takes up to a minute
+            self.app.events.put(("call", self._report_progress, msg))
+
         def worker():
             try:
-                self.manager.export_equipment_report(Path(target))
+                self.manager.export_equipment_report(Path(target), progress)
                 result = True
             except Exception as exc:  # reported in the window
                 result = exc
             self.app.events.put(("call", self._report_saved, target, result))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _report_progress(self, msg: str):
+        if not self.closed:
+            self.status_var.set(f"진단 파일 저장 중... {msg}")
 
     def _report_saved(self, target: str, result):
         if self.closed:
@@ -810,9 +979,205 @@ class EquipmentWindow(tk.Toplevel):
     def close(self):
         self.closed = True
         self._thumbs.put(None)
+        with self._look_cv:
+            self._look_queue.clear()
+            self._look_cv.notify_all()
         self.gen += 1
         for pending in (self._reload_after, self._search_after):
             if pending:
                 self.after_cancel(pending)
         self.app.equipment_window = None
         self.destroy()
+
+
+class LookDialog(Dialog):
+    """One part of an equipment as the game shows it and with a mod's files, side by side ("원래 모습 |
+    적용 후"), drawn on demand by the window's preview worker; with the notes, the replaced textures and
+    the changed colour values below."""
+
+    MIN_LOOK = 240  # the pictures are made smaller down to this before what is below them scrolls
+
+    def __init__(self, window: EquipmentWindow, item: ov.Item, use: ov.ModUse, part: str, job):
+        theme = window.theme
+        super().__init__(window, theme, "적용 후 미리보기")
+        t, px = theme, theme.px
+        self.window = window
+        self.preview = None
+        self.images: list = []  # PhotoImages shown (Tk drops unheld ones)
+        width, height = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.size = max(px(160), min(px(512), (width * 9 // 10 - px(110)) // 2, height * 45 // 100))
+        self.shown = self.size  # the pictures' side once _fit made them smaller (self.size is in the request)
+        name = " · ".join(x for x in (item.name, PART_LABELS.get(part, "")) if x)
+        ttk.Label(self.body, text=name, style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.body, text=use.name + ("" if use.enabled else "  (꺼짐)"), style="Muted.TLabel").pack(
+            anchor="w", pady=(px(2), 0))
+        pictures = ttk.Frame(self.body)
+        pictures.pack(anchor="w", pady=(px(14), 0))
+        self.before_label = self._box(pictures, "원래 모습", (0, px(12)))
+        self.after_label = self._box(pictures, "적용 후", (0, 0))
+        ttk.Label(self.body, text=LOOK_NOTE, style="Muted.TLabel", font=t.fonts["small"]).pack(
+            anchor="w", pady=(px(10), 0))
+        holder = ttk.Frame(self.body)  # the notes, swatches and chips; they scroll when the screen is too low
+        holder.pack(fill="x")
+        self.extra_canvas, self.extra = window._scroller(holder, (0, 0), plain=True)
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", pady=(px(16), 0))
+        ttk.Button(row, text="닫기", command=self.cancel).pack(side="right")
+        self.bind("<Return>", lambda e: self.cancel())
+        self.request = window._want_look(job, item.target.with_part(part), self.size, True, self._ready, urgent=True)
+
+    def _box(self, parent, title: str, padx) -> ttk.Label:
+        t, px = self.theme, self.theme.px
+        card = t.mark(tk.Frame(parent), "card")
+        card.pack(side="left", padx=padx)
+        ttk.Label(card, text=title, style="CardMuted.TLabel", font=t.fonts["small_bold"]).pack(
+            anchor="w", padx=px(12), pady=(px(10), 0))
+        frame = ttk.Frame(card, style="Card.TFrame", width=self.size, height=self.size)
+        frame.pack_propagate(False)
+        frame.pack(padx=px(12), pady=(px(6), px(12)))
+        label = ttk.Label(frame, text="그리는 중...", style="CardMuted.TLabel", anchor="center", justify="center",
+                          wraplength=self.size - px(40))
+        label.pack(fill="both", expand=True)
+        return label
+
+    def _image(self, path: Path | None, size: int):
+        image = load_image(path, size, size) if path is not None else None
+        if image is not None:
+            self.images.append(image)
+        return image
+
+    def _ready(self, preview):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self.preview = preview
+        after, before = self._image(preview.after, self.size), self._image(preview.before, self.size)
+        self.after_label.configure(image=after or "", text="" if after else (preview.text or "그림이 없습니다"))
+        self.before_label.configure(image=before or "", text="" if before else "원래 모습을 그릴 수 없습니다")
+        self._extras(preview)
+        self.window._bind_wheel(self.extra, self.extra_canvas)
+        self._fit(preview)
+        self._keep_on_screen()
+
+    def _room(self) -> int:
+        """The height the dialog may take: the screen less the taskbar and the title bar, or the window
+        manager's limit (on Windows the work area) when that is less."""
+        px = self.theme.px
+        return min(self.winfo_screenheight() - px(80), self.wm_maxsize()[1] - px(16))
+
+    def _fit(self, preview):
+        """Made to fit the screen once its content is known: the pictures smaller (down to MIN_LOOK), then
+        what is below them scrolling, then the pictures smaller still."""
+        px = self.theme.px
+        self.update_idletasks()
+        need = self.extra.winfo_reqheight()
+        self.extra_canvas.configure(width=max(1, self.extra.winfo_reqwidth()), height=max(1, need))
+        room = self._room()
+
+        def over() -> int:
+            self.update_idletasks()
+            return self.winfo_reqheight() - room
+
+        if over() > 0:
+            self._resize(preview, max(min(self.shown, px(self.MIN_LOOK)), self.shown - over()))
+        if over() > 0 and need > px(80):
+            self.extra_canvas.configure(height=max(px(80), need - over()))
+        if over() > 0:
+            self._resize(preview, max(px(120), self.shown - over()))
+
+    def _resize(self, preview, size: int):
+        """Both pictures made ``size`` square (only ever smaller)."""
+        if size >= self.shown:
+            return
+        self.shown = size
+        for label, path in ((self.after_label, preview.after), (self.before_label, preview.before)):
+            label.master.configure(width=size, height=size)  # load_image shrinks the drawn PNG
+            image = self._image(path, size)
+            label.configure(wraplength=size - self.theme.px(40), **({"image": image} if image is not None else {}))
+
+    def _extras(self, p):
+        """The notes, the textures the mod replaces (game -> mod) and its changed colour values."""
+        t, px = self.theme, self.theme.px
+        wrap = 2 * self.size + px(60)
+        for note in (n for n in p.notes if n != p.text):  # the status is in the picture's place
+            ttk.Label(self.extra, text=f"· {note}", style="Muted.TLabel", font=t.fonts["small"], wraplength=wrap,
+                      justify="left").pack(anchor="w", pady=(px(3), 0))
+        side, small = px(48), t.fonts["small"]
+        if p.swatches:  # in a grid across the dialog (a list of six would reach below the screen)
+            grid = self._grid("텍스처 (게임 → 모드)")
+            columns = max(1, wrap // px(190))
+            for i, swatch in enumerate(p.swatches):
+                cell = ttk.Frame(grid)
+                cell.grid(row=i // columns, column=i % columns, sticky="nw", padx=(0, px(18)), pady=(px(6), 0))
+                pair = ttk.Frame(cell)
+                pair.pack(anchor="w")
+                self._swatch(pair, swatch.before, side, "새 텍스처" if swatch.new else "?")
+                ttk.Label(pair, text="→", style="Muted.TLabel").pack(side="left", padx=px(6))
+                self._swatch(pair, swatch.after, side, "")
+                name = swatch.name[:-4] if swatch.name.lower().endswith(".tex") else swatch.name
+                ttk.Label(cell, text=name, style="Muted.TLabel", font=small, wraplength=px(180),
+                          justify="left").pack(anchor="w", pady=(px(2), 0))
+        if p.chips:
+            grid = self._grid("색 값 (재질 파일, 게임 → 모드)")
+            columns = max(1, wrap // px(270))
+            for i, chip in enumerate(p.chips):
+                cell = ttk.Frame(grid)
+                cell.grid(row=i // columns, column=i % columns, sticky="w", padx=(0, px(18)), pady=(px(5), 0))
+                self._colour(cell, chip.before, chip.before_on)
+                ttk.Label(cell, text="→", style="Muted.TLabel").pack(side="left", padx=px(6))
+                self._colour(cell, chip.after, chip.after_on)
+                text = f"{chip.material} · {equip_look.COLOR_LABELS.get(chip.name, chip.name)}"
+                ttk.Label(cell, text=text + ("" if chip.after_on else " (꺼짐)"), style="Muted.TLabel",
+                          font=small).pack(side="left", padx=(px(8), 0))
+
+    def _grid(self, title: str) -> ttk.Frame:
+        ttk.Label(self.extra, text=title, style="DialogSection.TLabel").pack(anchor="w", pady=(self.theme.px(12), 0))
+        grid = ttk.Frame(self.extra)
+        grid.pack(anchor="w")
+        return grid
+
+    def _swatch(self, parent, path: Path | None, side: int, empty: str):
+        image = self._image(path, side)
+        frame = ttk.Frame(parent, style="Thumb.TFrame", width=side, height=side)
+        frame.pack_propagate(False)
+        frame.pack(side="left")
+        ttk.Label(frame, image=image or "", text="" if image else empty, style="Thumb.TLabel", anchor="center",
+                  justify="center", wraplength=side).pack(fill="both", expand=True)
+
+    def _colour(self, parent, values, on: bool):
+        """A square of a colour value (0..1 RGB); "?" when the game's value is unknown."""
+        px, p = self.theme.px, self.theme.p
+        colour = equip_look.Chip.hex(values)
+        if colour is None:
+            ttk.Label(parent, text="?", style="Muted.TLabel", width=2, anchor="center").pack(side="left")
+            return
+        tk.Frame(parent, width=px(18), height=px(18), bg=colour, highlightthickness=1,
+                 highlightbackground=p["muted"] if on else p["border"]).pack(side="left")
+
+    def _on_screen(self, y: int) -> int:
+        """``y`` moved up so that the dialog ends above the bottom of the screen (taskbar and title bar);
+        a dialog on another monitor stays where it is."""
+        screen = self.winfo_screenheight()
+        bottom = screen - self.theme.px(80)
+        if 0 <= y < screen and y + self.winfo_reqheight() > bottom:
+            return max(0, bottom - self.winfo_reqheight())
+        return y
+
+    def _position(self):
+        x, y = super()._position()
+        return x, self._on_screen(y)  # a kept preview fills the dialog before it is shown
+
+    def _keep_on_screen(self):
+        """Grown by the notes and swatches after it was shown: moved up when it would reach below the screen."""
+        self.update_idletasks()
+        if not self.winfo_viewable():
+            return  # not shown yet: show() places it
+        y = self._on_screen(self.winfo_y())
+        if y != self.winfo_y():
+            self.geometry(f"+{self.winfo_x()}+{y}")
+
+    def cancel(self):
+        self.window.cancel_look(self.request)
+        super().cancel()

@@ -11,6 +11,7 @@ from pathlib import Path
 from . import __version__, fsutil, steam
 from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
+from .equip.selftest import DEFAULT_ITEMS as SELFTEST_ITEMS
 from .manager import InstallError, ModManager, acquire_instance_lock, prepare_data_dir, setup_logging
 from .matfix import MatfixError
 
@@ -436,7 +437,8 @@ def cmd_equipment(manager: ModManager, args) -> int:
             parts = list(dict.fromkeys(parts))
             rarity = f" · {item.rarity_text}" if item.rarity else ""
             where = f" [{', '.join(parts)}]" if parts else ""
-            print(f"     {KIND_LABELS.get(item.target.kind, '')} {item.name} ({item.subtitle}{rarity}){where}")
+            print(f"     {KIND_LABELS.get(item.target.kind, '')} {item.name} ({item.subtitle}{rarity}){where}"
+                  f"  {item.target.kind}/{item.target.key}")
             for part, users in item.conflicts().items():
                 if any(u.mod_id == job.mod_id for u in users):
                     others = ", ".join(f"'{u.name}'" for u in users if u.mod_id != job.mod_id)
@@ -450,6 +452,74 @@ def cmd_equipment(manager: ModManager, args) -> int:
         for problem in catalog.problems:
             print(f"경고: {problem}", file=sys.stderr)
     return 0
+
+
+def parse_target(text: str):
+    """``<kind>/<key>[/<part>]`` (e.g. ``weapon/09/000021/main``, ``armor/f/004/001/helm``; the part may also
+    be its Korean name) -> Target; None when it is not one."""
+    from .equip.model import KINDS, PART_LABELS, PART_ORDER, Target
+
+    kind, _, rest = text.strip().replace("\\", "/").strip("/").partition("/")
+    kind = kind.lower()
+    if kind not in KINDS or not rest:
+        return None
+    head, _, last = rest.rpartition("/")
+    names = {label: part for part, label in PART_LABELS.items()}
+    part = names.get(last, last.lower())
+    if head and part in PART_ORDER.get(kind, ()):
+        return Target(kind, head, part)
+    return Target(kind, rest)
+
+
+def cmd_equip_preview(manager: ModManager, args) -> int:
+    """A 3D picture of one equipment part with a mod's files (or the game's own look), or the self-test."""
+    import shutil
+
+    from .equip.look import COLOR_LABELS
+
+    if args.self_test is not None:
+        def progress(done, total, msg):
+            print(msg, file=sys.stderr)
+
+        print(manager.equipment_self_test(args.self_test, progress=progress), end="")
+        return 0
+    if not (args.mod and args.target and args.out):
+        raise SystemExit("사용법: equip-preview <모드> <장비> 파일.png [--before] [--size N]  "
+                         "(장비 예: weapon/09/000021/main, armor/f/004/001/helm · 모드 '-'는 게임 그대로)\n"
+                         "       equip-preview --self-test [N]")
+    target = parse_target(args.target)
+    if target is None:
+        raise SystemExit(f"장비를 알 수 없습니다: {args.target} (예: weapon/09/000021/main, armor/f/004/001/helm)")
+    if args.mod == "-":
+        job, name = None, "게임"
+    else:
+        (mod,) = _resolve(manager, [args.mod])
+        job, name = manager.equipment_job(mod.id), mod.name
+    p = manager.equipment_preview(job, target, args.size, compare=args.before and job is not None)
+    out = Path(args.out)
+    where = f"{target.kind}/{target.key}" + (f"/{target.part}" if target.part else "")
+    print(f"{name} · {where}: {p.text or '정상'}" + (f" (삼각형 {p.triangles:,}개)" if p.triangles else ""))
+    saved = False
+    if p.after is not None:
+        shutil.copyfile(p.after, out)
+        print(f"저장했습니다: {out}")
+        saved = True
+    if args.before:
+        if p.before is not None:
+            before = out.with_name(f"{out.stem}-before{out.suffix or '.png'}")
+            shutil.copyfile(p.before, before)
+            print(f"원래 모습: {before}")
+        elif job is not None:
+            print("원래 모습은 그리지 못했습니다")
+    for note in p.notes:
+        print(f"  참고: {note}")
+    for swatch in p.swatches:
+        print(f"  텍스처: {swatch.name}" + (" (새 텍스처)" if swatch.new else ""))
+    for chip in p.chips:
+        old, new = chip.hex(chip.before) or "?", chip.hex(chip.after) or "?"
+        off = "" if chip.after_on else " (꺼짐)"
+        print(f"  색: {chip.material} · {COLOR_LABELS.get(chip.name, chip.name)} {old} -> {new}{off}")
+    return 0 if saved else 1
 
 
 def cmd_game(manager: ModManager, args) -> int:
@@ -536,19 +606,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("mods", nargs="*", help="모드 id, 번호 또는 이름 (생략하면 장비를 바꾸는 모든 모드)")
     p.add_argument("--icons", metavar="파일.png", help="게임의 아이콘 그림을 확인용으로 저장")
 
+    p = sub.add_parser("equip-preview", help="모드를 적용한 장비 부위의 간단한 3D 미리보기 그림 저장")
+    p.add_argument("mod", nargs="?", help="모드 id, 번호 또는 이름 ('-': 게임 그대로)")
+    p.add_argument("target", nargs="?", help="장비 부위 (예: weapon/09/000021/main, armor/f/004/001/helm)")
+    p.add_argument("out", nargs="?", help="저장할 PNG 파일")
+    p.add_argument("--before", action="store_true", help="같은 구도로 그린 원래 모습도 <이름>-before.png로 저장")
+    p.add_argument("--size", type=int, default=512, help="그림 크기 (픽셀, 32~1024, 기본 512)")
+    p.add_argument("--self-test", type=int, nargs="?", const=SELFTEST_ITEMS, metavar="N",
+                   help="게임의 장비 N개로 미리보기를 점검해 결과를 글로 출력 (그림은 저장하지 않음)")
+
     p = sub.add_parser("game", help="게임 폴더 설정 (경로 생략 시 자동 감지)")
     p.add_argument("path", nargs="?")
     p.add_argument("--force", action="store_true")
     return parser
 
 
-READ_ONLY_COMMANDS = ("list", "verify", "conflicts", "equipment", "equip")
+READ_ONLY_COMMANDS = ("list", "verify", "conflicts", "equipment", "equip", "equip-preview")
 COMMANDS = {
     "list": cmd_list, "install": cmd_install, "options": cmd_options, "profile": cmd_profile, "refw": cmd_refw,
     "nexus": cmd_nexus, "conflicts": cmd_conflicts, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
-    "equipment": cmd_equipment, "equip": cmd_equipment,
+    "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview,
 }
 
 

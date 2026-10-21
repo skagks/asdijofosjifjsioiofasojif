@@ -13,6 +13,10 @@ File formats follow, without code taken from them:
 - .tex textures: REasy (MIT) - header and mip table; GDeflate (the DirectStorage tile stream the
   game compresses textures with): microsoft/DirectStorage (Apache-2.0) and NVIDIA's libdeflate
   GDeflate decoder (MIT / Apache-2.0) - re-implemented in pure Python.
+- .mesh models (mesh.py): REasy (MIT) - header, LOD / group / submesh tables, vertex buffer
+  layouts and the streaming companion, cross-checked against RE-Engine-Lib (MIT).
+- The 3D preview's materials (look.py): REasy (MIT) - .mdf2 material flag names, albedo slot names,
+  binding by material name; the renderer (render.py) is written for this project.
 - The equipment path list (equip_paths.txt.xz, tools/make_equip_paths.py) is taken from REasy's
   MHWS_STM.list (MIT), the community MH Wilds file list (dtlnor, Ekey's REE.PAK.Tool).
 """

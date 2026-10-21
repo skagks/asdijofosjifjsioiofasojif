@@ -36,9 +36,14 @@
     `equip_paths.txt.xz` PAK 안 파일 이름 해시 찾기(`tools/make_equip_paths.py`로 REasy 목록에서 만듦), `scan.py` 모드 파일 살펴보기,
     `catalog.py`·`userdata.py` 게임 데이터 표·msg에서 이름·그림 경로, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처,
     `icons.py` 게임 아이콘·레어도 색, `overview.py` 창에 보일 장비 목록. 창은 `mhwmm/equipview.py`
+    - 적용 후 미리보기(3D): `mesh.py` 모델(.mesh) 읽기, `render.py` 순수 파이썬 3D 그리기, `look.py` 모드·게임 파일에서
+      부위의 모델·재질·텍스처를 골라 그림·색 칩·텍스처 견본 만들기. 매니저의 `equipment_preview`가 `cache\equip-previews\`에 저장.
+      `selftest.py` 실제 게임 파일로 미리보기 점검(글만, 진단 zip의 `preview-selftest.txt`와 `equip-preview --self-test`)
     - 게임 파일(텍스트·그림·데이터)은 저장소에 넣지 않는다. 테스트는 직접 만든 가짜 파일로 한다.
     - 모드 파일을 장비에 대응시키는 규칙(paths.py, scan.py)을 바꾸면 `scan.SCAN_FORMAT`을, 게임 데이터에서 읽는 내용(catalog.py)을
       바꾸면 `catalog.CATALOG_FORMAT`을, 게임 텍스처로 만드는 그림·아이콘(icons.py, tex.py, gdeflate.py)을 바꾸면
-      `icons.PICTURE_FORMAT`을 올린다. 그래야 데이터 폴더 `cache\`의 예전 결과를 다시 만든다.
+      `icons.PICTURE_FORMAT`을, 미리보기 그림이 달라질 수 있는 변경(mesh.py, render.py, look.py)을 하면 `look.PREVIEW_FORMAT`을
+      올린다. 그래야 데이터 폴더 `cache\`의 예전 결과를 다시 만든다. 미리보기 캐시 폴더 이름에는 `PICTURE_FORMAT`과
+      `SCAN_FORMAT`도 들어 있어(`ModManager.preview_formats`) 텍스처 해석이나 파일 규칙을 바꿔도 미리보기를 다시 그린다.
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

@@ -270,9 +270,7 @@ class Dialog(tk.Toplevel):
 
     def show(self):
         self.update_idletasks()
-        parent = self.master
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 3)
+        x, y = self._position()
         self.geometry(f"+{x}+{y}")
         set_dark_titlebar(self, self.theme.name == "dark")
         self.deiconify()
@@ -280,6 +278,13 @@ class Dialog(tk.Toplevel):
         self.focus_set()
         self.wait_window()
         return self.result
+
+    def _position(self) -> tuple[int, int]:
+        """Where show() puts the dialog: over its parent, centred and a third of the way down."""
+        parent = self.master
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 3)
+        return x, y
 
     def cancel(self):
         self.result = None

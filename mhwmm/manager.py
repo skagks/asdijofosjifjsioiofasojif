@@ -32,9 +32,11 @@ from .deploy import Deployer, DeployError, DeployReport, ModSource, ProgressFn, 
 from .equip import EquipError
 from .equip import catalog as equip_catalog
 from .equip import icons as equip_icons
+from .equip import look as equip_look
 from .equip import overview as equip_overview
 from .equip import pathlist as equip_pathlist
 from .equip import scan as equip_scan
+from .equip import selftest as equip_selftest
 from .equip import tex as equip_tex
 from .equip import userdata as equip_userdata
 from .equip.model import PART_LABELS
@@ -58,6 +60,8 @@ MAX_ARCHIVE_DIRS = 8
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
 # can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3.
 MATFIX_FORMAT = 3
+REPORT_SELFTEST_ITEMS = 6  # game parts the diagnostics zip's 3D preview self-test looks at
+REPORT_SELFTEST_SECONDS = 60.0  # ... and for at most this long
 REGISTRY_RETRY = 3 * 86400  # how long to wait before looking for newer .user/.pfb type data again
 VERSIONED_RE = re.compile(r"\.(mdf2|user|pfb|scn)\.(\d+)$", re.IGNORECASE)  # the game reads one version number
 
@@ -483,6 +487,8 @@ class ModManager:
         self._equip_paths = None  # PathIndex of the game's equipment paths (for .pak mods)
         self._equip_scans: dict[str, tuple[str, object]] | None = None  # mod id -> (stamp, ModScan)
         self._equip_failed: set[tuple[str, int]] = set()  # pictures that could not be read
+        self._preview_failed: dict[tuple[str, str], str] = {}  # (cache folder, key) of failed 3D previews -> why
+        self._preview_textures = None  # equip_look.Textures shared by the 3D previews
         self.data_dir.mkdir(parents=True, exist_ok=True)
         rsz.TypeRegistry.updates = self.data_dir / "cache"
         self.mods_dir.mkdir(exist_ok=True)
@@ -1448,6 +1454,11 @@ class ModManager:
         """Every mod with the files it puts into the game, for equipment_scans (call on the GUI thread)."""
         return [self._equip_job(order, mod) for order, mod in enumerate(self.mods)]
 
+    def equipment_job(self, mod_id: str) -> EquipJob:
+        """One mod's EquipJob (for equipment_preview; call on the GUI thread). KeyError for an unknown mod."""
+        mod = self.get(mod_id)
+        return self._equip_job(self.mods.index(mod), mod)
+
     def _equip_job(self, order: int, mod: Mod) -> EquipJob:
         files = {rel: path for rel, (path, _key) in self.mod_entries(mod.id).items()}
         stamp = f"{self._stamp(mod)}|{','.join(mod.selected)}|{len(files)}"
@@ -1494,6 +1505,8 @@ class ModManager:
                 return None
             if rebuild:  # read everything again, pictures and icons too
                 self._equip_failed.clear()
+                self._preview_failed.clear()  # e.g. a full disk since freed
+                self._preview_textures = None
                 folder = self._picture_dir()
                 if folder is not None:
                     (folder / "ui.json").unlink(missing_ok=True)
@@ -1625,6 +1638,198 @@ class ModManager:
             self._equip_failed.add(key)
             return None
 
+    # ------------------------------------------------------------- 3D previews
+    def _preview_dir(self) -> Path | None:
+        """cache/equip-previews/<game version>-<formats>/ ("nogame" without a game); the folders of other
+        versions are removed. None when it cannot be made."""
+        version = self.game_version() or "nogame"
+        base = self.data_dir / "cache" / "equip-previews"
+        here = base / f"{version[:16]}-{self.preview_formats()}"
+        if not here.is_dir():
+            with self._equip_lock:
+                try:
+                    for old in base.glob("*"):  # from before a game update or a new preview format
+                        if old.is_dir() and old != here:
+                            fsutil.rmtree(old)
+                    here.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    log.warning("미리보기 폴더를 만들지 못했습니다: %s", exc)
+                    return None
+        return here
+
+    @staticmethod
+    def preview_formats() -> str:
+        """What the 3D previews are made with besides the game: the preview rules (mesh.py, render.py,
+        look.py), the texture decoding (tex.py, gdeflate.py) and the file rules (paths.py, scan.py)."""
+        return f"{equip_look.PREVIEW_FORMAT}-{equip_icons.PICTURE_FORMAT}-{equip_scan.SCAN_FORMAT}"
+
+    def _preview_key(self, job: EquipJob | None, target, size: int, compare: bool, extras: bool = True) -> str:
+        if job is None:  # the game's own look: the part alone
+            parts = ["game", target.kind, target.key, target.part, size]
+        else:
+            # the stamp changes with reinstalls and options, the file list with material repairs; a repair
+            # made again (a new game, new rules) keeps the names of the repaired files, not their content
+            repaired = self.mod_dir(job.mod_id) / MATFIX_DIR
+            lines = []
+            for rel, path in job.files.items():
+                line = f"{rel}\0{path}"
+                if Path(path).parent == repaired:
+                    try:
+                        st = Path(path).stat()
+                        line += f"\0{st.st_size}\0{st.st_mtime_ns}"
+                    except OSError:
+                        line += "\0?"
+                lines.append(line)
+            listing = "\n".join(sorted(lines))
+            parts = [job.mod_id, job.stamp, hashlib.sha1(listing.encode("utf-8", "replace")).hexdigest(),
+                     target.kind, target.key, target.part, size, compare]
+            if not extras:
+                parts.append("no extras")
+        parts.append(equip_pathlist.list_version()[:8])  # which meshes make up a part
+        return hashlib.sha1(json.dumps(parts).encode("utf-8")).hexdigest()[:24]
+
+    def equipment_preview(self, job: EquipJob | None, target, size: int = 256,
+                          compare: bool = False, extras: bool = True) -> equip_look.Preview:
+        """A small 3D picture of one equipment part (``target``, a Target with its part) with ``job``'s files
+        applied - job None: the game's own look - as PNG files with a transparent background.  ``compare``
+        (with a job) also draws the game's own look as ``before``, in the same camera and framing.
+        ``extras=False``: without the texture swatches and colour chips (small pictures that show neither).
+
+        Cached under cache/equip-previews/ per game version, mod files, options, size and compare.  Without
+        a game the mod's own files are still drawn (the game's textures as flat colours).  Never raises: a
+        broken mod gives a status and notes (Preview.text, Preview.notes).  Safe to call from a worker thread;
+        the heavy work does not hold the equipment lock, and a kept picture does not wait for it."""
+        try:
+            size = max(32, min(1024, int(size)))
+        except (TypeError, ValueError):
+            size = 256
+        compare = bool(compare) and job is not None
+        extras = bool(extras) or job is None
+        if not equip_tex.pillow():
+            return equip_look.Preview("error", notes=["3D 미리보기를 그리려면 Pillow가 필요합니다"])
+        folder = self._preview_dir()
+        if folder is None:
+            return equip_look.Preview("error", notes=["미리보기를 저장할 폴더를 만들지 못했습니다"])
+        key = self._preview_key(job, target, size, compare, extras)
+        failed = self._preview_failed.get((folder.name, key))  # written under the lock; a read needs none
+        if failed is not None:
+            return equip_look.Preview("error", notes=[failed])
+        try:
+            found = equip_look.Preview.from_dict(json.loads((folder / f"{key}.json").read_text(encoding="utf-8")),
+                                                 folder)
+        except (OSError, ValueError):
+            found = None
+        if found is not None:
+            return found
+        try:
+            made, keep = self._make_preview(job, target, size, compare, folder, extras)
+            return self._save_preview(folder, key, made, keep)
+        except Exception as exc:  # noqa: BLE001 - a bug or a full disk must not stop the window's worker
+            log.warning("3D 미리보기를 만들지 못했습니다 (%s %s %s): %s", target.kind, target.key, target.part, exc,
+                        exc_info=not isinstance(exc, (OSError, EquipError)))
+            note = f"{equip_look.STATUS['error']}: {exc}"
+            with self._equip_lock:
+                self._preview_failed[(folder.name, key)] = note  # tried again after a restart
+            return equip_look.Preview("error", notes=[note])
+
+    def _make_preview(self, job: EquipJob | None, target, size: int, compare: bool, folder: Path,
+                      extras: bool = True):
+        """(equip_look.Look, whether it may be kept: not when the game could not be read this time)."""
+        notes = []
+        try:
+            game = self._equip_game()
+        except (OSError, MatfixError) as exc:
+            game = None
+            notes.append(f"게임 파일 목록을 읽지 못했습니다: {exc}")
+        mod, redirects = None, ()
+        if job is not None:
+            mod = equip_look.ModSource(job.files)
+            try:
+                scan = self._preview_scan(job)
+                redirects = list(scan.redirects) if scan is not None else ()
+            except Exception as exc:  # noqa: BLE001 - without the look swaps the mod's own part is drawn
+                log.debug("모드 파일을 살펴보지 못했습니다 (%s): %s", job.name, exc)
+        with self._equip_lock:
+            textures = self._preview_textures
+            if textures is None or textures.folder != folder / "textures":
+                textures = self._preview_textures = equip_look.Textures(folder / "textures")
+        look = equip_look.preview(target, mod, equip_look.GameSource(game) if game is not None else None, size,
+                                  compare, redirects, textures, extras=extras)
+        look.notes[:0] = notes
+        return look, not notes
+
+    def _preview_scan(self, job: EquipJob):
+        """The job's ModScan (for its look swaps).  A job whose mod was scanned with other files since (an
+        option changed while the window still draws the old pictures) is scanned for this picture only:
+        it must not take the current scan's place."""
+        with self._equip_lock:
+            cached = self._load_equip_scans().get(job.mod_id)
+            if cached is not None and cached[0] == job.stamp:
+                return cached[1]
+            if cached is None:  # never scanned (the command line): scanned and kept
+                return self.equipment_scans([job]).get(job.mod_id)
+            if self._equip_paths is None and any(rel.lower().endswith(".pak") for rel in job.files):
+                self._equip_paths = equip_pathlist.PathIndex(self.data_dir / "cache")
+            paths = self._equip_paths
+        return equip_scan.scan_files(job.files, paths)  # the index is only read: no lock needed
+
+    @staticmethod
+    def _save_preview(folder: Path, key: str, look, keep: bool = True) -> equip_look.Preview:
+        """The pictures of a Look as PNG files and, with ``keep``, its record as <key>.json (written last: a
+        record is complete when it is there)."""
+        def save(image, name: str) -> Path | None:
+            if image is None:
+                return None
+            target = folder / name
+            tmp = target.with_name(f"{name}.{os.getpid()}-{threading.get_ident()}.tmp")
+            try:
+                image.save(tmp, "PNG")
+                tmp.replace(target)
+            finally:
+                tmp.unlink(missing_ok=True)  # left only when writing failed
+            return target
+
+        out = equip_look.Preview(look.status, save(look.image, f"{key}.png"), save(look.before, f"{key}-before.png"),
+                                 list(look.notes), [], list(look.chips), look.triangles, look.changed)
+        for i, (name, before, after, new) in enumerate(look.swatches):
+            out.swatches.append(equip_look.Swatch(name, save(before, f"{key}-t{i}b.png"),
+                                                  save(after, f"{key}-t{i}a.png"), new))
+        if not keep:
+            return out
+        record = folder / f"{key}.json"
+        tmp = record.with_name(f"{record.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(out.to_dict(), ensure_ascii=False), encoding="utf-8")
+            tmp.replace(record)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return out
+
+    def equipment_self_test(self, items: int = equip_selftest.DEFAULT_ITEMS, seconds: float | None = None,
+                            progress: ProgressFn | None = None) -> str:
+        """The 3D preview's self-test on the installed game (equip/selftest.py): a text report on how
+        ``items`` of the game's own equipment parts read and draw. Never raises; safe on a worker thread."""
+        try:
+            game = self._equip_game(progress)
+        except Exception as exc:  # noqa: BLE001 - the report says it
+            return f"preview self-test: 게임 파일 목록을 읽지 못했습니다 ({exc})\n"
+        if game is None:
+            return "preview self-test: 게임 폴더가 없거나 게임 파일을 읽을 수 없습니다 (zstandard 필요)\n"
+        try:
+            catalog = self.equipment_catalog(build=False)
+        except Exception:  # noqa: BLE001 - without the catalog there is no thumbnail to compare with
+            catalog = None
+
+        def thumb(target):
+            tex = catalog.thumb(target) if catalog is not None else None
+            return self.equipment_thumbnail(tex, 64) if tex else None
+
+        try:
+            return equip_selftest.run(game, items, thumb=thumb, seconds=seconds, progress=progress)
+        except Exception as exc:  # noqa: BLE001 - run() reports problems itself; this is a bug in it
+            log.warning("3D 미리보기 점검이 실패했습니다: %s", exc, exc_info=True)
+            return f"preview self-test failed: {type(exc).__name__}: {exc}\n"
+
     def equipment_ui(self) -> dict:
         """The game's rarity colours ({"1": "#rrggbb"...}), weapon-type icons ({type: PNG path}) and the
         icons of armor pieces, kinsects and palicos ({"helm"...: PNG path}), cached per game version; {}
@@ -1661,9 +1866,10 @@ class ModManager:
             pass
         return ui
 
-    def export_equipment_report(self, target: Path) -> None:
+    def export_equipment_report(self, target: Path, progress: ProgressFn | None = None) -> None:
         """A zip to find out why names or pictures are missing on a real game: the cached results, a
-        check of the game files they come from, the icon sheet and the log. Thread-safe."""
+        check of the game files they come from, the 3D preview's self-test, the icon sheet and the log.
+        Thread-safe."""
         from . import __version__
 
         lines = [f"app {__version__}", f"game {self.game_version()}", f"registry {self.registry_date()}",
@@ -1693,10 +1899,12 @@ class ModManager:
                            equip_catalog.palico_thumb_prefab(500100)):
                 tex = equip_catalog.thumb_texture(prefab)
                 lines.append(f"{tex}: {'found' if game.has(tex) else 'not in the game'}")
+        selftest = self.equipment_self_test(REPORT_SELFTEST_ITEMS, REPORT_SELFTEST_SECONDS, progress)
         partial = target.with_name(target.name + ".partial")
         try:
             with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("report.txt", "\n".join(lines) + "\n")
+                zf.writestr("preview-selftest.txt", selftest)  # text only: no game pictures
                 cache = self.data_dir / "cache"
                 for path in [*cache.glob("equip-catalog-*.json"), cache / "equip-scans.json"]:
                     if path.is_file():

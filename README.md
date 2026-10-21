@@ -27,6 +27,7 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
 - **장비 외형 보기**: 모드가 게임 속 어떤 장비(방어구 · 무기 · 오토모 장비 · 세크레트 · NPC 등)의 모습을 바꾸는지
   게임의 장비 이름과 미리보기 그림으로 한눈에 보여 줍니다. 방어구는 남성 · 여성과 부위(머리 · 몸통 · 팔 · 허리 · 다리)별로,
   같은 부위를 바꾸는 모드끼리는 **겹침**으로 표시합니다. 루스 파일 모드와 PAK 모드 모두 살펴봅니다.
+  모드를 적용한 모습을 간단한 3D 그림으로 그려 원래 모습과 나란히 비교할 수도 있습니다 (**적용 후 미리보기**).
 - **켜기/끄기와 로드 순서**: 체크박스로 켜고 끄며, 드래그 또는 ▲▼ 버튼으로 순서를 바꿉니다.
   목록 아래쪽 모드일수록 우선 적용됩니다.
 - **충돌 한눈에 보기**: 같은 파일을 바꾸는 모드끼리 몇 개의 파일이 겹치고 어느 모드가 이기는지, 아무것도 적용되지 않는 모드가
@@ -237,11 +238,31 @@ MH Wilds RSZ 덤프와 그 기록을 바탕으로 만들었습니다.
   게임 폴더가 없거나 게임 파일을 읽을 수 없으면 게임 안의 번호(예: `방어구 004-001`)로 보여 줍니다.
 - 게임에서 이름과 그림을 읽으려면 zstandard가, 그림을 보려면 Pillow도 필요합니다 (exe에는 모두 들어 있습니다).
 - 장비 이름이나 그림이 나오지 않으면 창 오른쪽 아래 **⋯ → 진단 파일 저장**으로 만든 zip을 보내 주세요.
+  zip에는 게임의 장비 몇 개로 적용 후 미리보기를 점검한 결과도 글로 들어 있습니다 (게임 그림은 넣지 않습니다).
+
+#### 적용 후 미리보기 (간단한 3D)
+
+- 오른쪽 **바꾸는 모드**의 모드마다 **적용 후** 그림이 나옵니다. 그 모드가 바꾸는 부위를 모드 파일을 적용한 모습으로
+  그린 것입니다. 방어구는 머리 · 몸통 · 팔 · 허리 · 다리를 하나씩, 무기는 본체와 보조(방패 · 칼집 등)를 따로,
+  오토모 장비는 조각마다 그립니다.
+- 그림을 누르면 **원래 모습 | 적용 후**를 같은 구도로 나란히 크게 보여 주고, 모드가 바꾼 텍스처(게임 → 모드)와
+  재질 파일(.mdf2)에서 바뀐 색 값(기본 색 · 염색 색 · 발광 색)도 함께 보여 줍니다.
+- 모델(.mesh) · 재질 · 텍스처를 모드에서 먼저 찾고, 없는 파일은 게임에서 읽어 이 프로그램이 직접 그리는 간단한 그림입니다.
+  **게임과 색 · 광택이 다를 수 있습니다.** 염색 색(컬러 레이어), 빛나는 부분(발광), 반투명(얇은 천 · 유리 같은 막은 구멍
+  뚫린 모습으로 그림), 노멀 맵은 그리지 않습니다. 방어구는 몸에 입힌 모습이 아니라 부위 하나씩 그립니다.
+- 모드가 부위를 감추면 **숨김**으로 나옵니다. 모드가 가리키는 파일이 모드에도 게임에도 없으면 그 부분을 회색으로 그리고
+  부위 이름 옆에 ⚠를 붙입니다 (게임에서 멈추거나 깨져 보일 수 있습니다). 재질 이름이 맞지 않는 부분은 게임처럼 체크무늬로
+  그립니다.
+- 게임 폴더가 없으면 모드에 들어 있는 파일만으로 그리고(게임 텍스처를 쓰는 부분은 단색), 원래 모습은 그리지 않습니다.
+- 그림은 처음 볼 때 그리고(부위 하나에 보통 1초 안팎) 데이터 폴더의 `cache\equip-previews\`에 저장해 둡니다. 모드나 옵션이
+  바뀌거나 게임이 업데이트되면 다시 그립니다.
 
 텍스트 파일 형식은 [REMSG_Converter](https://github.com/dtlnor/REMSG_Converter)(dtlnor, MIT)와 REasy(MIT)를,
 텍스처의 GDeflate 압축은 [DirectStorage](https://github.com/microsoft/DirectStorage)(Apache-2.0)와 NVIDIA
 [libdeflate](https://github.com/NVIDIA/libdeflate)(MIT/Apache-2.0)의 GDeflate 설명을 바탕으로 직접 구현했습니다.
 장비 파일 목록은 REasy의 `MHWS_STM.list`(MIT)에서 뽑았습니다 (`tools/make_equip_paths.py`).
+적용 후 미리보기의 모델(.mesh) 구조와 재질 규칙은 REasy(Battlezone, MIT)를 바탕으로 했고, 3D 그리기는 이 프로그램을 위해
+순수 파이썬으로 새로 썼습니다.
 
 ### 모드를 전부 빼고 싶을 때
 
@@ -262,7 +283,8 @@ v1.2.1 이하에서 `%LOCALAPPDATA%\MHWildsModManager`에 쌓인 데이터는 v1
 
 - `mods\<id>\files\` : 설치된 모드 파일 (게임 폴더 기준 구조)
 - `mods\<id>\matfix\` : 재질 복구로 만든 파일 (모드의 원래 파일은 그대로)
-- `cache\` : 재질 점검에 쓰는 게임 파일 목록, 장비 외형에 쓰는 장비 이름과 미리보기 그림 (게임이 업데이트되면 다시 만듦)
+- `cache\` : 재질 점검에 쓰는 게임 파일 목록, 장비 외형에 쓰는 장비 이름과 미리보기 그림, 적용 후 미리보기 그림
+  (게임이 업데이트되면 다시 만듦)
 - `state.json` : 모드 목록, 순서, 활성 상태, 설정
 - `deployment.json` : 게임 폴더에 넣은 파일 기록
 - `backups\` : 모드가 덮어쓴 원본 게임 파일
@@ -295,10 +317,15 @@ python -m mhwmm materials restore "모드 이름"  # 원래 재질 파일로 되
 python -m mhwmm materials report "모드 이름" --out 진단.zip   # 진단 파일 저장
 python -m mhwmm equipment [모드...]          # 모드가 바꾸는 장비 (게임의 장비 이름으로)
 python -m mhwmm equipment --icons 아이콘.png  # 게임의 무기 아이콘 위치 확인용 그림 저장
+python -m mhwmm equip-preview "모드 이름" weapon/09/000021/main 그림.png [--before] [--size 512]
+                                             # 적용 후 3D 미리보기 그림 저장 (--before: 원래 모습도 그림-before.png로)
+python -m mhwmm equip-preview --self-test [N] # 게임의 장비 N개로 적용 후 미리보기 점검 (결과는 글로 출력)
 python -m mhwmm deploy | purge | verify
 ```
 
 `enable`/`disable`/`install` 등은 바로 게임 폴더에 적용합니다 (`--no-deploy`로 끌 수 있음).
+`equip-preview`의 장비는 `종류/번호/부위`로 씁니다 (예: `armor/f/004/001/helm`, `weapon/09/000021/sub`, `palico/062/body`).
+`equipment` 명령이 장비마다 `종류/번호`를 보여 주고, 모드 자리에 `-`를 쓰면 게임 그대로의 모습을 그립니다.
 
 ## 주의 사항
 
@@ -326,7 +353,8 @@ python -m pytest
 - `tools/make_rsz_types.py` : RSZ 타입 정보(`rsz_types.json.xz`) 다시 만들기 (REasy 저장소 클론 필요),
   `tools/check_rsz_types.py` : 새로 만든 타입 정보 확인 (빠진 CRC, 실제 게임 파일 읽기)
 - `mhwmm/equip/` : 장비 외형 (`paths.py` 게임 경로 → 장비, `scan.py` 모드 파일·PAK 살펴보기, `catalog.py` 게임 데이터에서
-  장비 이름·그림 찾기, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처, `icons.py` 게임 아이콘·레어도 색),
+  장비 이름·그림 찾기, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처, `icons.py` 게임 아이콘·레어도 색,
+  적용 후 미리보기: `mesh.py` 모델 읽기, `render.py` 3D 그리기, `look.py` 모드·게임 파일 고르기, `selftest.py` 점검),
   `mhwmm/equipview.py` : 장비 외형 창, `tools/make_equip_paths.py` : 장비 파일 목록(`equip_paths.txt.xz`) 다시 만들기
 - `mhwmm/gui.py` : tkinter GUI, `mhwmm/theme.py` : 색상·글꼴·스타일, `mhwmm/cli.py` : 명령줄
 - `tools/make_assets.py` : 체크박스·스위치·아이콘 이미지 다시 만들기 (Pillow 필요)
