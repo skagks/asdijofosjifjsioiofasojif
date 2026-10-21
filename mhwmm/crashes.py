@@ -56,6 +56,7 @@ MAX_LOG_COPY = 64 * 1024 * 1024  # a larger log is copied in part (its start and
 MAX_DUMP_COPY = 512 * 1024 * 1024
 REPORT_LOG_LINES = 2000
 MAX_FAULTY_MATCH = 5000  # faulty entries looked for in paks and the game folder (the rest only in the mods' files)
+PAK_FAMILY = "re_chunk_000.pak.sub_000.pak"  # the paks REFramework adds pak_mods' paks to as numbered patches
 RSZ_EXTS = (".user", ".pfb", ".scn", ".mdf2")  # files the material check and repair (재질 점검·복구) handle
 # version suffixes when neither the mods nor the bundled path list know one
 FALLBACK_VERSIONS = {"user": ("3",), "pfb": ("18",), "scn": ("21",), "mdf2": ("45",), "tex": ("241106027",),
@@ -92,12 +93,25 @@ def evidence_dirs(game_dir, appdata=None) -> list[Path]:
     return out
 
 
-def config_path(game_dir, appdata=None) -> Path | None:
-    """REFramework's config file in use (the game folder's when there is none yet)."""
+def config_path(game_dir, appdata=None, fallback: bool | None = None) -> Path | None:
+    """REFramework's config file in use. REFramework picks its folder at every start by trying to write
+    to the game folder, so ``fallback`` (its last log said it used %APPDATA%: True, the game folder:
+    False) names that folder's file even before it exists; without it (None: not known) the game
+    folder's file, else %APPDATA%'s, else the game folder's (made there)."""
+    if fallback is not None and game_dir:
+        folder = appdata_dir(appdata) if fallback else Path(game_dir)
+        if folder is not None:
+            return folder / CONFIG_FILE
     for d in evidence_dirs(game_dir, appdata):
         if (d / CONFIG_FILE).is_file():
             return d / CONFIG_FILE
     return Path(game_dir) / CONFIG_FILE if game_dir else None
+
+
+def config_paths(game_dir, appdata=None) -> list[Path]:
+    """The places REFramework's config file can be (the game folder's, %APPDATA%'s)."""
+    folders = [Path(game_dir) if game_dir else None, appdata_dir(appdata)]
+    return [d / CONFIG_FILE for d in folders if d is not None]
 
 
 def refw_option(game_dir, key: str, appdata=None) -> str | None:
@@ -114,10 +128,11 @@ def lua_logging(game_dir, appdata=None) -> bool:
     return crashlog.config_bool(refw_option(game_dir, crashlog.LUA_LOG_KEY, appdata)) is True
 
 
-def set_refw_option(game_dir, key: str, value, appdata=None) -> bool:
-    """Change one REFramework option (see crashlog.set_config_value). The caller makes sure the
-    game is not running and the user agreed. Returns False when it already had that value."""
-    path = config_path(game_dir, appdata)
+def set_refw_option(game_dir, key: str, value, appdata=None, path=None) -> bool:
+    """Change one REFramework option (see crashlog.set_config_value) in ``path`` (one of
+    config_paths; by default config_path's). The caller makes sure the game is not running and the
+    user agreed. Returns False when it already had that value."""
+    path = Path(path) if path else config_path(game_dir, appdata)
     if path is None or (not path.is_file() and not (Path(game_dir) / REFRAMEWORK_DLL).is_file()):
         raise ValueError("REFramework가 설치되어 있지 않습니다.")
     changed = crashlog.set_config_value(path, key, value)
@@ -140,8 +155,8 @@ def dump_time(path) -> float | None:
         return None
 
 
-def steam_info(game_dir) -> dict:
-    """``buildid`` and ``LastUpdated`` (local time) of the game in Steam's app manifest ({} if not found)."""
+def _steam_state(game_dir) -> dict:
+    """``buildid`` and ``LastUpdated`` (as written) of the game in Steam's app manifest ({} if not found)."""
     if not game_dir:
         return {}
     from . import steam
@@ -156,9 +171,21 @@ def steam_info(game_dir) -> dict:
         value = steam._get(state, key)
         if isinstance(value, str) and value:
             out[key] = value
+    return out
+
+
+def steam_info(game_dir) -> dict:
+    """``buildid`` and ``LastUpdated`` (local time) of the game in Steam's app manifest ({} if not found)."""
+    out = _steam_state(game_dir)
     if out.get("LastUpdated", "").isdigit():
         out["LastUpdated"] = datetime.fromtimestamp(int(out["LastUpdated"])).strftime("%Y-%m-%d %H:%M")
     return out
+
+
+def steam_updated(game_dir) -> float | None:
+    """When Steam last updated the game (its app manifest's ``LastUpdated``; None if not known)."""
+    value = _steam_state(game_dir).get("LastUpdated", "")
+    return float(value) if value.isdigit() and int(value) > 0 else None
 
 
 # ---- sessions ------------------------------------------------------------------------------------
@@ -283,6 +310,20 @@ class Session:
         if s.get("faulty"):
             parts.append(f"읽지 못한 파일 {s['faulty']}개")
         return " · ".join(parts)
+
+
+def session_loose(s: Session | None) -> bool | None:
+    """Whether REFramework's loose file loading (LooseFileLoader) was on in the session: its settings
+    file as copied with the session (REFramework writes it while it runs; no line: off, its default).
+    None: not copied."""
+    path = s.file(CONFIG_FILE) if s is not None else None
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return crashlog.parse_config(text).get(crashlog.LOOSE_FILES_KEY) == "true"  # (REFramework takes only "true")
 
 
 def _when(epoch: float | None, now: float | None = None) -> str:
@@ -532,9 +573,15 @@ def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]
         s.info["files"][DUMP_FILE] = {"from": str(path), "size": st.st_size, "mtime": st.st_mtime_ns, "time": written}
         changed[s.id] = s
 
-    # REFramework's settings as they are now (Lua error logging, loose files, pak_mods)
-    config = next((d / CONFIG_FILE for d in dirs if (d / CONFIG_FILE).is_file()), None)
+    # REFramework's settings as they are now (Lua error logging, loose files, pak_mods): those of the folder
+    # the session's records came from (REFramework keeps its settings where it writes its log)
     for s in changed.values():
+        source = s.info.get("source")
+        if source:
+            config = Path(source) / CONFIG_FILE
+            config = config if config.is_file() else None
+        else:
+            config = next((d / CONFIG_FILE for d in dirs if (d / CONFIG_FILE).is_file()), None)
         if config is not None:
             try:
                 st = config.stat()
@@ -671,7 +718,7 @@ def pending_notice(crash_dir, now: float | None = None, days: float = NOTICE_DAY
         if new and index is None:
             return s
         if new:
-            match = index.for_session(s).match_faulty(new)
+            match = index.for_session(s).match_faulty(new, session_loose(s))
             if match.by_mod or match.loose or match.paks:
                 return s
     return None
@@ -736,16 +783,21 @@ class ModIndex:
     folder only (pak tables, folder listings).
 
     A session is explained with :meth:`for_session`: then only the mods that were on in it count
-    (``ran``), and the files the manager had placed then (``owners``, outside natives\\) name their mods,
-    whatever was installed, turned off or renumbered since."""
+    (``ran``, in load order; of those only the ones with files in the game folder then, ``present``,
+    when the session says), and the files the manager had placed then (``owners``, outside natives\\)
+    name their mods, whatever was installed, turned off or renumbered since. A loose file several of
+    them have was the last one's in load order (the one the manager had placed), whoever placed it since."""
 
     def __init__(self, game_dir=None, deployed: dict | None = None, mods: Iterable[ModRef] = (),
-                 names: dict[str, str] | None = None, ran: Iterable[str] | None = None, owners: dict | None = None):
+                 names: dict[str, str] | None = None, ran: Iterable[str] | None = None, owners: dict | None = None,
+                 present: Iterable[str] | None = None):
         self.game_dir = Path(game_dir) if game_dir else None
         self.deployed = {k: v for k, v in (deployed or {}).items() if isinstance(v, dict)}
         self.mods = {m.id: m for m in mods}
         self.names = dict(names or {})
-        self.ran = set(ran) if ran is not None else None  # ids of the mods on in the session (None: as now)
+        self.order = list(dict.fromkeys(ran)) if ran is not None else None  # ids of the mods on in the session
+        self.ran = set(self.order) if self.order is not None else None  # (None: as now)
+        self.present = set(present) if present is not None else None  # of those, the ones applied (None: not known)
         self.owners = ({norm_path(k): v for k, v in owners.items() if isinstance(k, str) and isinstance(v, str) and v}
                        if isinstance(owners, dict) else None)
         self.unreadable: list[str] = []
@@ -756,6 +808,7 @@ class ModIndex:
         self._pak_tables: dict[str, object] = {}
         self._listings: dict[Path, dict[str, str]] = {}
         self._versions: dict[str, list[str]] = {}
+        self._ranks: dict[str, int] | None = None
 
     def for_session(self, session: Session | None) -> ModIndex:
         """This index as it was when ``session`` ran (its context: the mods on then and the files the
@@ -766,8 +819,10 @@ class ModIndex:
             return self
         mods = [m for m in mods if isinstance(m, dict) and isinstance(m.get("id"), str)]
         names = {**{m["id"]: m["name"] for m in mods if isinstance(m.get("name"), str) and m["name"]}, **self.names}
+        placed = context.get("placed")
         view = ModIndex(self.game_dir, self.deployed, self.mods.values(), names,
-                        ran=[m["id"] for m in mods if m.get("enabled")], owners=context.get("owners"))
+                        ran=[m["id"] for m in mods if m.get("enabled")], owners=context.get("owners"),
+                        present=[i for i in placed if isinstance(i, str)] if isinstance(placed, list) else None)
         view.unreadable, view._pak_tables, view._listings, view._versions = (
             self.unreadable, self._pak_tables, self._listings, self._versions)
         return view
@@ -782,8 +837,13 @@ class ModIndex:
         return f"'{self.name(mod_id)}'" + (" (지금은 꺼져 있음)" if mod is not None and not mod.enabled else "")
 
     def was_on(self, mod: ModRef) -> bool:
-        """The mod was on in the session explained (without a session: it is on now)."""
-        return mod.id in self.ran if self.ran is not None else mod.enabled
+        """The mod was on in the session explained (and applied, when the session says which mods were;
+        without a session: it is on now)."""
+        return self._in_session(mod.id) if self.ran is not None else mod.enabled
+
+    def _in_session(self, mod_id: str) -> bool:
+        """The mod's files were in the game folder in the session (as far as it says; without one: True)."""
+        return (self.ran is None or mod_id in self.ran) and (self.present is None or mod_id in self.present)
 
     def _keys_of(self, mod: ModRef) -> set[str]:
         if mod.id not in self._keys:
@@ -795,7 +855,7 @@ class ModIndex:
         of them (natives\\ from the deploy manifest), else the manifest's, of the mods that were on."""
         if self._placed is None:
             placed = {k: str(e["mod"]) for k, e in self.deployed.items()
-                      if e.get("mod") and (self.ran is None or e["mod"] in self.ran)}
+                      if e.get("mod") and self._in_session(str(e["mod"]))}
             if self.owners is not None:
                 placed = {k: m for k, m in placed.items() if k.startswith("natives/")}
                 placed.update(self.owners)
@@ -843,26 +903,40 @@ class ModIndex:
 
     # ---- faulty files
     def _loose_index(self) -> dict[str, list[str]]:
+        """Resource -> the mods whose loose file for it the game could read: the files in the game folder
+        now and those of the mods that are on but not applied; for a session, the one of the mods that
+        were on (and applied) with it that came last in load order (the manifest may name another one
+        now: a mod turned off or moved since)."""
         if self._loose is None:
             index: dict[str, list[str]] = {}
             for key, mod in self.placed().items():  # the files in the game folder
                 index.setdefault(resource_key(key), []).append(mod)
             placed = set(index)
-            for m in self.mods.values():  # and those of the mods that were on but not applied
+            for m in self.mods.values():  # and those of the mods that were on (but not applied)
                 if self.was_on(m):
                     for rel in m.files:
                         key = resource_key(rel)
-                        if key not in placed and m.id not in index.get(key, []):
+                        if (key not in placed or self.order is not None) and m.id not in index.get(key, []):
                             index.setdefault(key, []).append(m.id)
+            if self.order is not None:
+                rank = {mod_id: n for n, mod_id in enumerate(self.order)}
+                index = {key: [max(ids, key=lambda i: rank.get(i, -1))] for key, ids in index.items()}
             self._loose = index
         return self._loose
+
+    def later_gone(self, mod_id: str) -> bool:
+        """For a session: a mod that was on in it after this one in load order is no longer installed
+        (its files are not known, so it may have been the one whose copy the game read)."""
+        if self.order is None or mod_id not in self.order:
+            return False
+        return any(i not in self.mods and self._in_session(i) for i in self.order[self.order.index(mod_id) + 1:])
 
     def _pak_list(self) -> list[tuple[str, str]]:
         """(mod id or "" for a pak no mod placed, game path) of the paks REFramework or the game read."""
         if self._paks is None:
             managed = [(e.get("mod", ""), e["path"]) for e in self.deployed.values() if e.get("pak") and e.get("path")]
-            # a pak of a mod that was not on came after the session (nor is it one no mod placed)
-            paks = [(m, p) for m, p in managed if self.ran is None or m in self.ran]
+            # a pak of a mod that was not on (or not applied) came after the session (nor is it one no mod placed)
+            paks = [(m, p) for m, p in managed if self._in_session(m)]
             if self.game_dir is not None:
                 folder = self.game_dir / PAK_MODS_DIR
                 placed = {norm_path(p) for _, p in managed}
@@ -962,17 +1036,24 @@ class ModIndex:
                     return game_path
         return None
 
-    def match_faulty(self, entries: Sequence[FaultyFile]) -> FaultyMatch:
+    def match_faulty(self, entries: Sequence[FaultyFile], loose: bool | None = None) -> FaultyMatch:
+        """Where the game got the files REFramework could not load: a loose file in the game folder first
+        (REFramework's loose file loading serves one before any pak), else the pak that wins. ``loose``:
+        whether that loading was on (False: loose files were not read; None: not known, as if on)."""
         out = FaultyMatch()
-        loose = self._loose_index()
+        index = self._loose_index() if loose is not False else {}
         for i, entry in enumerate(entries):
-            owners = loose.get(entry.key)
+            owners = index.get(entry.key)
             if owners:
                 for mod_id in owners:
                     out.by_mod.setdefault(mod_id, []).append(entry)
                 continue
             if i >= MAX_FAULTY_MATCH:
                 out.unchecked.append(entry)
+                continue
+            copy = self.loose_copy(entry.path) if loose is not False else None
+            if copy:
+                out.loose.append((entry, copy))
                 continue
             hits = self._pak_hits(entry.path)
             if hits:
@@ -982,15 +1063,13 @@ class ModIndex:
                     else:
                         out.paks.setdefault(rel, []).append(entry)
                 continue
-            copy = self.loose_copy(entry.path)
-            if copy:
-                out.loose.append((entry, copy))
-            else:
-                out.unknown.append(entry)
+            out.unknown.append(entry)
         out.unreadable = list(dict.fromkeys(self.unreadable))
         return out
 
     def _pak_hits(self, path: str) -> list[tuple[str, str]]:
+        """The pak in pak_mods the game read this resource from: of those that have it, the one REFramework
+        gave the highest patch number."""
         paks = self._pak_list()
         if not paks:
             return []
@@ -1002,7 +1081,34 @@ class ModIndex:
             table = self._pak_table(rel)
             if table is not None and any(table.find(h) is not None for h in hashes):
                 hits.append((mod_id, rel))
+        if len(hits) > 1:
+            ranks = self._pak_ranks()
+            hits = [max(hits, key=lambda hit: ranks.get(hit[1], -1))]
         return hits
+
+    def _pak_ranks(self) -> dict[str, int]:
+        """Game path -> the patch number REFramework gives a pak in pak_mods (the highest wins): a name like
+        ``re_chunk_000.pak.sub_000.pak.patch_012.pak`` takes its number, the others the next free ones
+        after the game's own patches, in the order Windows lists the folder (NTFS: by upper-cased name,
+        a subfolder's paks where the subfolder is)."""
+        if self._ranks is None:
+            free = 1
+            if self.game_dir is not None:
+                listing = self._listing(self.game_dir)
+                while free < 32 and f"{PAK_FAMILY}.patch_{free:03d}.pak".casefold() in listing:
+                    free += 1
+            ranks: dict[str, int] = {}
+            auto = []
+            for _mod, rel in self._pak_list():
+                m = re.match(r"(.+)\.patch_(\d+)", module_name(rel))  # (at the last ".patch_", as REFramework)
+                if m and m.group(1) == PAK_FAMILY:
+                    ranks[rel] = int(m.group(2))
+                else:
+                    auto.append(rel)
+            for n, rel in enumerate(sorted(auto, key=lambda r: tuple(p.upper() for p in r.split("/")))):
+                ranks[rel] = free + n
+            self._ranks = ranks
+        return self._ranks
 
 
 # ---- explaining a session -------------------------------------------------------------------------
@@ -1152,6 +1258,14 @@ def _faulty_findings(match: FaultyMatch, index: ModIndex) -> list[Finding]:
 
     for mod_id, items in match.by_mod.items():
         rsz = any(_RSZ_EXTS_RE.search(f.key) for f in items)
+        mod = index.mods.get(mod_id)
+        state = mod.material_state if mod is not None and all(_RSZ_EXTS_RE.search(f.key) for f in items) else ""
+        if state == "current":  # (REFramework lists some of the game's own files too: #1677)
+            out.append(Finding("faulty", f"REFramework가 {index.label(mod_id)}의 {items[0].name}{more(items)}을(를) 읽지 못한 "
+                               "파일로 기록했지만, 재질 점검에서는 현재 게임과 맞는 파일입니다. 바뀌지 않은 게임 파일도 이렇게 "
+                               "기록되는 경우가 있어 원인이 아닐 수 있습니다 → 게임이 멈추거나 튕기면 모드를 업데이트하거나 꺼 "
+                               "보세요", sample(items), [mod_id], "low"))
+            continue
         out.append(Finding("faulty", f"REFramework가 읽지 못한 파일: {index.label(mod_id)}의 {items[0].name}{more(items)}"
                            + (" → 재질 점검·복구를 해 보세요" if rsz else " → 모드를 최신 버전으로 업데이트하거나 꺼 보세요"),
                            sample(items), [mod_id], "high", "matfix" if rsz else ""))
@@ -1312,7 +1426,7 @@ def explain(session: Session | None, index: ModIndex, builds=None, now: float | 
         findings += _setup_findings(info, bases, index)
     faulty = session.faulty() if session is not None else []
     if faulty:
-        findings += _faulty_findings(index.match_faulty(faulty), index)
+        findings += _faulty_findings(index.match_faulty(faulty, session_loose(session)), index)
     if session is None:
         lead.append(Finding("no_record", NO_RECORD))
     elif session.dump_only:
@@ -1395,7 +1509,7 @@ def explain_text(text: str, index: ModIndex, session: Session | None = None) -> 
         out.append(Finding("code", f"오류 코드 {exception_label(found.codes[0])}. 어느 파일에서 났는지는 이 문구만으로는 알 수 "
                            "없습니다.", [f"예외 코드: {exception_label(c)}" for c in found.codes[:3]], [], "info"))
     if found.faulty:
-        out += _faulty_findings(index.match_faulty(found.faulty), index)
+        out += _faulty_findings(index.match_faulty(found.faulty, session_loose(session)), index)
     for path, line in found.scripts:
         owners = index.owners_by_tail(path)
         out.append(Finding("lua", f"스크립트 '{module_name(path)}'에서 오류가 났습니다" + _suspect(index, owners),

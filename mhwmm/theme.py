@@ -265,6 +265,9 @@ class Theme:
               bordercolor=[("disabled", p["border"])], foreground=[("disabled", p["subtle"])])
         button("Compact.TButton", p["raised"], p["text"], p["hover"], p["pressed"], border=p["border"],
                padding=(12, 7), width=-2)
+        # small buttons in a card's text (실행 전 점검: what may help with an issue)
+        button("Action.TButton", p["raised"], p["text"], p["hover"], p["pressed"], border=p["border"],
+               padding=(10, 3), font=f["small"], width=-2)
         button("Ghost.TButton", p["surface"], p["muted"], p["hover"], p["pressed"], padding=(9, 5),
                font=f["icon"], width=-2)
         s.map("Ghost.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])

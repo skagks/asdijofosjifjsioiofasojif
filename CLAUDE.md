@@ -58,5 +58,12 @@
   - `mhwmm/gamewatch.py`: 매니저에서 실행한(또는 켤 때 실행 중인) 게임 프로세스가 어떻게 끝났는지 확인(Windows API, 안 되면
     tasklist, 다른 OS에서는 아무것도 하지 않음). 종료 코드는 모두 manager.log에 남기고, 정상 종료면 `crashes\last_good.json`.
     테스트는 가짜 ProcessApi로 한다 (진짜 프로세스는 Windows CI에서만)
+  - `mhwmm/precheck.py`: 실행 전 점검. 빠른 `check()`(폴더 몇 개만 훑어 1초 안에, 예외를 내지 않음)와 느린 `background()`(지난
+    게임 기록, 매니저가 넣지 않은 natives 파일의 읽기 전용 재질 점검. 결과는 `cache\precheck-scan.json`이고 `check()`가 지금도
+    맞는 것만 씀). 목록의 ⚠ 문제(`ModManager.problems`)도 여기서 만든다. 게임 실행 직전에는 새로 생긴 높음·보통 항목만 묻고
+    (`to_ask`, '같은 내용이면 다시 묻지 않기'는 데이터 폴더 `precheck.json`에 게임 버전마다) 실행은 막지 않는다(실패해도 실행).
+    게임 폴더는 바꾸지 않고, REFramework 설정만 사용자가 동의했을 때 게임이 꺼져 있을 때 `set_refw_option`으로 한 줄 바꾼다.
+    느린 점검의 결과가 달라지는 변경을 하면 `precheck.BACKGROUND_FORMAT`을 올린다. 원인 모드 찾기 중에는 묻지 않는다.
+    창은 gui.py의 PrecheckDialog(게임 실행 직전, ☰ → 실행 전 점검), 명령줄은 `check`
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

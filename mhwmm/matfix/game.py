@@ -19,6 +19,7 @@ import os
 import re
 import struct
 import threading
+import zlib
 from array import array
 from bisect import bisect_left
 from pathlib import Path
@@ -249,8 +250,9 @@ class ShaderIndex:
                     data = json.load(f)
                 self._by_mmtr = {k: [(src, material_from_json(m)) for src, m in v] for k, v in data.items()}
                 return
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
+            except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error) as exc:  # (cut short: made again)
+                log.info("재질 목록 캐시를 다시 만듭니다: %s", exc)
+                source.unlink(missing_ok=True)
         by_mmtr: dict[str, list[tuple[str, dict]]] = {}
         paths = known_material_paths()
         for i, listed in enumerate(paths):
@@ -274,13 +276,20 @@ class ShaderIndex:
         self._by_mmtr = by_mmtr
         target = self._cache_file()
         if target is not None:
+            # written aside and then put in place: a manager closed meanwhile leaves no half-written cache
+            tmp = target.with_name(f"{target.name}.{os.getpid()}-{threading.get_ident()}.tmp")
             try:
                 for old in target.parent.glob("shaders-*.json.gz"):
                     old.unlink(missing_ok=True)
-                with gzip.open(target, "wt", encoding="utf-8") as f:
+                with gzip.open(tmp, "wt", encoding="utf-8") as f:
                     json.dump({k: [(src, material_to_json(b)) for src, b in v] for k, v in by_mmtr.items()}, f)
+                tmp.replace(target)
             except OSError as exc:
                 log.warning("재질 목록을 저장하지 못했습니다: %s", exc)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def find(self, mmtr: str) -> list[tuple[str, dict]]:
         if self._by_mmtr is None:

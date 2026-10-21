@@ -572,3 +572,24 @@ def test_results_of_older_repair_rules_are_checked_again(library, game, tmp_path
     assert [j.mod_id for j in library.material_jobs(unchecked_only=True)] == [mod.id]
     run(library, unchecked_only=True)
     assert library.material_state(mod.id) == "stale" and library.materials_to_offer() == [mod]
+
+
+def test_shader_index_cache_cut_short_is_made_again(tmp_path, monkeypatch):
+    """The whole-game material list is saved aside and then put in place; a cache file cut short (the
+    manager closed while it was written) is made again instead of failing every lookup."""
+    import types
+
+    from mhwmm.matfix import game as gamemod
+
+    raw = assemble_mdf2(current_body(), 45)
+    fake = types.SimpleNamespace(cache_dir=tmp_path, fingerprint="fp",
+                                 read_versioned=lambda base, ext, prefer=(): (f"{base}.mdf2.45", raw))
+    monkeypatch.setattr(gamemod, "known_material_paths", lambda: [BODY + ".mdf2.45"])
+    index = gamemod.ShaderIndex(fake)
+    mmtr = Mdf2File(raw, 45).materials[0].mmtr_path
+    assert index.find(mmtr)
+    cache = tmp_path / "shaders-fp.json.gz"
+    assert cache.is_file() and [p.name for p in tmp_path.iterdir()] == ["shaders-fp.json.gz"]  # (no .tmp left)
+    cache.write_bytes(cache.read_bytes()[:20])  # cut short
+    assert gamemod.ShaderIndex(fake).find(mmtr) == index.find(mmtr)
+    assert gamemod.ShaderIndex(fake).find(mmtr)  # (and saved whole again)

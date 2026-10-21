@@ -33,6 +33,12 @@ def answer_dialogs(monkeypatch):
     for name in ("askyesno", "askyesnocancel"):
         monkeypatch.setattr(gui.messagebox, name, lambda *a, **k: True)
 
+    def run_anyway(self):  # 실행 전 점검 before a launch: 그래도 실행
+        self.destroy()
+        return ("run",)
+
+    monkeypatch.setattr(gui.PrecheckDialog, "show", run_anyway)
+
 
 def pump(root, until, timeout=10.0):
     end = time.time() + timeout
@@ -1324,3 +1330,360 @@ def test_gui_bisect_resumes_after_the_startup_checks(root, manager, tmp_path, ga
     # the folder was checked before the step's deploy started, not while it changed the folder
     assert state["verified"] == [False] and not asked
     assert app._bisect is not None and "적용했습니다" in app.bisect_text.cget("text")
+
+
+# ---- 실행 전 점검 -----------------------------------------------------------------------------------
+def test_gui_precheck_before_launch(root, manager, tmp_path, game_dir, monkeypatch):
+    import mhwmm.manager
+    from mhwmm import gui, precheck
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    bisect_mods(manager, tmp_path)  # REFramework and three loose mods, applied
+    config = game_dir / "re2_fw_config.txt"
+    write(config, "FontSize=16\r\nLooseFileLoader_Enabled=false\r\n")
+    write(game_dir / "dxgi.dll", "MZ")  # ReShade or the like, not placed by the manager
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    started = launcher(monkeypatch)
+    seen, answers = [], []
+
+    def show(self):
+        seen.append({"title": self.title_label.cget("text"), "kinds": [i.kind for i in self._shown()],
+                     "new": [i.kind for i in self._shown() if tuple(i.keys) in self.new],
+                     "buttons": [b.cget("text") for b in self._buttons], "texts": texts(self)})
+        answers.pop(0)(self)
+        return self.result
+
+    def fix_then_run(dialog):
+        loose = next(i for i in dialog.report.important if i.kind == "config_loose")
+        # not while the game runs: REFramework writes its settings back when it closes
+        monkeypatch.setattr(mhwmm.manager, "is_game_running", lambda: True)
+        dialog._act(loose)
+        pump(root, lambda: not dialog._fixing)
+        assert dialog.status.cget("text") == precheck.RUNNING and b"=false" in config.read_bytes()
+        monkeypatch.setattr(mhwmm.manager, "is_game_running", lambda: False)
+        dialog._act(loose)  # asked first (answered yes), then one line changes (CRLF kept)
+        pump(root, lambda: not dialog._fixing)
+        assert config.read_bytes() == b"FontSize=16\r\nLooseFileLoader_Enabled=true\r\n"
+        assert [i.kind for i in dialog.report.important] == ["dll_proxy"] and "바꿨습니다" in dialog.status.cget("text")
+        dialog.dont_ask_var.set(True)  # 같은 내용이면 다시 묻지 않기
+        dialog.finish(("run",))
+
+    monkeypatch.setattr(gui.PrecheckDialog, "show", show)
+    answers.append(fix_then_run)
+    app.launch_game()
+    pump(root, lambda: started)
+    (first,) = seen
+    assert first["title"] == "실행 전 점검: 확인할 것 2개" and first["kinds"] == ["config_loose", "dll_proxy"]
+    assert first["new"] == [] and first["buttons"] == ["설정 고치기", "폴더 열기"]  # (all new: none marked)
+    assert precheck.DONT_ASK in "".join(first["texts"]) and precheck.RUN_ANYWAY in first["texts"]
+    assert (manager.data_dir / "cache" / precheck.BACKGROUND_FILE).is_file()
+
+    # the same again: not asked, the game starts right away
+    app.launch_game()
+    pump(root, lambda: len(started) == 2)
+    assert len(seen) == 1
+
+    # something new: asked, the new one marked; 취소 does not start the game
+    write(game_dir / "pak_mods" / "hand.pak", "p")
+    answers.append(lambda dialog: dialog.cancel())
+    app.launch_game()
+    pump(root, lambda: len(seen) == 2)
+    pump(root, lambda: not app._prechecking)
+    assert seen[1]["kinds"] == ["pak_unknown", "dll_proxy"] and seen[1]["new"] == ["pak_unknown"]
+    assert len(started) == 2
+
+    # 폴더 열기 works in the window; a button for the main window closes it without starting the game
+    opened = []
+    monkeypatch.setattr(gui.fsutil, "open_in_explorer", lambda path: opened.append(path))
+
+    def open_then_apply(dialog):
+        dialog._act(next(i for i in dialog.report.important if i.kind == "pak_unknown"))
+        assert opened == [game_dir / "pak_mods"] and dialog.winfo_exists()
+        dialog.finish(("action", precheck.Issue("verify", "medium", "x", action="apply")))
+
+    applied = []
+    monkeypatch.setattr(app, "apply", lambda: applied.append(True))
+    answers.append(open_then_apply)
+    app.launch_game()
+    pump(root, lambda: applied)
+    assert len(started) == 2
+
+    # whatever fails in the check, the game starts
+    monkeypatch.setattr(gui.precheck, "check", lambda *a, **k: 1 / 0)
+    app.launch_game()
+    pump(root, lambda: len(started) == 3)
+    assert len(seen) == 3 and not app._prechecking
+
+    # not during 원인 모드 찾기 (its steps turn mods off on purpose)
+    monkeypatch.setattr(gui.precheck, "gather", lambda *a, **k: 1 / 0)
+    plain = []
+    monkeypatch.setattr(app, "_start_game", lambda: plain.append(True))
+    app._bisect = object()
+    app._precheck_then_start()
+    app._bisect = None
+    assert plain == [True]
+
+
+def test_gui_precheck_from_the_menu_and_in_the_background(root, manager, tmp_path, game_dir, monkeypatch):
+    import os
+
+    from mhwmm import gui, precheck
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    manager.settings.check_materials = False
+    ids = {}
+    for name, files in (("REFramework", {"dinput8.dll": "MZ"}), ("Armor", {"natives/STM/GameDesign/x.user.3": "u"}),
+                        ("Camera", {"reframework/autorun/camera.lua": 'require("_CatLib")'})):
+        with manager.prepare_install(make_zip(tmp_path / "zips" / f"{name}.zip", files)) as s:
+            ids[name] = manager.install_variant(s, s.variants[0]).id
+    old = time.time() - 7200
+    for path in manager.mods_dir.rglob("*"):  # installed before the game below crashed
+        os.utime(path, (old, old))
+    manager.deploy()
+    write(game_dir / "re2_fw_config.txt", "LooseFileLoader_Enabled=true\r\n")
+    write(game_dir / "natives" / "STM" / "hand" / "manual.tex", "t")  # put in by hand
+    # the last game: REFramework could not load a file of the armor mod
+    write(game_dir / "re2_framework_log.txt", crash_log(game_dir, time.time() - 600))
+    write(game_dir / "reframework_faulty_files.txt", '"error" 2 "Invalid file" "GameDesign/x.user"\r\n')
+
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None and manager.crash_sessions())
+    assert app._problems == manager.problems() == {ids["Camera"]: ["필요한 모드가 없거나 꺼져 있습니다: _CatLib"]}
+
+    # the slow part in the background (at startup, after applying): kept for the next launch
+    app.precheck_background()
+    pump(root, lambda: app._precheck_runs == 0 and (manager.data_dir / "cache" / precheck.BACKGROUND_FILE).is_file())
+    kept = precheck.load_background(manager.data_dir / "cache")
+    assert kept.faulty[0]["mod"] == ids["Armor"] and kept.natives_total == 1
+    assert app.status_var.get() == "준비"
+    app.precheck_background()  # not due again
+    assert app._precheck_runs == 0
+
+    # ☰ → 실행 전 점검: every issue, low ones too; a button for the main window
+    seen = {}
+
+    def show(self):
+        seen["kinds"] = [i.kind for i in self._shown()]
+        seen["title"] = self.title_label.cget("text")
+        seen["text"] = self.text.get("1.0", "end")
+        seen["links"] = self.text.tag_ranges(f"mod:{ids['Armor']}")
+        self.finish(("action", next(i for i in self._shown() if i.kind == "faulty")))
+        return self.result
+
+    checked = []
+    monkeypatch.setattr(gui.PrecheckDialog, "show", show)
+    monkeypatch.setattr(app, "check_materials", lambda mod_ids=None: checked.append(mod_ids))
+    app.show_precheck()
+    pump(root, lambda: checked)
+    assert seen["kinds"][0] == "faulty" and {"requirement", "natives_unmanaged"} <= set(seen["kinds"])
+    assert "지난번 게임에서 REFramework가 읽지 못한 파일: 'Armor'의 x.user" in seen["text"]
+    assert gui.PRECHECK_HEADINGS["low"] in seen["text"] and seen["links"]
+    assert checked == [[ids["Armor"]]] and not app._precheck_menu and app.status_var.get() == "준비"
+
+    # REFramework off while mods need it: its button turns it on
+    manager.set_enabled(ids["REFramework"], False)
+    app.refresh()
+
+    def enable(self):
+        self.finish(("action", next(i for i in self._shown() if i.kind == "refw_off")))
+        return self.result
+
+    monkeypatch.setattr(gui.PrecheckDialog, "show", enable)
+    app.show_precheck()
+    pump(root, lambda: manager.get(ids["REFramework"]).enabled)
+
+    # several mods at once are selected in the list
+    app.filter_var.set("비활성")
+    app.refresh()
+    app.show_mods([ids["Armor"], ids["Camera"]])
+    assert set(app.tree.selection()) == {ids["Armor"], ids["Camera"]} and app.filter_var.get() == gui.FILTER_ALL
+
+
+def test_gui_precheck_window(root, manager, tmp_path):
+    import types
+
+    from mhwmm import gui, precheck
+    from mhwmm.theme import Theme
+
+    with manager.prepare_install(make_zip(tmp_path / "Armor.zip", {"natives/STM/a.user.3": "u"})) as s:
+        armor = manager.install_variant(s, s.variants[0])
+    issues = [
+        precheck.Issue("faulty", "high", "지난번 게임에서 REFramework가 읽지 못한 파일: 'Armor'의 a.user → 재질 복구를 해 보세요",
+                       ['"Invalid file" "a.user"'], [armor.id], "matfix", items=["a"]),
+        precheck.Issue("config_loose", "high", "루스 파일 읽기가 꺼져 있습니다", ["LooseFileLoader_Enabled=false"], [],
+                       "fix_config", ("LooseFileLoader_Enabled", "true"), items=["b"]),
+        precheck.Issue("pak_count", "medium", "PAK이 많습니다", [], [], "open_folder", folder="pak_mods", items=["c"]),
+        precheck.Issue("script_unmanaged", "low", "스크립트가 있습니다", ["reframework/autorun/x.lua"], [], "open_folder",
+                       folder="reframework/autorun", items=["d"]),
+    ]
+    report = precheck.Report(issues, {}, "v1", "current")
+    theme = Theme(root, "dark")
+
+    # before a launch: the high and medium ones; only the new ones marked (some were seen before)
+    dialog = gui.PrecheckDialog(root, theme, manager, report, launch=True, new=issues[:1])
+    text = dialog.text.get("1.0", "end")
+    assert dialog.title_label.cget("text") == "실행 전 점검: 확인할 것 3개"
+    assert gui.PRECHECK_HEADINGS["high"] in text and gui.PRECHECK_HEADINGS["medium"] in text
+    assert gui.PRECHECK_HEADINGS["low"] not in text and "스크립트가 있습니다" not in text
+    assert text.count(gui.PRECHECK_NEW) == 1 and text.index(gui.PRECHECK_NEW) < text.index("지난번 게임")
+    assert [b.cget("text") for b in dialog._buttons] == ["재질 복구", "설정 고치기", "폴더 열기"]
+    assert {precheck.RUN_ANYWAY, precheck.CANCEL, "  " + precheck.DONT_ASK} <= set(texts(dialog))
+    assert 4 <= int(dialog.text.cget("height")) <= 18
+    # a mod's name shows it in the list; a button for the main window gives its issue
+    dialog.deiconify()
+    dialog.update()
+    start = dialog.text.tag_ranges(f"mod:{armor.id}")[0]
+    x, y, _w, _h = dialog.text.bbox(start)
+    dialog._on_link(types.SimpleNamespace(x=x + 2, y=y + 2))
+    assert dialog.result == ("show", armor.id) and not dialog.winfo_exists()
+    dialog = gui.PrecheckDialog(root, theme, manager, report, launch=True, new=issues[:3])
+    assert gui.PRECHECK_NEW not in dialog.text.get("1.0", "end")  # (all new: nothing marked)
+    dialog._buttons[0].invoke()
+    assert dialog.result == ("action", issues[0]) and dialog.dont_ask is False
+
+    # from the menu: every issue, counted by level, no "don't ask" box
+    dialog = gui.PrecheckDialog(root, theme, manager, report, note="재질 점검을 하지 못했습니다.")
+    assert dialog.title_label.cget("text") == "실행 전 점검: 확인할 것 4개"
+    assert dialog.summary.cget("text") == "높음 2 · 보통 1 · 낮음 1"
+    assert "스크립트가 있습니다" in dialog.text.get("1.0", "end") and "재질 점검을 하지 못했습니다." in dialog.note.cget("text")
+    assert "  " + precheck.DONT_ASK not in texts(dialog)
+    dialog.destroy()
+
+    # nothing found (light theme)
+    theme.use("light")
+    dialog = gui.PrecheckDialog(root, theme, manager, precheck.Report([], {}, "v1", "current"))
+    assert dialog.title_label.cget("text") == "실행 전 점검: 확인할 것이 없습니다."
+    assert dialog.text.get("1.0", "end").strip() == gui.PRECHECK_NOTHING.strip() and not dialog._buttons
+    dialog.destroy()
+
+
+def test_gui_precheck_after_applying_and_while_a_deploy_runs(root, manager, tmp_path, game_dir, monkeypatch):
+    """▶ with changes not applied: applied first, then 실행 전 점검, then the game; an apply that begins while
+    the window is open is waited for (the game never starts on a half-applied folder), and the same
+    issues are not asked again right after it."""
+    from mhwmm import gui
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    ids = bisect_mods(manager, tmp_path)
+    manager.update_settings(auto_apply=False, apply_before_launch=True, check_materials=False)
+    write(game_dir / "re2_fw_config.txt", "LooseFileLoader_Enabled=true\r\n")
+    write(game_dir / "dxgi.dll", "MZ")  # (a medium issue: asked about before a launch)
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    order = []
+    monkeypatch.setattr(gui.webbrowser, "open", lambda url: order.append(("start", app.busy, manager.dirty)))
+    monkeypatch.setattr(gui.os, "startfile", lambda url: order.append(("start", app.busy, manager.dirty)),
+                        raising=False)
+    during = []
+
+    def show(self):
+        order.append(("asked", app.busy, manager.dirty, [i.kind for i in self.report.important]))
+        if during:  # something applies while the window is open (the material check's apply, a toggle)
+            during.pop()()
+        self.destroy()
+        return ("run",)
+
+    monkeypatch.setattr(gui.PrecheckDialog, "show", show)
+    manager.set_enabled(ids["Armor C"], False)
+    app.refresh()
+    assert manager.dirty
+    app.launch_game()
+    pump(root, lambda: any(o[0] == "start" for o in order))
+    assert order == [("asked", None, False, ["dll_proxy"]), ("start", None, False)]
+    assert not (game_dir / "natives/STM/c.tex").exists()
+
+    # a deploy that begins while the window is open: the game starts after it, without asking again
+    order.clear()
+
+    def toggle_and_apply():
+        manager.set_enabled(ids["Armor B"], False)
+        app.apply()
+        assert app.busy == "deploy"
+
+    during.append(toggle_and_apply)
+    app.launch_game()
+    pump(root, lambda: any(o[0] == "start" for o in order))
+    pump(root, lambda: app.busy is None)
+    assert order == [("asked", None, False, ["dll_proxy"]), ("start", None, False)]
+    assert not (game_dir / "natives/STM/b.tex").exists()
+
+    # turned on while the window is open (no apply yet): applied before the game starts
+    order.clear()
+    during.append(lambda: manager.set_enabled(ids["Armor B"], True))
+    app.launch_game()
+    pump(root, lambda: any(o[0] == "start" for o in order))
+    assert order == [("asked", None, False, ["dll_proxy"]), ("start", None, False)]
+    assert (game_dir / "natives/STM/b.tex").is_file()
+
+    # not applying first (that setting off): asked once whether to start with the changes left out
+    manager.update_settings(apply_before_launch=False)
+    manager.set_enabled(ids["Armor C"], True)
+    app.refresh()
+    asked = []
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: asked.append(a[1]) or True)
+    order.clear()
+    app.launch_game()
+    pump(root, lambda: any(o[0] == "start" for o in order))
+    assert order == [("asked", None, True, ["dll_proxy"]), ("start", None, True)]
+    assert len(asked) == 1 and "그대로 실행할까요?" in asked[0]
+
+
+def test_gui_precheck_while_the_material_check_runs(root, manager, tmp_path, game_dir, monkeypatch):
+    """After a game update the mods not checked since are asked about before a launch, also while their
+    check runs; a mod never checked (a new one) is not asked about."""
+    from mhwmm import gui, matfix
+    from mhwmm.manager import MATFIX_FORMAT
+
+    from conftest import write
+
+    if not matfix.available():
+        pytest.skip("zstd 모듈이 없습니다")
+    monkeypatch.setenv("APPDATA", "")
+    manager.update_settings(check_materials=False)
+    ids = {}
+    for name in ("Old Armor", "New Armor"):
+        with manager.prepare_install(make_zip(tmp_path / "zips" / f"{name}.zip",
+                                              {f"natives/STM/Art/{name[:3]}.mdf2.45": "m"})) as s:
+            ids[name] = manager.install_variant(s, s.variants[0]).id
+    manager.deploy()
+    write(game_dir / "re2_fw_config.txt", "LooseFileLoader_Enabled=true\r\n")
+    write(game_dir / "dinput8.dll", "MZ")  # (REFramework put in by hand)
+    # checked against the game before its update
+    manager._save_material_record(ids["Old Armor"], {"game": "before-the-update", "format": MATFIX_FORMAT})
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    started = launcher(monkeypatch)
+    seen = []
+
+    def show(self):
+        seen.append([(i.kind, i.level, i.mods, i.action) for i in self.report.important])
+        self.destroy()
+        return ("run",)
+
+    monkeypatch.setattr(gui.PrecheckDialog, "show", show)
+    app._matfix_running = True  # (the mods' own check, started after the update)
+    app.launch_game()
+    pump(root, lambda: started)
+    assert seen == [[("unchecked", "medium", [ids["Old Armor"]], "show_mods")]]
+    app._matfix_running = False
+    app.launch_game()
+    pump(root, lambda: len(started) == 2)
+    assert seen[1] == [("unchecked", "medium", [ids["Old Armor"]], "matfix_check")]
+    # a mod never checked is worth knowing (☰ → 실행 전 점검), not asked about
+    manager.set_enabled(ids["Old Armor"], False)
+    manager.deploy()
+    app.refresh()
+    app.launch_game()
+    pump(root, lambda: len(started) == 3)
+    assert len(seen) == 2
+    assert [i.kind for i in manager.prelaunch_check().issues if i.kind.startswith("unchecked")] == ["unchecked_new"]

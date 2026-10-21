@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, bisect, fsutil, steam
+from . import __version__, bisect, crashlog, fsutil, steam
 from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
 from .equip.selftest import DEFAULT_ITEMS as SELFTEST_ITEMS
@@ -695,6 +695,49 @@ def cmd_bisect(manager: ModManager, args) -> int:
     return code
 
 
+def cmd_check(manager: ModManager, args) -> int:
+    """실행 전 점검: every check (low ones too), with REFramework's records copied first and the slow part
+    (the last game's records, the loose files no mod placed) done again; ``--fix`` changes the REFramework
+    settings it names. Exits with 1 while there are high or medium issues."""
+    from . import precheck
+
+    shown = [0.0]
+
+    def progress(done, total, msg):
+        if time.time() - shown[0] > 1.0:  # the first material check reads the game's file list
+            shown[0] = time.time()
+            print(msg, file=sys.stderr)
+
+    if manager.game_dir:
+        manager.collect_crash_evidence()
+    facts = precheck.gather(manager)
+    background = None
+    if facts.game_dir and Path(facts.game_dir).is_dir():
+        background = manager.precheck_background(facts, materials=not args.quick, progress=progress)
+    report = precheck.check(facts, background)
+    fixes = [issue for issue in report.issues if issue.fix]
+    if args.fix and fixes:
+        for issue in fixes:
+            key, value = issue.fix
+            try:
+                changed = manager.set_refw_option(key, value, path=issue.config or None)
+            except (DeployError, ValueError) as exc:
+                print(f"오류: {exc}", file=sys.stderr)
+                return 1
+            where = f" ({crashlog.mask_user(issue.config)})" if issue.config else ""
+            print(f"REFramework 설정을 바꿨습니다: {key}={value}{where}" if changed
+                  else f"이미 그렇게 설정되어 있습니다: {key}={value}{where}")
+        print()
+        report = precheck.check(facts, background)
+    for line in report.lines():
+        print(line)
+    if background is not None and background.matfix:
+        print(f"\n참고: {background.matfix}")
+    if not args.fix and any(issue.fix for issue in report.issues):
+        print("\nREFramework 설정을 고치려면: check --fix (게임이 꺼져 있을 때만)")
+    return 1 if report.important else 0
+
+
 def cmd_game(manager: ModManager, args) -> int:
     path = Path(args.path) if args.path else manager.detect_game_dir()
     if path is None:
@@ -807,6 +850,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--record", metavar="번호", help="start: 원인을 찾을 게임 튕김 기록 (crash list의 번호)")
     p.add_argument("--disable", action="store_true", help="stop: 찾은 모드를 원래 프로필에서 끄기")
 
+    p = sub.add_parser("check", help="실행 전 점검: 게임이 튕기거나 모드가 작동하지 않는 흔한 원인 찾기 "
+                                     "(높음·보통 항목이 있으면 종료 코드 1)")
+    p.add_argument("--quick", action="store_true", help="매니저가 넣지 않은 루스 파일 중 새 파일의 재질은 점검하지 않음")
+    p.add_argument("--fix", action="store_true", help="찾은 REFramework 설정 문제(루스 파일 읽기 · pak_mods 읽기 · 읽지 "
+                                                     "못한 파일 기록)를 켬 (게임이 꺼져 있을 때만)")
+
     p = sub.add_parser("game", help="게임 폴더 설정 (경로 생략 시 자동 감지)")
     p.add_argument("path", nargs="?")
     p.add_argument("--force", action="store_true")
@@ -820,7 +869,7 @@ COMMANDS = {
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
     "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview, "crash": cmd_crash,
-    "bisect": cmd_bisect,
+    "bisect": cmd_bisect, "check": cmd_check,
 }
 
 

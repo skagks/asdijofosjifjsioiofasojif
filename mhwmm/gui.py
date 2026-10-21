@@ -16,7 +16,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, bisect, crashes, crashlog, fsutil, gamewatch, matfix, nexus, refw, steam, updater
+from . import (__version__, bisect, crashes, crashlog, fsutil, gamewatch, matfix, nexus, precheck, refw, steam,
+               updater)
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL,
@@ -26,6 +27,7 @@ from .helptext import SECTIONS as HELP_SECTIONS
 from .manager import (InstallError, InstallSession, MaterialJob, MaterialRun, Mod, ModManager,
                       acquire_instance_lock, is_game_running, prepare_data_dir, resolve_data_dir, setup_logging)
 from .matfix import MatfixError
+from .precheck import stuck_summary
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
 from .updater import Release, UpdateError
 
@@ -665,11 +667,6 @@ def material_summary(results: list) -> str:
     return " · ".join(parts)
 
 
-def stuck_summary(stuck: list[dict]) -> str:
-    kinds = sorted({"." + i.get("kind", "") for i in stuck})
-    return f"{'·'.join(kinds)} 파일 {len(stuck)}개"
-
-
 class MaterialsDialog(Dialog):
     """Mods whose materials no longer fit the game; result is the ids of those to repair."""
 
@@ -849,6 +846,27 @@ class SettingsDialog(Dialog):
 FINDING_COLORS = {"high": "danger", "medium": "warn", "low": "subtle", "info": "info"}  # the dot before a finding
 BISECT_TIP = "모드를 절반씩 끄고 실행해 보며 게임을 튕기게 하는 모드를 찾습니다 (기록만으로 모드를 알 수 없을 때)"
 PASTE_HINT = "게임 오류 창(RE ENGINE - Aborted, Fatal D3D error 등)이나 Windows 이벤트 뷰어의 문구를 붙여 넣으면 분석합니다."
+
+
+def link_mod_names(t: tk.Text, start: str, mod_ids, names: dict[str, str]) -> bool:
+    """Make the names of these mods after ``start`` (always in quotes) links tagged ``mod:<id>`` (a click
+    shows the mod in the list). Returns whether there was one."""
+    found = False
+    for mod_id in mod_ids:
+        name = names.get(mod_id)
+        if not name:
+            continue
+        pos = start
+        while True:
+            pos = t.search(f"'{name}'", pos, stopindex="end", exact=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(name) + 2}c"
+            t.tag_add("link", f"{pos}+1c", f"{end}-1c")
+            t.tag_add(f"mod:{mod_id}", f"{pos}+1c", f"{end}-1c")
+            found = True
+            pos = end
+    return found
 
 
 def session_context_text(session) -> str:
@@ -1105,21 +1123,8 @@ class CrashDialog(Dialog):
         t.insert("end", "●", ("finding", f"dot_{finding.level}" if finding.level in FINDING_COLORS else "dot_info"))
         start = t.index("end-1c")
         t.insert("end", "\t" + finding.text + "\n", ("finding", "lead") if lead else ("finding",))
-        installed = {m.id: m.name for m in self.manager.mods}
-        for mod_id in finding.mods:  # the mod's name (always in quotes) shows it in the list
-            name = installed.get(mod_id)
-            if not name:
-                continue
-            pos = start
-            while True:
-                pos = t.search(f"'{name}'", pos, stopindex="end", exact=True)
-                if not pos:
-                    break
-                end = f"{pos}+{len(name) + 2}c"
-                t.tag_add("link", f"{pos}+1c", f"{end}-1c")
-                t.tag_add(f"mod:{mod_id}", f"{pos}+1c", f"{end}-1c")
-                self._links = True
-                pos = end
+        if link_mod_names(t, start, finding.mods, {m.id: m.name for m in self.manager.mods}):
+            self._links = True
         for line in finding.evidence[:3]:
             t.insert("end", f"근거: {line}\n", ("evidence",))
 
@@ -1530,8 +1535,265 @@ class BisectResultDialog(Dialog):
             messagebox.showinfo(bisect.TITLE, f"저장했습니다:\n{result}", parent=self)
 
 
+# ---- 실행 전 점검 ---------------------------------------------------------------------------------------
+PRECHECK_HEADINGS = {"high": "높음 · 모드가 작동하지 않거나 게임이 튕기거나 멈출 수 있음", "medium": "보통 · 흔한 원인이거나 추정",
+                     "low": "낮음 · 알아 두면 좋은 것", "info": "참고"}
+PRECHECK_LAUNCH_INTRO = "게임을 켜기 전에 모드와 게임 폴더에서 찾은 것입니다. 원인일 수 있다는 뜻이고 확실하다는 뜻은 아닙니다."
+PRECHECK_LAUNCH_NOTE = ("항목의 버튼을 누르면 게임을 실행하지 않고 그 일을 합니다(설정 고치기 · 폴더 열기는 이 창에서 합니다). "
+                        "모드 이름을 누르면 목록에서 그 모드를 보여 줍니다.")
+PRECHECK_MENU_NOTE = ("게임을 실행할 때는 높음 · 보통 항목 중 새로 생긴 것만 묻고, 실행을 막지는 않습니다. 매니저가 넣지 않은 "
+                      "파일은 지우지 않으니 직접 확인하세요.")
+PRECHECK_NOTHING = ("원인일 수 있는 것을 찾지 못했습니다. 게임이 튕기지 않는다는 뜻은 아니니, 튕기면 ☰ → 게임 튕김 기록에서 "
+                    "원인을 찾아보세요.\n")
+PRECHECK_NOTHING_LAUNCH = "이제 확인할 것이 없습니다. 아래 버튼을 누르면 게임을 실행합니다.\n"
+PRECHECK_NEW = "새로"
+PRECHECK_DELAY = 5000  # ms after the startup records are copied (the mods' own material check goes first)
+
+
+def _columns(text: str) -> int:
+    """Width of a line in columns of the Text widget (Korean and other wide characters count two)."""
+    return sum(2 if ord(c) >= 0x1100 else 1 for c in text)
+
+
+class PrecheckDialog(Dialog):
+    """실행 전 점검: what was found, each with a button for what may help. Before a launch (``launch``) the
+    high and medium issues with 그래도 실행 · 취소 and 같은 내용이면 다시 묻지 않기 (``new`` ones are
+    marked when not all are new); from the menu every issue. 설정 고치기 (after asking) and 폴더 열기
+    work in the window, then ``recheck()`` gives the report again. Result: ("run",) (launch only),
+    ("action", Issue) or ("show", mod id) for the main window (the game is not started), or None.
+    ``dont_ask`` tells whether the box was ticked."""
+
+    def __init__(self, parent, theme: Theme, manager: ModManager, report, launch: bool = False, new=(),
+                 recheck=None, note: str = ""):
+        super().__init__(parent, theme, precheck.TITLE)
+        px, f, p = theme.px, theme.fonts, theme.p
+        self.manager, self.report, self.launch, self.recheck = manager, report, launch, recheck
+        self.dont_ask_var: tk.BooleanVar | None = None
+        # (marks only help while some of the issues were seen before)
+        self.new = {tuple(i.keys) for i in new} if len(new) < len(report.important) else set()
+        self.dont_ask = False
+        self._events: queue.Queue = queue.Queue()
+        self._poll_id = None
+        self._fixing = False
+        self._buttons: list = []  # the buttons in the text (made again with it)
+        wrap = px(680)
+
+        self.title_label = ttk.Label(self.body, text="", style="DialogTitle.TLabel")
+        self.title_label.pack(anchor="w")
+        self.summary = ttk.Label(self.body, text="", style="Muted.TLabel", wraplength=wrap, justify="left")
+        self.summary.pack(anchor="w", pady=(px(4), px(10)))
+        card = theme.mark(tk.Frame(self.body), "card")
+        card.pack(fill="both", expand=True)
+        self.text = theme.mark(tk.Text(card, wrap="word", width=84, height=6, font=f["base"], padx=px(16), pady=px(10),
+                                       cursor="arrow", spacing1=px(2)), "text")
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=autohide(sb, side="right", fill="y"))
+        self.text.pack(side="left", fill="both", expand=True)
+        t = self.text
+        t.tag_configure("issue", lmargin1=0, lmargin2=px(22), tabs=(px(22),), spacing1=px(10))
+        t.tag_configure("detail", foreground=p["muted"], font=f["small"], lmargin1=px(22), lmargin2=px(22))
+        t.tag_configure("action", lmargin1=px(22), spacing1=px(5), spacing3=px(1))
+        t.tag_configure("heading", foreground=p["accent"], font=f["small_bold"], spacing1=px(16))
+        t.tag_configure("top", spacing1=0)
+        t.tag_configure("new", background=p["chip"], foreground=p["chip_text"], font=f["small_bold"])
+        t.tag_configure("muted", foreground=p["muted"])
+        t.tag_configure("link", foreground=p["accent"], underline=True)
+        t.tag_bind("link", "<Enter>", lambda e: t.configure(cursor="hand2"))
+        t.tag_bind("link", "<Leave>", lambda e: t.configure(cursor="arrow"))
+        t.tag_bind("link", "<Button-1>", self._on_link)
+        for level, color in FINDING_COLORS.items():
+            t.tag_configure(f"dot_{level}", foreground=p[color], font=f["bold"])
+
+        self.status = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                                justify="left")  # what 설정 고치기 did
+        notes = PRECHECK_LAUNCH_NOTE if launch else " ".join(x for x in (PRECHECK_MENU_NOTE, note) if x)
+        self.note = ttk.Label(self.body, text=notes, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                              justify="left")
+        self.note.pack(anchor="w", pady=(px(10), 0))
+        if launch:
+            self.dont_ask_var = tk.BooleanVar(self, value=False)
+            theme.checkbutton(self.body, precheck.DONT_ASK, self.dont_ask_var).pack(anchor="w", pady=(px(10), 0))
+            self.buttons(precheck.RUN_ANYWAY, lambda: self.finish(("run",)), precheck.CANCEL)
+        else:
+            row = ttk.Frame(self.body)
+            row.pack(fill="x", pady=(px(18), 0))
+            ttk.Button(row, text="닫기", style="Accent.TButton", command=self.cancel).pack(side="right")
+            self.bind("<Return>", lambda e: self.cancel())
+        self._render()
+        limit = 18 if self.winfo_screenheight() >= px(900) else 11  # the window fits a 768-pixel screen
+        t.configure(height=max(4, min(limit, self._lines())))
+
+    def _shown(self) -> list:
+        return self.report.important if self.launch else self.report.issues
+
+    def _lines(self) -> int:
+        """About how many lines the issues take at the text's width (its height before it is shown)."""
+        cols = int(self.text.cget("width")) - 4
+        lines, level = 0, None
+        for issue in self._shown():
+            if issue.level != level:
+                level, lines = issue.level, lines + 2
+            lines += sum(-(-_columns(x) // cols) for x in (issue.text + "  " + PRECHECK_NEW,
+                                                            *issue.detail[:precheck.DETAIL]))
+            lines += 3 if issue.action_label else 1
+        return lines
+
+    def _can(self, issue) -> bool:
+        """The issue's button would do something here."""
+        if issue.action == "fix_config":
+            return bool(issue.fix)
+        if issue.action == "open_folder":
+            return bool(self.manager.game_dir)
+        if issue.action in ("matfix", "matfix_check"):
+            return matfix.available() and bool(issue.mods)
+        if issue.action in ("show_mods", "enable_refw"):
+            return bool(issue.mods)
+        return bool(issue.action_label)
+
+    def _render(self):
+        t, report = self.text, self.report
+        issues = self._shown()
+        for button in self._buttons:
+            button.destroy()
+        self._buttons = []
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        for tag in t.tag_names():
+            if tag.startswith("mod:"):
+                t.tag_delete(tag)
+        self.title_label.configure(text=report.title(issues))
+        if self.launch:
+            self.summary.configure(text=PRECHECK_LAUNCH_INTRO)
+        else:
+            counts = [(precheck.LEVEL_LABELS[lv], sum(1 for i in issues if i.level == lv)) for lv in precheck.LEVELS]
+            self.summary.configure(text=" · ".join(f"{label} {n}" for label, n in counts if n) or
+                                   "모드와 게임 폴더에서 흔한 문제를 찾지 못했습니다.")
+        names = {m.id: m.name for m in self.manager.mods}
+        level = None
+        for issue in issues:
+            if issue.level != level:
+                level = issue.level
+                t.insert("end", PRECHECK_HEADINGS.get(level, level) + "\n", ("heading", "top") if t.index("end-1c") == "1.0"
+                         else ("heading",))
+            t.insert("end", "●", ("issue", f"dot_{issue.level}" if issue.level in FINDING_COLORS else "dot_info"))
+            t.insert("end", "\t", ("issue",))
+            if tuple(issue.keys) in self.new:
+                t.insert("end", f" {PRECHECK_NEW} ", ("issue", "new"))
+                t.insert("end", " ", ("issue",))
+            start = t.index("end-1c")
+            t.insert("end", issue.text + "\n", ("issue",))
+            link_mod_names(t, start, issue.mods, names)
+            for line in issue.detail[:precheck.DETAIL]:
+                t.insert("end", line + "\n", ("detail",))
+            if issue.action_label and self._can(issue):
+                button = ttk.Button(t, text=issue.action_label, style="Action.TButton",
+                                    command=lambda i=issue: self._act(i))
+                pos = t.index("end-1c")
+                t.window_create(pos, window=button)
+                t.insert("end", "\n")
+                t.tag_add("action", pos, "end-1c")
+                self._buttons.append(button)
+        if not issues:
+            t.insert("end", PRECHECK_NOTHING_LAUNCH if self.launch else PRECHECK_NOTHING, ("muted",))
+        t.delete("end-2c", "end-1c")  # no empty line at the end
+        t.configure(state="disabled")
+
+    # ---- the buttons
+    def _act(self, issue):
+        if self._fixing:
+            return
+        if issue.action == "fix_config":
+            self._fix(issue)
+        elif issue.action == "open_folder":
+            self._open_folder(issue.folder)
+        else:
+            self.finish(("action", issue))
+
+    def _on_link(self, event):
+        for tag in self.text.tag_names(f"@{event.x},{event.y}"):
+            if tag.startswith("mod:"):
+                self.finish(("show", tag[4:]))
+                return
+
+    def _open_folder(self, folder: str):
+        game = Path(self.manager.game_dir)
+        path = game / folder if folder else game
+        while path != game and not path.is_dir():  # the nearest one that is there
+            path = path.parent
+        try:
+            fsutil.open_in_explorer(path)
+        except OSError as exc:
+            messagebox.showerror(precheck.TITLE, f"폴더를 열지 못했습니다: {exc}", parent=self)
+
+    def _fix(self, issue):
+        """설정 고치기: one line of REFramework's config, after asking (only while the game is closed)."""
+        if not messagebox.askyesno(precheck.TITLE, precheck.fix_question(issue), parent=self):
+            return
+        self._fixing = True
+        self._status("REFramework 설정을 바꾸는 중...")
+        manager, (key, value), path = self.manager, issue.fix, issue.config or None
+
+        def worker():
+            try:
+                manager.set_refw_option(key, value, path=path)
+                result = None
+            except Exception as exc:  # shown in the window
+                if not isinstance(exc, EXPECTED_ERRORS):
+                    log.error("REFramework 설정을 바꾸다가 오류가 났습니다:\n%s", traceback.format_exc())
+                result = exc
+            self._events.put((key, value, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_id = self.after(60, self._poll)
+
+    def _poll(self):
+        try:
+            key, value, error = self._events.get_nowait()
+        except queue.Empty:
+            self._poll_id = self.after(60, self._poll)
+            return
+        self._poll_id = None
+        self._fixing = False
+        if isinstance(error, DeployError):
+            self._status(precheck.RUNNING)
+            return
+        if error is not None:
+            self._status(f"바꾸지 못했습니다: {error}")
+            return
+        log.info("실행 전 점검: REFramework 설정을 바꿨습니다 (%s=%s)", key, value)
+        if self.recheck is not None:
+            try:
+                self.report = self.recheck()
+            except Exception:
+                log.exception("실행 전 점검을 다시 하지 못했습니다.")
+            self._render()
+        self._status(f"REFramework 설정을 바꿨습니다 ({key}={value}). 다음에 게임을 실행할 때부터 적용됩니다.")
+
+    def _status(self, text: str):
+        self.status.configure(text=text)
+        if not self.status.winfo_manager():
+            self.status.pack(anchor="w", pady=(self.theme.px(10), 0), before=self.note)
+
+    def finish(self, result):
+        self.result = result
+        self.destroy()
+
+    def destroy(self):
+        if self._poll_id is not None:
+            self.after_cancel(self._poll_id)
+            self._poll_id = None
+        if self.dont_ask_var is not None:
+            try:
+                self.dont_ask = bool(self.dont_ask_var.get())
+            except tk.TclError:  # (the manager is closing)
+                pass
+            self.dont_ask_var = None
+        super().destroy()
+
+
 class App:
     MUTATING_OK_DURING = (None, "deploy")
+    FOLDER_TASKS = ("purge", "game", "remove", "refw", "install", "matfix")  # end with an apply: no launch meanwhile
 
     def __init__(self, root: tk.Tk, manager: ModManager, events: queue.Queue):
         self.root = root
@@ -1571,6 +1833,18 @@ class App:
         self._notice_session: str | None = None  # the crash record the notice bar tells about
         self._live_record = ""  # start of the record of the game running now (from the last collect)
         self._collect_lock = threading.Lock()  # one copy of the game's records at a time
+        self._missing: dict[str, list[dict]] = {}  # enabled mods' missing requirements (from the last refresh)
+        # 실행 전 점검: one run of its slow part at a time (they share its cache file), how many are running,
+        # one of them checking materials (the mods' material check waits for it: both read the game's
+        # files), the launch waiting for it
+        self._precheck_lock = threading.Lock()
+        self._precheck_runs = 0
+        self._precheck_reading = False
+        self._precheck_waiting = False
+        self._prechecking = False
+        self._precheck_answered = None  # report.signature() the user just answered 그래도 실행 to
+        self._unapplied_ok = None  # manager.revision the user agreed to start the game with, not applied
+        self._precheck_menu = False
         # 원인 모드 찾기 (bisect.json): the search in progress, its 또 튕겼나요? window, how the step's game ended
         self._bisect = bisect.load(manager.data_dir)
         self._bisect_preparing = False
@@ -1730,6 +2004,7 @@ class App:
         m.add_command(label="적용 상태 점검", command=self.verify)
         m.add_command(label=crashes.TITLE, command=self.show_crashes)
         m.add_command(label=bisect.TITLE, command=self.show_bisect)
+        m.add_command(label=precheck.TITLE, command=self.show_precheck)
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
         m.add_command(label="장비 외형 보기", command=lambda: self.show_equipment())
         m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
@@ -2101,8 +2376,8 @@ class App:
         self._conflicts = m.conflicts()
         # enabled mods that need other mods which are missing or switched off
         missing = {mod.id: m.missing_requirements(mod.id) for mod in m.mods if mod.enabled}
-        missing = {mod_id: reqs for mod_id, reqs in missing.items() if reqs}
-        self._problems = self._find_problems(missing)
+        self._missing = missing = {mod_id: reqs for mod_id, reqs in missing.items() if reqs}
+        self._problems = m.problems(self._conflicts, missing)
         query = self._query()
         keep = FILTERS.get(self.filter_var.get())
         if self.filter_var.get() == FILTER_MISSING:
@@ -2633,29 +2908,6 @@ class App:
         except KeyError:
             return None
 
-    def _find_problems(self, missing: dict[str, list[dict]]) -> dict[str, list[str]]:
-        """Why each enabled mod cannot fully work: {mod id: [reason]}."""
-        problems: dict[str, list[str]] = {}
-        for mod in self.manager.mods:
-            if not mod.enabled:
-                continue
-            reasons = []
-            if mod.needs_option:
-                reasons.append("옵션을 하나도 켜지 않아 아무 파일도 적용되지 않습니다")
-            if mod.id in missing:
-                reasons.append("필요한 모드가 없거나 꺼져 있습니다: " + ", ".join(r["name"] for r in missing[mod.id]))
-            if self.manager.material_state(mod.id) == "stale":
-                reasons.append("재질이나 .user·.pfb 파일이 현재 게임과 맞지 않습니다 (오른쪽 클릭 → 재질 복구)")
-            stuck = self.manager.material_stuck(mod.id)
-            if stuck:
-                reasons.append(f"현재 게임과 맞지 않지만 고칠 수 없는 {stuck_summary(stuck)}이 있어 게임이 멈출 수 "
-                               "있습니다 (정보 탭 참고)")
-            if reasons:
-                problems[mod.id] = reasons
-        for mod in self.manager.hidden_mods(self._conflicts):
-            problems.setdefault(mod.id, []).append("파일이 모두 다른 모드에 밀려 아무것도 적용되지 않습니다")
-        return problems
-
     def _row_tooltip(self, mod_id: str) -> str:
         reasons = self._problems.get(mod_id)
         return "\n".join("⚠ " + r for r in reasons) if reasons else ""
@@ -2683,6 +2935,7 @@ class App:
     def show_problems(self):
         self.filter_var.set(FILTER_PROBLEMS)
         self.refresh()
+
     def warm_equipment(self):
         """Work out in the background which equipment the mods change (and read the game's names once),
         so that the info tab can list it and the 장비 외형 window opens quickly."""
@@ -3382,7 +3635,9 @@ class App:
         if not m.game_dir.is_dir():
             log.warning("게임 폴더가 없습니다: %s", m.game_dir)
             return
-        self.collect_crashes()  # before anything is applied: the records go with the mods as they are
+        # before anything is applied: the records go with the mods as they are; then (after the material
+        # check of the mods has started) the slow part of 실행 전 점검 looks at them
+        self.collect_crashes(lambda: self.root.after(PRECHECK_DELAY, self.precheck_background))
         self._watch_launched = None
         self.watcher.game_dir = m.game_dir
         self.watcher.attach()  # a game started before the manager: how it ends
@@ -3447,7 +3702,7 @@ class App:
             self.request_apply()
             self.check_materials_background()
             self.warm_equipment()
-            self.collect_crashes()
+            self.collect_crashes(lambda: self.root.after(PRECHECK_DELAY, self.precheck_background))
 
         self.run_task("game", "게임 폴더 변경 중...", lambda p: self.manager.set_game_dir(path, p), on_done=done)
 
@@ -3674,7 +3929,10 @@ class App:
                                 "\n\n게임이 실행 중이라면 종료한 뒤 다시 '게임에 적용'을 누르세요.")
             elif self._launch_after_apply and not self._apply_pending and not m.dirty:
                 self._launch_after_apply = False
-                self._start_game()
+                # (a window opened here would hold up the events)
+                self.root.after_idle(lambda: self._precheck_then_start(applied=True))
+            elif not self._launch_after_apply:
+                self.precheck_background()  # (when due: a game update, a new record)
             if self._refw_status is not None:
                 self.check_refw(manual=False, builds=self._refw_status.builds)
             if self._bisect is not None:  # the step is in the game folder now (or not: its line says)
@@ -3739,9 +3997,11 @@ class App:
     def launch_game(self):
         """Start the game: first copy the last game's REFramework records (starting the game overwrites
         them), then apply what is left to apply."""
-        if self._launching:
+        if self._launching or self._prechecking:
             return
         self._launching = True
+        self._precheck_answered = None
+        self._unapplied_ok = None
         if self.busy is None:
             self.status_var.set("게임 기록 확인 중...")
         self.collect_crashes(self._continue_launch)
@@ -3779,7 +4039,8 @@ class App:
             if not messagebox.askyesno("게임 실행", "아직 게임에 적용하지 않은 변경사항이 있습니다.\n그대로 실행할까요?",
                                        parent=self.root):
                 return
-        self._start_game()
+            self._unapplied_ok = m.revision  # (not asked again before the start unless something changes)
+        self._precheck_then_start()
 
     def _start_game(self):
         url = f"steam://rungameid/{STEAM_APP_ID}"
@@ -4042,7 +4303,7 @@ class App:
         if self._matfix_running:
             self._matfix_again = True
             return
-        if self.busy == "matfix":  # a check or repair the user started: one reader of the game at a time
+        if self.busy == "matfix" or self._precheck_reading:  # one reader of the game's files at a time
             self.root.after(2000, self.check_materials_background)
             return
         jobs = m.material_jobs(unchecked_only=True)
@@ -4363,6 +4624,307 @@ class App:
             self._on_refw_click()
         elif result[0] == "bisect":
             self.show_bisect(record=result[1])
+
+    # ------------------------------------------------------------------ 실행 전 점검 (before a launch)
+    def _game_version_now(self) -> str:
+        """The game's fingerprint looked at again (Steam may update the game while the manager is open):
+        after an update the list shows the mods' materials as not checked yet, and their check starts."""
+        m = self.manager
+        before = m.game_version()
+        now = m.game_version(refresh=True)
+        if now != before:
+            log.info("게임 파일이 바뀌었습니다 (게임 업데이트). 모드의 재질을 다시 점검합니다.")
+            self.refresh()
+            self.check_materials_background()
+        return now
+
+    def _precheck_facts(self, verify: bool = True):
+        """precheck.Facts of the manager as it is now (this thread)."""
+        self._game_version_now()
+        return precheck.gather(self.manager, self._refw_status, self._conflicts, self._missing, verify=verify)
+
+    def _precheck_report(self, facts, background):
+        """precheck.check, telling it whether the mods' own material check runs now (then the mods not checked
+        since a game update are said to be in check, and new ones not yet checked are left out)."""
+        facts.checking = self._matfix_running
+        return precheck.check(facts, background)
+
+    def _precheck_then_start(self, applied: bool = False):
+        """실행 전 점검 right before the game starts (after applying, or without): new high and medium issues
+        are shown first. It never keeps the game from starting: whatever fails here, the game starts.
+        The deploy check (it stats every file the manager placed) and the last game's record copied just
+        now are looked at on another thread; ``applied``: right after an apply (its files are in place)."""
+        if self._closed:
+            return
+        if self._bisect is not None:  # the search's steps turn mods off on purpose
+            self._start_game()
+            return
+        m = self.manager
+        try:
+            facts = self._precheck_facts(verify=False)
+            bg = precheck.load_background(m.data_dir / "cache")
+            # a record copied just now (or a game update) is looked at first (``now``: not because the last
+            # look at natives\ is old, which waits for the next background run)
+            due = bg is None or precheck.background_due(facts, bg, m.crash_dir, now=bg.natives_made)
+        except Exception:
+            log.exception("실행 전 점검을 하지 못했습니다.")
+            self._start_when_ready()
+            return
+        verify = not applied and bool(facts.game_dir)
+        run_bg = bool(due and facts.game_dir) and self._precheck_lock.acquire(blocking=False)  # (else the result kept)
+        if not verify and not run_bg:
+            self._precheck_ask(facts, bg)
+            return
+        self._prechecking = True
+        if self.busy is None:
+            self.status_var.set("실행 전 점검 중...")
+
+        def worker():
+            result = bg
+            try:
+                if verify:
+                    facts.verify = precheck.verify_files(m)
+                if run_bg:
+                    result = m.precheck_background(facts, natives=False)
+            except Exception as exc:  # then without it
+                log.warning("지난 게임 기록을 점검하지 못했습니다: %s", exc)
+            finally:
+                if run_bg:
+                    self._precheck_lock.release()
+            self.events.put(("call", self._precheck_ready, facts, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _precheck_ready(self, facts, background):
+        if self.busy is None and self.status_var.get() == "실행 전 점검 중...":
+            self.status_var.set("준비")
+        # outside the event pump: a window opened there would hold up every other event
+        self.root.after_idle(lambda: self._precheck_ask(facts, background))
+
+    def _precheck_ask(self, facts, background):
+        self._prechecking = False
+        if self._closed:
+            return
+        m = self.manager
+        dialog = None
+        try:
+            report = self._precheck_report(facts, background)
+            ask = precheck.to_ask(report, m.data_dir)
+            if report.issues:
+                log.info("%s", report.summary())
+            choice = ("run",)
+            answered, self._precheck_answered = self._precheck_answered, None
+            if ask and answered != report.signature():  # (not again right after 그래도 실행 made it apply first)
+                dialog = PrecheckDialog(self.root, self.theme, m, report, launch=True, new=ask,
+                                        recheck=lambda: self._precheck_report(facts, background))
+                choice = dialog.show()
+                if choice == ("run",):
+                    self._precheck_answered = dialog.report.signature()
+        except Exception:
+            log.exception("실행 전 점검을 하지 못했습니다.")
+            choice = ("run",)
+        if dialog is not None and dialog.dont_ask:
+            try:
+                precheck.remember(m.data_dir, dialog.report.important, dialog.report.game_version)
+            except Exception:
+                log.exception("실행 전 점검 상태를 저장하지 못했습니다.")
+        if choice == ("run",):
+            self._start_when_ready()
+        elif choice is None:
+            log.info("실행 전 점검: 게임을 실행하지 않았습니다.")
+        else:
+            self._precheck_choice(choice)
+
+    def _start_when_ready(self):
+        """Start the game once nothing changes the game folder: what began while 실행 전 점검 ran (an apply
+        after the mods' material check, the user's own changes) is finished, or applied, first."""
+        if self._closed:
+            return
+        m = self.manager
+        if self.busy == "deploy":  # its done handler starts the game (after looking again)
+            self._launch_after_apply = True
+            return
+        if self.busy in self.FOLDER_TASKS or self._installing:
+            log.info("다른 작업 중이라 게임을 실행하지 않았습니다. 작업이 끝난 뒤 다시 실행하세요.")
+            self.status_var.set("작업이 끝난 뒤에 다시 시도하세요.")
+            self._precheck_answered = None
+            return
+        if m.dirty and m.game_dir:
+            if m.settings.apply_before_launch:
+                log.info("남은 변경사항을 적용한 뒤 게임을 실행합니다.")
+                self._launch_after_apply = True
+                self.apply()
+                return
+            if self._unapplied_ok != m.revision and not messagebox.askyesno(
+                    "게임 실행", "아직 게임에 적용하지 않은 변경사항이 있습니다.\n그대로 실행할까요?", parent=self.root):
+                self._precheck_answered = None
+                return
+        self._precheck_answered = None
+        self._start_game()
+
+    def _precheck_choice(self, choice):
+        """What was picked in the 실행 전 점검 window: ("action", Issue) or ("show", mod id)."""
+        if not choice:
+            return
+        if choice[0] == "show":
+            self.show_mod(choice[1])
+            return
+        issue = choice[1]
+        log.info("실행 전 점검: %s", issue.action_label)
+        m = self.manager
+        ids = [i for i in issue.mods if any(mod.id == i for mod in m.mods)]
+        action = issue.action
+        if action == "matfix" and ids and all(m.material_state(i) in ("stale", "declined") for i in ids):
+            if self._search_blocks() or not self._materials_ready():
+                return
+            mods = [m.get(i) for i in ids]
+            m.mark_materials_offered(mods)
+            chosen = MaterialsDialog(self.root, self.theme, m, mods).show()
+            if chosen:
+                self.repair_materials(chosen)
+        elif action in ("matfix", "matfix_check") and ids:
+            self.check_materials(ids)
+        elif action in ("update_refw", "install_refw"):
+            self._on_refw_click()
+        elif action == "enable_refw" and ids:
+            if self._search_blocks() or not self.can_mutate():
+                return
+            m.set_enabled(ids[0], True)
+            log.info("REFramework를 켰습니다: %s", m.get(ids[0]).name)
+            self._changed(select=ids[0])
+        elif action == "apply":
+            self.apply()
+        elif action == "crash_record":
+            self.show_crashes()
+        elif action == "show_mods" and ids:
+            self.show_mods(ids)
+
+    def show_mods(self, ids: list[str]):
+        """Select these mods in the list (clearing a search or filter that hides one of them)."""
+        ids = [i for i in ids if any(m.id == i for m in self.manager.mods)]
+        if len(ids) <= 1:
+            if ids:
+                self.show_mod(ids[0])
+            return
+        if not all(self.tree.exists(i) for i in ids):
+            self.filter_var.set(FILTER_ALL)
+            self.search_var.set("")
+            self.refresh()
+        self.tree.selection_set(ids)
+        self.tree.see(ids[0])
+
+    def precheck_background(self):
+        """The slow part of 실행 전 점검 in the background when it is due (at startup, after applying, for a
+        new game folder): the last game's records against the mods, and the loose files no mod placed
+        with a read-only material check. Its result is kept for the next launch."""
+        m = self.manager
+        if self._closed or self._precheck_runs or not m.game_dir or not m.game_dir.is_dir():
+            return
+        if self.busy is not None or self._installing or self._matfix_running:  # the folder settles; one reader
+            if not self._precheck_waiting:                                       # of the game's files at a time
+                self._precheck_waiting = True
+                self.root.after(2000, self._precheck_again)
+            return
+        try:
+            version = self._game_version_now()
+            bg = precheck.load_background(m.data_dir / "cache")
+            if not precheck.background_due(precheck.Facts(m.game_dir, game_version=version), bg, m.crash_dir):
+                return
+            facts = precheck.gather(m, self._refw_status, self._conflicts, self._missing, verify=False)
+        except Exception as exc:  # only a help
+            log.warning("실행 전 점검을 준비하지 못했습니다: %s", exc)
+            return
+        self._run_precheck(facts, m.settings.check_materials)
+
+    def _precheck_again(self):
+        self._precheck_waiting = False
+        self.precheck_background()
+
+    def _run_precheck(self, facts, materials: bool, then=None):
+        """The slow part on another thread (one at a time); ``then(result)`` (a precheck.Background, or the
+        exception) runs on this thread afterwards."""
+        m = self.manager
+        self._precheck_runs += 1
+
+        def progress(done, total, msg):
+            self._precheck_reading = True  # (only the material check reports progress)
+            self.events.put(("call", self._precheck_status, msg))
+
+        def worker():
+            try:
+                with self._precheck_lock:
+                    result = m.precheck_background(facts, materials=materials, progress=progress)
+            except Exception as exc:  # only a help: in the log
+                log.warning("실행 전 점검 중 일부를 하지 못했습니다: %s", exc)
+                result = exc
+            self.events.put(("call", self._precheck_done, result, then))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _precheck_status(self, msg: str):
+        if self.busy is None and self._precheck_runs and not self._matfix_running:
+            self.status_var.set(f"{precheck.TITLE}: " + (msg if len(msg) < 80 else "…" + msg[-78:]))
+
+    def _precheck_done(self, result, then):
+        self._precheck_runs -= 1
+        self._precheck_reading = self._precheck_reading and self._precheck_runs > 0
+        if self._closed:
+            return
+        if self.busy is None and self.status_var.get().startswith(precheck.TITLE):
+            self.status_var.set("준비")
+        if isinstance(result, precheck.Background) and result.matfix:
+            log.debug("실행 전 점검: %s", result.matfix)
+        if then is not None:  # outside the event pump (it may open a window)
+            self.root.after_idle(lambda: None if self._closed else then(result))
+
+    def show_precheck(self):
+        """☰ → 실행 전 점검: the last game's records and the loose files no mod placed looked at again, then
+        every issue (low ones too) in a window."""
+        if self._precheck_menu or self._modal_open() or not self._idle():  # (a deploy: the folder is half done)
+            return
+        m = self.manager
+        if not m.game_dir or not m.game_dir.is_dir():
+            self._open_precheck(None)
+            return
+        self._precheck_menu = True
+        if self.busy is None:
+            self.status_var.set(f"{precheck.TITLE} 중...")
+        try:
+            facts = self._precheck_facts(verify=False)
+        except Exception as exc:
+            self._open_precheck(exc)
+            return
+        # (while the mods' own material check runs, files not checked yet wait for the next run)
+        self._run_precheck(facts, not (self._matfix_running or self.busy == "matfix"), then=self._open_precheck)
+
+    def _open_precheck(self, result):
+        """The 실행 전 점검 window from the menu (``result``: what the slow part gave, an exception, or None)."""
+        if self._modal_open() or self.busy in ("deploy", "purge"):  # another window, or the folder half done
+            self._precheck_menu = True
+            self.root.after(1000, lambda: None if self._closed else self._open_precheck(result))
+            return
+        self._precheck_menu = False
+        if self.busy is None and self.status_var.get().startswith(precheck.TITLE):
+            self.status_var.set("준비")
+        m = self.manager
+        bg = result if isinstance(result, precheck.Background) else None
+        note = ""
+        if isinstance(result, Exception):
+            note = f"지난 게임 기록과 매니저가 넣지 않은 루스 파일은 살펴보지 못했습니다: {result}"
+            bg = precheck.load_background(m.data_dir / "cache")
+        elif bg is not None:
+            note = bg.matfix
+        try:
+            facts = self._precheck_facts()  # as things are now (the mods may have changed meanwhile)
+            report = self._precheck_report(facts, bg)
+        except Exception as exc:
+            log.error("실행 전 점검을 하지 못했습니다:\n%s", traceback.format_exc())
+            self.show_error(precheck.TITLE, f"실행 전 점검을 하지 못했습니다: {exc}")
+            return
+        log.info("%s", report.summary())
+        dialog = PrecheckDialog(self.root, self.theme, m, report, note=note,
+                                recheck=lambda: self._precheck_report(facts, bg))
+        self._precheck_choice(dialog.show())
 
     # ------------------------------------------------------------------ the game process (how it ended)
     def _watch_game(self, launched: float):

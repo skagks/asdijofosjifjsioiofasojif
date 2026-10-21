@@ -550,6 +550,87 @@ def test_a_record_is_explained_with_the_mods_of_its_session(game, crash_dir):
     assert e.suspects == ["a", "arm"]
 
 
+def faulty_lines(*paths) -> str:
+    return "".join(f'"error" 2 "Invalid file" "{p}"\r\n' for p in paths)
+
+
+def test_the_copy_the_game_read_is_the_one_blamed(game, crash_dir):
+    """Of the mods that had a file, the one whose copy was in the game folder in the session: the last
+    one in load order (not the one placed since), and never a mod that was on but not applied."""
+    user = "GameDesign/Equip/_Prefab/Armor/Male/003/001/003_001_avp.user"
+    rel = f"natives/STM/{user}.3"
+    crashes.note_launch(crash_dir, {"mods": [{"id": "a", "name": "Armor A", "enabled": True},
+                                             {"id": "b", "name": "Armor B", "enabled": True},
+                                             {"id": "c", "name": "Armor C", "enabled": True}],
+                                    "placed": ["a", "b"], "dirty": True}, now=T0 - 10)
+    put(game / "re2_fw_config.txt", "LooseFileLoader_Enabled=true\r\n", T0 - 100)
+    s = session_for(crash_dir, game, log_text(game, T0, end=30), faulty_lines(user))
+    # since then B was turned off and applied: A's copy is in the game folder now; C (on, not applied then) too
+    mods = [ModRef("a", "Armor A", files=[rel]), ModRef("b", "Armor B", enabled=False, files=[rel]),
+            ModRef("c", "Armor C", files=[rel])]
+    index = ModIndex(game, deployed((rel, "a")), mods)
+    e = crashes.explain(s, index)
+    (found,) = [f for f in e.findings if f.kind == "faulty"]
+    assert found.mods == ["b"] and "'Armor B' (지금은 꺼져 있음)의 003_001_avp.user" in found.text
+    assert list(index.for_session(s).match_faulty(s.faulty()).by_mod) == ["b"]
+    # C came last but had no file in the game folder then (turned on without applying); with B removed since,
+    # A is the last one known, but whether B had that file is not (later_gone: precheck words it as unsure)
+    later = ModIndex(game, deployed((rel, "c")), [ModRef("a", "Armor A", files=[rel]), ModRef("c", "Armor C", files=[rel])])
+    assert list(later.for_session(s).match_faulty(s.faulty()).by_mod) == ["a"]
+    assert later.for_session(s).later_gone("a") and not index.for_session(s).later_gone("a")
+    # as things are now (no session): the copy placed now
+    assert list(index.match_faulty(s.faulty()).by_mod) == ["a"]
+
+
+def test_the_pak_the_game_read_wins(game):
+    user = "GameDesign/Equip/_Prefab/Armor/Male/003/001/003_001_avp.user"
+    entry = [(path_hash(f"natives/STM/{user}.3"), b"u", 1, 0)]
+    for rel in ("pak_mods/001_Old Armor.pak", "pak_mods/002_New Armor.pak"):
+        write_pak(entry, write(game / rel, b""))
+    paks = {**deployed(("pak_mods/001_Old Armor.pak", "old"), pak=True),
+            **deployed(("pak_mods/002_New Armor.pak", "new"), pak=True)}
+    index = ModIndex(game, paks, [ModRef("old", "Old Armor"), ModRef("new", "New Armor")])
+    faulty = crashlog.parse_faulty(faulty_lines(user))
+    assert list(index.match_faulty(faulty).by_mod) == ["new"]  # (REFramework numbers them in folder order)
+    # a pak named as a patch of the game takes that number; a subfolder's paks come where the subfolder is
+    write_pak(entry, write(game / "pak_mods" / "re_chunk_000.pak.sub_000.pak.patch_090.pak", b""))
+    assert list(ModIndex(game, paks, []).match_faulty(faulty).paks) == [
+        "pak_mods/re_chunk_000.pak.sub_000.pak.patch_090.pak"]
+    (game / "pak_mods" / "re_chunk_000.pak.sub_000.pak.patch_090.pak").unlink()
+    write_pak(entry, write(game / "pak_mods" / "zz" / "x.pak", b""))
+    write_pak(entry, write(game / "pak_mods" / "zz x.pak", b""))
+    assert list(ModIndex(game, paks, []).match_faulty(faulty).paks) == ["pak_mods/zz x.pak"]
+
+
+def test_a_loose_file_is_read_before_any_pak(game):
+    user = "GameDesign/Equip/_Prefab/Armor/Male/003/001/003_001_avp.user"
+    write_pak([(path_hash(f"natives/STM/{user}.3"), b"u", 1, 0)], write(game / "pak_mods" / "001_Armor.pak", b""))
+    write(game / f"natives/STM/{user}.3", b"by hand")
+    index = ModIndex(game, deployed(("pak_mods/001_Armor.pak", "p"), pak=True), [ModRef("p", "갑옷 팩")])
+    faulty = crashlog.parse_faulty(faulty_lines(user))
+    match = index.match_faulty(faulty)
+    assert match.by_mod == {} and [rel for _f, rel in match.loose] == [f"natives/STM/{user}.3"]
+    # loose file loading off: that file was not read, the pak was
+    match = index.match_faulty(faulty, loose=False)
+    assert list(match.by_mod) == ["p"] and match.loose == []
+    # nor a mod's loose file
+    loose = ModIndex(game, deployed((f"natives/STM/{user}.3", "a")), [ModRef("a", "Armor A")])
+    assert list(loose.match_faulty(faulty).by_mod) == ["a"] and loose.match_faulty(faulty, loose=False).by_mod == {}
+
+
+def test_the_settings_of_the_session_say_whether_loose_files_were_read(game, crash_dir, tmp_path):
+    appdata = tmp_path / "AppData"
+    folder = appdata / "REFramework" / "MonsterHunterWilds"
+    put(game / "re2_fw_config.txt", "LooseFileLoader_Enabled=true\r\n", T0 - 100)
+    put(folder / "re2_fw_config.txt", "LooseFileLoader_Enabled=false\r\n", T0 - 100)
+    # REFramework could not write to the game folder: its log and its settings are in %APPDATA%
+    put(folder / "re2_framework_log.txt", log_text(game, T0, end=30), T0 + 600)
+    (s,) = crashes.collect(crash_dir, game, {}, appdata=str(appdata))
+    assert s.info["source"] == str(folder) and crashes.session_loose(s) is False
+    assert s.info["files"]["re2_fw_config.txt"]["from"] == str(folder / "re2_fw_config.txt")
+    assert crashes.session_loose(None) is None
+
+
 def test_session_mods_name_removed_mods(game, crash_dir):
     crashes.note_launch(crash_dir, {"mods": [{"id": "gone", "name": "지운 모드", "enabled": True}]}, now=T0)
     plugin = game / "reframework" / "plugins" / "Gone.dll"
@@ -688,6 +769,14 @@ def test_refw_options(game, tmp_path):
     assert crashes.config_path(bare, str(appdata)) == folder / "re2_fw_config.txt"
     assert crashes.set_refw_option(bare, "B", "2", appdata=str(appdata))
     assert (folder / "re2_fw_config.txt").read_bytes() == b"A=1\r\nB=2\r\n"
+    # REFramework picks its folder at every start: the folder its last log came from, file or not
+    assert crashes.config_path(game, str(appdata), fallback=False) == game / "re2_fw_config.txt"
+    fresh = tmp_path / "Fresh"
+    target = crashes.config_path(game, str(fresh), fallback=True)
+    assert target == fresh / "REFramework" / "MonsterHunterWilds" / "re2_fw_config.txt"
+    assert crashes.set_refw_option(game, crashlog.LOOSE_FILES_KEY, "true", path=target)  # (its folder is made)
+    assert target.read_bytes() == b"LooseFileLoader_Enabled=true\r\n"
+    assert crashes.config_paths(game, str(fresh)) == [game / "re2_fw_config.txt", target]
 
 
 def test_steam_build_from_the_app_manifest(tmp_path):
@@ -699,6 +788,7 @@ def test_steam_build_from_the_app_manifest(tmp_path):
     assert info["buildid"] == "20519522"
     assert info["LastUpdated"] == datetime.fromtimestamp(1792000000).strftime("%Y-%m-%d %H:%M")
     assert crashes.steam_info(tmp_path / "elsewhere") == {} and crashes.steam_info(None) == {}
+    assert crashes.steam_updated(game) == 1792000000 and crashes.steam_updated(tmp_path / "elsewhere") is None
 
 
 def test_a_file_that_cannot_be_copied_is_skipped(game, crash_dir, monkeypatch):

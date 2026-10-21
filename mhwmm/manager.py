@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from . import crashes, fsutil, matfix, nexus, requirements, steam
+from . import crashes, fsutil, matfix, nexus, precheck, requirements, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
 from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_URL, REFW_ORIGIN
@@ -1212,6 +1212,11 @@ class ModManager:
             return []
         return [item for r in self.material_results(mod_id) for item in r.stuck]
 
+    def material_checked_for(self, mod_id: str) -> str:
+        """The game version (fingerprint) the mod's materials were last checked against ("" never)."""
+        game = self._material_record(mod_id).get("game")
+        return game if isinstance(game, str) else ""
+
     def material_state(self, mod_id: str) -> str:
         """"none" (no materials or PAKs), "unchecked" (not against this game version), "current",
         "stale" (outdated materials, not repaired), "repaired" or "declined" (the user undid the repair)."""
@@ -2221,8 +2226,9 @@ class ModManager:
     def crash_context(self, deployed: dict | None = None) -> dict:
         """What a game session runs with, kept with its records: versions, profile, mods and which mod
         placed each file outside natives\\ (plugins, scripts, PAKs: a crash record names them by path, and
-        they may be renumbered or gone by the time the record is read). The chosen options' names let
-        원인 모드 찾기 see what changed since the last normal exit. ``deployed``: deployed_files()."""
+        they may be renumbered or gone by the time the record is read), and which mods had files there
+        at all (``placed``: a mod turned on but not applied yet was not in the game). The chosen options'
+        names let 원인 모드 찾기 see what changed since the last normal exit. ``deployed``: deployed_files()."""
         from . import __version__
 
         deployed = self.deployed_files() if deployed is None else deployed
@@ -2231,7 +2237,9 @@ class ModManager:
                           "options": [o["name"] for o in m.options if o["id"] in m.selected]}
                          for m in self.mods],
                 "owners": {e.get("path") or key: e["mod"] for key, e in deployed.items()
-                           if isinstance(e, dict) and e.get("mod") and not key.startswith("natives/")}}
+                           if isinstance(e, dict) and e.get("mod") and not key.startswith("natives/")},
+                "placed": sorted({str(e["mod"]) for e in deployed.values() if isinstance(e, dict) and e.get("mod")}),
+                "dirty": bool(self.dirty)}
 
     def collect_crash_evidence(self, context: dict | None = None) -> list[crashes.Session]:
         """Copy REFramework's records of the last game sessions before a game start overwrites them.
@@ -2263,16 +2271,43 @@ class ModManager:
                 for m in self.mods]
         return crashes.ModIndex(self.game_dir, self.deployed_files() if deployed is None else deployed, mods)
 
-    def set_refw_option(self, key: str, value) -> bool:
+    def set_refw_option(self, key: str, value, path=None) -> bool:
         """Change one REFramework setting (only while the game is closed: REFramework writes its whole
-        config file again while it runs). Returns False when it already had that value."""
+        config file again while it runs) in its config file, or in ``path`` (the game folder's or
+        %APPDATA%'s: the one REFramework uses, see precheck.Issue.config). Returns False when it already
+        had that value."""
         if is_game_running():
             raise DeployError("게임이 실행 중입니다. 게임을 종료한 뒤 다시 시도하세요.")
         if not self.game_dir:
             raise ValueError("게임 폴더가 설정되지 않았습니다.")
+        if path and not any(fsutil.same_path(path, p) for p in crashes.config_paths(self.game_dir)):
+            raise ValueError(f"REFramework 설정 파일이 아닙니다: {path}")
         if isinstance(value, bool):
             value = "true" if value else "false"  # as REFramework writes them
-        return crashes.set_refw_option(self.game_dir, key, value)
+        return crashes.set_refw_option(self.game_dir, key, value, path=path or None)
+
+    # ------------------------------------------------------------- 실행 전 점검
+    def problems(self, conflicts: Conflicts | None = None, missing: dict | None = None) -> dict[str, list[str]]:
+        """Why each enabled mod cannot fully work: {mod id: [reason]} (the list's ⚠ marks; the same as the
+        mods' own issues of 실행 전 점검). ``conflicts`` and ``missing`` ({enabled mod id:
+        missing_requirements}) are used when the caller has them already."""
+        return precheck.mod_problems(precheck.mod_states(self, conflicts, missing))
+
+    def precheck_background(self, facts: precheck.Facts, natives: bool = True, materials: bool = True,
+                            progress: ProgressFn | None = None) -> precheck.Background:
+        """The slow part of 실행 전 점검 (precheck.background, any thread; kept in cache\\): the last game's
+        records and the loose files no mod placed, with the game's pak index shared with the equipment
+        window."""
+        return precheck.background(facts, self.crash_dir, self.data_dir / "cache", natives=natives,
+                                   materials=materials, game=lambda: self._equip_game(progress), progress=progress)
+
+    def prelaunch_check(self, refw_status=None, background: precheck.Background | None = None) -> precheck.Report:
+        """실행 전 점검 as things are now: the fast checks with the slow part's last result (``background``,
+        by default the one kept in cache\\)."""
+        facts = precheck.gather(self, refw_status)
+        if background is None:
+            background = precheck.load_background(self.data_dir / "cache")
+        return precheck.check(facts, background)
 
     def crash_report_mods(self, kind_text=None) -> list[crashes.ReportMod]:
         """The mods (in load order) for the support zip's report.txt."""

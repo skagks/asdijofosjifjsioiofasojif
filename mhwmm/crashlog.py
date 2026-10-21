@@ -598,7 +598,7 @@ def config_bool(value) -> bool | None:
 def set_config_value(path, key: str, value) -> bool:
     """Set ``key=value`` in a REFramework config file, line by line: every other line, the line
     endings (CRLF) and the encoding stay as they are; a missing key is added at the end and a
-    missing file is made.  Returns False when it already had that value.  Only call this while the
+    missing file (and its folder) is made.  Returns False when it already had that value.  Only call this while the
     game is closed: REFramework rewrites the whole file from memory while it runs."""
     if "=" in key or "\n" in key or not key:
         raise ValueError(f"잘못된 설정 이름입니다: {key!r}")
@@ -629,6 +629,8 @@ def set_config_value(path, key: str, value) -> bool:
         changed = True
     if not changed:
         return False
+    if not data:
+        path.parent.mkdir(parents=True, exist_ok=True)  # (REFramework's %APPDATA% folder before its first start)
     tmp = path.with_name(path.name + ".mhwmm-part")
     try:
         with open(tmp, "wb") as f:  # on disk before it replaces the user's settings (a PC that crashes...)
