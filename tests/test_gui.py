@@ -1135,6 +1135,9 @@ def test_gui_bisect_from_the_crash_records(root, manager, tmp_path, game_dir, mo
     style, head, detail = gui.exit_summary(crash)
     assert (style, head) == ("Alert", "비정상 종료를 확인했습니다 (0xC0000005)")
     assert "종료 코드 0xC0000005 (메모리 접근 오류) · 9분 33초 실행" in detail and "REFramework 기록: " in detail
+    record.info["summary"] = {**record.summary, "crash_from": "report"}  # the game's own report, not REFramework's
+    detail = gui.exit_summary(crash)[2]
+    assert "게임 오류 보고서: " in detail and "REFramework 기록" not in detail
     normal = gamewatch.Detection(False, "", gamewatch.GameExit(1, 0, now, now - 1260))
     style, head, detail = gui.exit_summary(normal)  # what was seen, not a verdict (code 0 may be a crash too)
     assert (style, head) == ("Banner", "게임이 종료 코드 0으로 끝났고 REFramework 오류 기록은 없습니다.")

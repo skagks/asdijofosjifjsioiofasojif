@@ -570,14 +570,16 @@ class Detection:
         return self.crashed is True
 
 
-def judge(exit: GameExit | None, record: crashes.Session | None = None) -> Detection:
-    """Detection from an exit (None: not watched) and a crash record since the launch."""
+def judge(exit: GameExit | None, record: crashes.Session | None = None, reported: bool = False) -> Detection:
+    """Detection from an exit (None: not watched), a crash record since the launch and whether the
+    game's own crash reporter wrote a report since then (``reported``: the game then ends with exit
+    code 0 although it crashed)."""
     code = ""
     if exit is not None and exit.crashed:
         code = crashlog.normalize_code(exit.code)
     elif record is not None:
         code = crashlog.normalize_code(record.summary.get("crash") or "")
-    if (exit is not None and exit.crashed) or record is not None:
+    if (exit is not None and exit.crashed) or record is not None or reported:
         crashed = True
     elif exit is not None and exit.code == 0:
         crashed = False
@@ -601,12 +603,41 @@ def detect(crash_dir, since: float | None, exit: GameExit | None = None, game_di
         known = [t for t in (exit.started, exit.seen) if t is not None]
         start = min([*known, *([since] if since is not None else [])], default=None)
     record = None
+    reported = False
     if start is not None:
         try:
             record = crashes.crashed_since(crash_dir, start - 5)
         except Exception as exc:
             log.warning("게임 기록을 읽지 못했습니다: %s", exc)
-    return judge(exit, record)
+        reported = record is None and game_reported_since(game_dir, start - 5,
+                                                          exit.ended if exit is not None and exit.ended else None)
+        if reported:
+            log.warning("게임이 스스로 오류 보고서(CrashReport)를 만들었습니다: 종료 코드와 관계없이 튕긴 것으로 봅니다.")
+    return judge(exit, record, reported)
+
+
+def game_reported_since(game_dir, since: float, until: float | None = None) -> bool:
+    """Whether the game's own crash reporter wrote a report in <game>\\CrashReport for a crash between ``since``
+    and ``until`` (default: now): the crash's minute in its name (2026_1022_0346.zip, or a temporary file while
+    it is still being written), else a zip's time. An unpacked or copied earlier report is not this run's."""
+    folder = crashes.game_report_dir(game_dir)
+    until = (until if until is not None else time.time()) + 60
+    try:
+        entries = list(folder.iterdir()) if folder is not None and folder.is_dir() else []
+    except OSError:
+        return False
+    for p in entries:
+        named = crashes.report_name_time(p.name)
+        if named is not None:
+            if since - 60 <= named <= until:
+                return True
+            continue
+        try:
+            if p.suffix.lower() == ".zip" and since <= p.stat().st_mtime <= until:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 # ---- the last normal exit ---------------------------------------------------------------------------
@@ -652,7 +683,32 @@ def load_last_good(crash_dir) -> dict | None:
     if not isinstance(data, dict) or data.get("format") != LAST_GOOD_FORMAT or \
             not isinstance(data.get("context"), dict):
         return None
+    if _crashed_during(crash_dir, data):
+        return None
     return data
+
+
+def _crashed_during(crash_dir, data: dict) -> bool:
+    """A crash was recorded during the run kept as the last good one (e.g. the game's own crash report,
+    collected only later, of a run that ended with exit code 0): forget that run."""
+    ended = data.get("time")
+    started = data.get("started") or (ended - data["seconds"] if isinstance(ended, (int, float))
+                                      and isinstance(data.get("seconds"), (int, float)) else None)
+    if not isinstance(ended, (int, float)) or not isinstance(started, (int, float)):
+        return False
+    try:
+        crashed = any(s.problem() == "crash" and started - 5 <= float(s.summary.get("crash_time") or 0) <= ended + 5
+                      for s in crashes.sessions(crash_dir))
+    except Exception as exc:
+        log.debug("게임 기록을 읽지 못했습니다: %s", exc)
+        return False
+    if crashed:
+        log.warning("정상 종료로 기억했던 실행에서 튕긴 기록이 나와 그 기억을 지웁니다.")
+        try:
+            (Path(crash_dir) / LAST_GOOD_FILE).unlink()
+        except OSError:
+            pass
+    return crashed
 
 
 def after_exit(crash_dir, exit: GameExit | None, launched: float | None = None, game_dir=None,

@@ -55,8 +55,12 @@ def put(path: Path, data, mtime: float) -> Path:
     return path
 
 
-def dump_bytes(t: float) -> bytes:
-    return b"MDMP" + struct.pack("<IIIII", 0xA793, 3, 32, 0, int(t)) + bytes(8) + b"\x00" * 64
+def dump_bytes(t: float, started: float | None = None) -> bytes:
+    if started is None:
+        return b"MDMP" + struct.pack("<IIIII", 0xA793, 3, 32, 0, int(t)) + bytes(8) + b"\x00" * 64
+    # with a MiscInfoStream (stream 15) holding the process's start, as the game's MiniDump.dmp has
+    return (b"MDMP" + struct.pack("<IIIII", 0xA793, 1, 32, 0, int(t)) + bytes(8) + struct.pack("<III", 15, 24, 44)
+            + struct.pack("<IIIIII", 24, 0x3F7, 14792, int(started), 10, 5) + b"\x00" * 64)
 
 
 def snapshot(folder: Path) -> dict:
@@ -819,3 +823,154 @@ def test_an_old_faulty_list_is_not_given_to_a_session_that_did_not_write_it(game
     (current,) = collect(crash_dir, game)
     assert current.started == stamp(T0) and current.faulty() == []
     assert all(s.faulty() == [] for s in crashes.sessions(crash_dir))
+
+
+# ---- the game's own crash reporter (CrashReport.exe) ---------------------------------------------------
+def game_report_text(game: Path, message: str = "Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) "
+                                                "DeviceRemovedReason(0x887a0006)", top: str | None = None) -> str:
+    """CrashReport.txt as the game writes it (a folder listing, the exception, the call stack, the message)."""
+    exe = game / "MonsterHunterWilds.exe"
+    frames = [top] if top else []
+    frames += [str(exe)] * 3 + [r"C:\WINDOWS\System32\KERNEL32.DLL"]
+    lines = ["[Process Directory]", str(game), "2026/10/21 18:45\t<DIR>\t         0\t. ", "",
+             "[Process Information]", str(exe), "ExceptionPointer: 000000015493E420", "ExceptionRecord:",
+             "\tExceptionCode   : C0000005(EXCEPTION_ACCESS_VIOLATION)", "\tExceptionFlags  : 00000000",
+             "\tExceptionAddress: 000000014CD94BF0", "", "Callstack's:"]
+    lines += [f"Stack[{i}] : 0x000000014cd94ce{i} ( {f} )" for i, f in enumerate(frames)]
+    lines += [f"Command Line : {exe}", "Windows Last Error : 0x0000000000000000 ", f"Message : {message}", ""]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def report_zip(path: Path, text: str, crashed_at: float, mtime: float, started: float | None = None) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("CrashReport.txt", text)
+        zf.writestr("MiniDump.dmp", dump_bytes(crashed_at, started))
+        zf.writestr("DxDiag.txt", "private system details")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_the_game_s_own_crash_report_is_a_crash(game, crash_dir):
+    report = crashlog.parse_game_report(game_report_text(game))
+    assert report.code == "c0000005" and report.address == "000000014cd94bf0"
+    assert report.device_error == "DEVICE_HUNG" and report.modules[0].endswith("MonsterHunterWilds.exe")
+    assert crashlog.parse_game_report("nothing here") is None
+
+    # REFramework saw nothing (the game caught the graphics device error itself); its report is the record
+    put(game / "re2_framework_log.txt", log_text(game, T0, [(90, "Hooked DirectX 12", "info")]), T0 + 90)
+    report_zip(game / "CrashReport" / "2026_1016_1541.zip", game_report_text(game), T0 + 80, T0 + 260)
+    before = snapshot(game)
+    s, = collect(crash_dir, game)
+    assert snapshot(game) == before
+    assert s.problem() == "crash" and s.summary["crash"] == "c0000005" and s.summary["crash_time"] == int(T0 + 80)
+    assert s.summary["device_error"] == "DEVICE_HUNG" and s.summary["category"] == "gpu"
+    assert "그래픽 장치 오류 (DEVICE_HUNG)" in s.title()
+    assert sorted(s.info["files"]) == [crashes.GAME_REPORT_FILE, crashes.LOG_FILE]  # only its text: no DxDiag & co
+    ex = crashes.explain(s, ModIndex(game, {}, []))
+    assert ex.crashed and ex.code == "c0000005" and ex.category == "gpu"
+    assert ex.findings[0].kind == "game_report" and "스스로 오류 보고서" in ex.findings[0].text
+    advice = next(f for f in ex.findings if f.kind == "d3d")
+    assert "그래픽카드가 응답하지 않아(DEVICE_HUNG)" in advice.text and advice.action == "bisect" and not ex.suspects
+    assert "게임 오류 보고서" in ex.summary
+    assert crashes.crashed_since(crash_dir, T0).id == s.id
+    assert collect(crash_dir, game) == []  # the same report is not taken twice
+
+
+def test_a_game_report_without_a_record_of_its_session(game, crash_dir, monkeypatch):
+    monkeypatch.setattr(crashes.time, "time", lambda: T0 + 86400)  # (older reports get no session of their own)
+    # a report whose log was overwritten since (or without REFramework): a session of its own
+    report_zip(game / "CrashReport" / "2026_1016_1541.zip", game_report_text(game, "", top=r"C:\x\reframework\plugins\Bad.dll"),
+               T0 + 80, T0 + 260)
+    # ... and the folder form (an unpacked report)
+    put(game / "CrashReport" / "2026_1016_1700" / "CrashReport.txt", game_report_text(game), T0 + 5000)
+    put(game / "CrashReport" / "notes.txt", "not a report", T0)
+    found = collect(crash_dir, game)
+    assert [s.id.endswith("-report") for s in found] == [True, True]
+    newer, older = found
+    assert newer.summary["device_error"] == "DEVICE_HUNG" and older.summary["device_error"] == ""
+    assert older.summary["module_name"] == "Bad.dll" and older.problem() == "crash"
+    ex = crashes.explain(older, ModIndex(game, {}, []))
+    assert ex.findings[0].kind == "game_report" and any(f.kind in crashes.KINDS for f in ex.findings[1:])
+
+
+def test_old_unpacked_or_copied_reports_and_a_run_without_refw(game, crash_dir, monkeypatch):
+    import json
+    now = T0 + 30 * 86400
+    monkeypatch.setattr(crashes.time, "time", lambda: now)
+    # ten kept sessions (some with unreadable files), then reports from months ago: none taken
+    for i in range(10):
+        t = now - (10 - i) * 86400
+        put(game / "re2_framework_log.txt", log_text(game, t, [(90, "Hooked DirectX 12", "info")]), t + 90)
+        put(game / "reframework_faulty_files.txt", f"natives/STM/x{i}.tex.241106027\r\n", t + 60)
+        collect(crash_dir, game)
+    for i in range(15):
+        t = now - (200 - i * 5) * 86400
+        name = datetime.fromtimestamp(t).strftime("%Y_%m%d_%H%M") + ".zip"
+        report_zip(game / "CrashReport" / name, game_report_text(game), t, t + 30)
+    assert collect(crash_dir, game) == [] and all(s.problem() == "faulty" for s in crashes.sessions(crash_dir))
+    # a recent report, then the same unpacked next to it and a copy of it: one record
+    t = now - 3600
+    z = report_zip(game / "CrashReport" / datetime.fromtimestamp(t).strftime("%Y_%m%d_%H%M.zip"),
+                   game_report_text(game), t, t + 200)
+    first, = collect(crash_dir, game)
+    with zipfile.ZipFile(z) as zf:
+        zf.extractall(z.with_suffix(""))
+    (z.parent / (z.stem + " - 복사본.zip")).write_bytes(z.read_bytes())
+    assert collect(crash_dir, game) == []
+    # a run without REFramework (no log) reports a crash minutes after a run that ended well: not that run's
+    t = now - 600
+    good = {"mods": [{"id": "a", "name": "A", "enabled": True}]}
+    crashes.note_launch(crash_dir, good, now=t - 300)
+    put(game / "re2_framework_log.txt", log_text(game, t - 290, [(100, "Hooked DirectX 12", "info")]), t - 190)
+    a, = collect(crash_dir, game, good)
+    off = {"mods": [{"id": "a", "name": "A", "enabled": False}]}
+    crashes.note_launch(crash_dir, off, now=t)
+    report_zip(game / "CrashReport" / "x.zip", game_report_text(game), t + 60, t + 240)
+    b, = collect(crash_dir, game, good)
+    assert b.id != a.id and b.id.endswith("-report") and b.launched == t and b.context == off
+    assert not crashes.find_session(crash_dir, a.id).summary.get("game_report")
+
+
+def test_a_damaged_report_never_stops_the_others(game, crash_dir):
+    put(game / "re2_framework_log.txt", log_text(game, T0, [(90, "Hooked DirectX 12", "info")]), T0 + 90)
+    put(game / "reframework_faulty_files.txt", "natives/STM/x.tex.241106027\r\n", T0 + 60)
+    bad = game / "CrashReport" / "2026_1016_1541.zip"
+    bad.parent.mkdir(parents=True)
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("CrashReport.txt", game_report_text(game) * 20)
+    with zipfile.ZipFile(bad) as zf:
+        info = zf.getinfo("CrashReport.txt")
+    data = bytearray(bad.read_bytes())
+    at = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    data[at] = 0xFF  # an invalid deflate block: zipfile raises zlib.error, not BadZipFile
+    bad.write_bytes(bytes(data))
+    with pytest.raises(Exception) as raised:
+        with zipfile.ZipFile(bad) as zf:
+            zf.read("CrashReport.txt")
+    assert not isinstance(raised.value, zipfile.BadZipFile)
+    report_zip(game / "CrashReport" / "2026_1016_2000.zip", game_report_text(game), T0 + 20000, T0 + 20100)
+    found = collect(crash_dir, game)
+    assert sorted(s.problem() for s in found) == ["crash", "faulty"]  # the log's session and the other report
+    assert not [p for p in crash_dir.iterdir() if p.is_dir() and not (p / crashes.SESSION_FILE).is_file()]
+
+
+def test_the_process_start_in_the_dump_finds_the_run(game, crash_dir):
+    mods = {"mods": [{"id": "a", "name": "A", "enabled": True}]}
+    crashes.note_launch(crash_dir, mods, now=T0 - 10)
+    # a long quiet run: REFramework's log stops after loading, the crash comes an hour later
+    put(game / "re2_framework_log.txt", log_text(game, T0, [(60, "Hooked DirectX 12", "info")]), T0 + 60)
+    report_zip(game / "CrashReport" / "2026_1016_1639.zip", game_report_text(game), T0 + 3600, T0 + 3780, started=T0 - 3)
+    s, = collect(crash_dir, game, mods)
+    assert s.started and not s.id.endswith("-report") and s.summary["crash_time"] == int(T0 + 3600)
+    assert s.summary["crash_from"] == "report" and s.launched == T0 - 10
+    # the next run without REFramework (no log) crashes soon after starting: a record of its own, with its launch
+    off = {"mods": [{"id": "a", "name": "A", "enabled": False}]}
+    crashes.note_launch(crash_dir, off, now=T0 + 5000)
+    report_zip(game / "CrashReport" / "2026_1016_1705.zip", game_report_text(game), T0 + 5080, T0 + 5300,
+               started=T0 + 5003)
+    b, = collect(crash_dir, game, mods)
+    assert b.id.endswith("-report") and b.launched == T0 + 5000 and b.context == off
+    assert crashes.find_session(crash_dir, s.id).summary["crash_time"] == int(T0 + 3600)
+    assert crashes._dump_times(b"MDMP" + bytes(10)) == (None, None)
+    assert crashes._dump_times(dump_bytes(T0 + 1, T0 - 5)) == (int(T0 + 1), int(T0 - 5))

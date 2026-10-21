@@ -55,13 +55,22 @@ LAUNCH_SECONDS = 15 * 60  # a session starting this soon after a launch from the
 MAX_LOG_COPY = 64 * 1024 * 1024  # a larger log is copied in part (its start and its end)
 MAX_DUMP_COPY = 512 * 1024 * 1024
 REPORT_LOG_LINES = 2000
+GAME_REPORT_FILE = "game_crashreport.txt"  # the text of the game's own crash report (CrashReport.txt)
+GAME_REPORT_SECONDS = 15 * 60  # a game crash report this soon after a session's last log line belongs to it
+MAX_GAME_REPORTS = 20  # the newest reports in <game>\CrashReport looked at
+MAX_GAME_REPORT_TEXT = 4 * 1024 * 1024
+DUMP_HEAD = 64 * 1024  # a minidump's first bytes read for its times (header, stream directory, MiscInfoStream)
+GAME_REPORT_DAYS = 14  # an older report gets no session of its own (only a kept session it was written in takes it)
+REPORT_LAUNCH_SECONDS = 12 * 3600  # a report-only session this soon after an unclaimed launch from the manager came from it
+SAME_REPORT_SECONDS = 120  # reports this close together are the same crash (a copy, or an unpacked zip)
+_REPORT_NAME = re.compile(r"^(\d{4})_(\d{2})(\d{2})_(\d{2})(\d{2})(?!\d)")  # 2026_1022_0346.zip: the crash's minute
 MAX_FAULTY_MATCH = 5000  # faulty entries looked for in paks and the game folder (the rest only in the mods' files)
 PAK_FAMILY = "re_chunk_000.pak.sub_000.pak"  # the paks REFramework adds pak_mods' paks to as numbered patches
 RSZ_EXTS = (".user", ".pfb", ".scn", ".mdf2")  # files the material check and repair (재질 점검·복구) handle
 # version suffixes when neither the mods nor the bundled path list know one
 FALLBACK_VERSIONS = {"user": ("3",), "pfb": ("18",), "scn": ("21",), "mdf2": ("45",), "tex": ("241106027",),
                      "mesh": ("241111606",)}
-TEXT_FILES = (LOG_FILE, FAULTY_FILE, CONFIG_FILE, SESSION_FILE)
+TEXT_FILES = (LOG_FILE, FAULTY_FILE, CONFIG_FILE, SESSION_FILE, GAME_REPORT_FILE)
 
 TITLE = "게임 튕김 기록"  # the window and the ☰ menu item
 SUSPECTS_HEADER = "의심되는 원인"
@@ -284,11 +293,19 @@ class Session:
         info = self.log()
         return info.crash if info else None
 
+    def game_report(self) -> crashlog.GameReport | None:
+        """The game's own crash report of this session (CrashReport.exe), if one was found."""
+        path = self.file(GAME_REPORT_FILE)
+        try:
+            return crashlog.parse_game_report(path.read_text(encoding="utf-8", errors="replace")) if path else None
+        except OSError:
+            return None
+
     def problem(self) -> str:
         """"crash" (REFramework recorded a fatal exception), "dump" (only a crash dump is left), "faulty"
         (files the game could not load) or "" - from the summary, without reading the files."""
         s = self.summary
-        if s.get("crash"):
+        if s.get("crash") or s.get("game_report"):
             return "crash"
         if self.dump_only:
             return "dump"
@@ -301,8 +318,12 @@ class Session:
         session of the game running now, not finished)."""
         s = self.summary
         parts = [_when(s.get("crash_time") or self.end_time, now)]
-        if s.get("crash"):
+        if s.get("device_error"):
+            parts.append(f"그래픽 장치 오류 ({s['device_error']})")
+        elif s.get("crash"):
             parts.append(f"오류 코드 {exception_label(s['crash'])}")
+        elif s.get("game_report"):
+            parts.append("게임 오류 보고서")
         elif self.dump_only:
             parts.append("크래시 덤프만 남음")
         else:
@@ -573,6 +594,53 @@ def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]
         s.info["files"][DUMP_FILE] = {"from": str(path), "size": st.st_size, "mtime": st.st_mtime_ns, "time": written}
         changed[s.id] = s
 
+    # the game's own crash reports (CrashReport.exe; e.g. a graphics device error that REFramework never sees):
+    # only their text is copied, to the session that was running then (or a session of its own)
+    cutoff = time.time() - GAME_REPORT_DAYS * 86400
+    oldest = min((s.time for s in everything.values()), default=cutoff)
+    for path, st in _game_reports(game_dir):
+        key = _report_key(path)
+        if key in pruned or any(_report_record_key(s) == key for s in everything.values()):
+            continue
+        if st.st_mtime < min(cutoff, oldest):  # older than any kept session and too old for one of its own
+            continue
+        try:
+            text, written, started = _read_game_report(path, st)
+        except Exception as exc:  # one report never stops the others (nor the records above) being kept
+            log.info("게임 오류 보고서를 읽지 못했습니다 (%s): %s", path, exc)
+            continue
+        if text is None or any(abs(_report_record_time(s) - written) <= SAME_REPORT_SECONDS
+                               for s in everything.values() if _report_record_key(s)):
+            continue
+        launch_data = fsutil.read_json(crash_dir / LAUNCH_FILE, None)
+        launched = launch_data.get("time") if isinstance(launch_data, dict) else None
+        s = _report_owner(everything.values(), written, started,
+                          launched if isinstance(launched, (int, float)) else None)
+        if s is None and written < cutoff:
+            continue
+        made, launch = s is None, None
+        try:
+            if s is None:
+                launch = _report_launch(launch_data, written, started)
+                s = Session(_new_folder(crash_dir, written, "-report"),
+                            {"format": SESSION_FORMAT, "files": {}, "started": "", "time": written, "end_time": written,
+                             "ended": datetime.fromtimestamp(written).strftime(crashlog.TIME_FORMAT)[:-3],
+                             "context": (launch or {}).get("context") or context,
+                             "context_from": "launch" if launch else "collect",
+                             "launched": launch["time"] if launch else 0, "notified": "", "source": str(game_dir)})
+            fsutil.atomic_write_text(s.folder / GAME_REPORT_FILE, text)
+        except OSError as exc:
+            log.warning("게임 오류 보고서를 복사하지 못했습니다 (%s): %s", path, exc)
+            if made and s is not None:
+                fsutil.rmtree(s.folder)
+            continue
+        if launch is not None:
+            _claim_launch(crash_dir, launch, s.id)
+        everything[s.id] = s
+        s.info["files"][GAME_REPORT_FILE] = {"from": str(path), "size": st.st_size, "mtime": st.st_mtime_ns,
+                                             "time": written, "key": key}
+        changed[s.id] = s
+
     # REFramework's settings as they are now (Lua error logging, loose files, pak_mods): those of the folder
     # the session's records came from (REFramework keeps its settings where it writes its log)
     for s in changed.values():
@@ -600,6 +668,160 @@ def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]
 
 def _dump_key(st) -> str:
     return f"dump:{st.st_size}:{st.st_mtime_ns}"
+
+
+def game_report_dir(game_dir) -> Path | None:
+    return Path(game_dir) / crashlog.GAME_REPORT_DIR if game_dir else None
+
+
+def _game_reports(game_dir) -> list[tuple[Path, os.stat_result]]:
+    """The newest crash reports of the game: zips (or folders) in <game>\\CrashReport."""
+    folder = game_report_dir(game_dir)
+    found = []
+    try:
+        entries = list(folder.iterdir()) if folder is not None and folder.is_dir() else []
+    except OSError:
+        entries = []
+    for p in entries:
+        if p.is_dir():
+            p = p / crashlog.GAME_REPORT_TEXT
+        elif p.suffix.lower() != ".zip":
+            continue
+        st = _stat(p)
+        if st is not None and p.is_file():
+            found.append((p, st))
+    return sorted(found, key=lambda x: x[1].st_mtime, reverse=True)[:MAX_GAME_REPORTS]
+
+
+def report_name_time(name: str) -> float | None:
+    """The crash's minute (local time) in a report's name (2026_1022_0346.zip, its unpacked folder, a temporary
+    file); None for another name."""
+    m = _REPORT_NAME.match(name)
+    if not m:
+        return None
+    try:
+        return datetime(*map(int, m.groups())).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _report_key(path: Path) -> str:
+    """The same for a report zip, its unpacked folder and a copy of it ("2026_1022_0346 - 복사본.zip")."""
+    name = path.parent.name if path.name == crashlog.GAME_REPORT_TEXT else path.name
+    m = _REPORT_NAME.match(name)
+    return f"report:{m.group(0) if m else name.removesuffix('.zip').removesuffix('.ZIP')}"
+
+
+def _report_record_time(s: Session) -> float:
+    record = s.info["files"].get(GAME_REPORT_FILE)
+    t = record.get("time") if isinstance(record, dict) else None
+    return float(t) if isinstance(t, (int, float)) else 0.0
+
+
+def _report_record_key(s: Session) -> str:
+    record = s.info["files"].get(GAME_REPORT_FILE)
+    return record.get("key", "") if isinstance(record, dict) else ""
+
+
+def _read_game_report(path: Path, st) -> tuple[str | None, float, float | None]:
+    """(CrashReport.txt's text, when the game crashed, when its process started) of a report zip or folder;
+    (None, 0, None) if unreadable (any error: a damaged zip also raises zlib.error, EOFError ...). The crash
+    time is the minidump's (written at the crash), else the text's, else the name's, else the file's."""
+    head, stamp = b"", None
+    try:
+        if path.name != crashlog.GAME_REPORT_TEXT:
+            with zipfile.ZipFile(path) as zf:
+                by_name = {i.filename.replace("\\", "/").rsplit("/", 1)[-1].casefold(): i for i in zf.infolist()}
+                info = by_name.get(crashlog.GAME_REPORT_TEXT.casefold())
+                if info is None or info.file_size > MAX_GAME_REPORT_TEXT:
+                    return None, 0, None
+                data = zf.read(info)
+                dump = next((i for n, i in by_name.items() if n.endswith(".dmp")), None)
+                if dump is not None:
+                    try:
+                        with zf.open(dump) as f:
+                            head = f.read(DUMP_HEAD)
+                    except Exception:  # (a damaged dump only loses the times)
+                        head = b""
+                try:
+                    stamp = time.mktime((*info.date_time, 0, 0, -1))
+                except (OverflowError, ValueError):
+                    stamp = None
+            name = path.name
+        else:
+            if st.st_size > MAX_GAME_REPORT_TEXT:
+                return None, 0, None
+            data = path.read_bytes()
+            dumps = sorted(path.parent.glob("*.dmp"))
+            if dumps:
+                try:
+                    with open(dumps[0], "rb") as f:
+                        head = f.read(DUMP_HEAD)
+                except OSError:
+                    head = b""
+            name = path.parent.name
+    except Exception as exc:
+        log.info("게임 오류 보고서를 읽지 못했습니다 (%s): %s", path, exc)
+        return None, 0, None
+    text = data.decode("utf-8", errors="replace")
+    if crashlog.parse_game_report(text) is None:
+        return None, 0, None
+    crashed, started = _dump_times(head)
+    written = crashed or _plausible(stamp) or _plausible(report_name_time(name)) or st.st_mtime
+    return text, float(written), started
+
+
+def _plausible(t: float | None) -> float | None:
+    return float(t) if t and 1.5e9 < t < time.time() + 86400 else None
+
+
+def _dump_times(head: bytes) -> tuple[float | None, float | None]:
+    """(when it was written, when the process started) from a minidump's first bytes: its header and the
+    MiscInfoStream (MINIDUMP_MISC_INFO with MINIDUMP_MISC1_PROCESS_TIMES)."""
+    try:
+        if len(head) < 32 or head[:4] != b"MDMP":
+            return None, None
+        count, rva, _sum, written = struct.unpack_from("<IIII", head, 8)
+        started = None
+        for i in range(min(count, 64)):
+            at = rva + 12 * i
+            if at + 12 > len(head):
+                break
+            kind, size, where = struct.unpack_from("<III", head, at)
+            if kind == 15 and size >= 24 and where + 24 <= len(head):
+                flags, _pid, created = struct.unpack_from("<III", head, where + 4)
+                started = float(created) if flags & 2 else None
+                break
+    except struct.error:
+        return None, None
+    return _plausible(written), _plausible(started)
+
+
+def _report_owner(candidates: Iterable[Session], written: float, started: float | None = None,
+                  launched: float | None = None) -> Session | None:
+    """The session that was running when the game wrote its crash report (one without a report yet). With
+    the process start from the dump: the session REFramework began in that process (one game runs at a
+    time). Else the newest running then that no other run (a kept session, or the last launch from the
+    manager) started after, before the report - a run without REFramework writes no log, and its report is
+    not the earlier run's."""
+    candidates = list(candidates)
+    if started is not None:
+        spans = [s for s in candidates if s.started and started - 30 <= s.time <= written + 5]
+    else:
+        later = [t for t in (*(x.time for x in candidates), launched) if t]
+        spans = [s for s in candidates if s.started and s.time - 5 <= written <= s.end_time + GAME_REPORT_SECONDS
+                 and not any(s.end_time + 5 < t <= written for t in later)]
+    spans = [s for s in spans if not _report_record_key(s)]
+    return max(spans, key=lambda s: s.time) if spans else None
+
+
+def _report_launch(data, written: float, started: float | None = None) -> dict | None:
+    """The launch from the manager a report without a log came from (REFramework off: no session claimed it)."""
+    if not isinstance(data, dict) or not isinstance(data.get("time"), (int, float)) or data.get("claimed"):
+        return None
+    if started is not None:
+        return data if -60 <= started - data["time"] <= LAUNCH_SECONDS else None
+    return data if -60 <= written - data["time"] <= REPORT_LAUNCH_SECONDS else None
 
 
 def _pruned(crash_dir) -> list[str]:
@@ -655,6 +877,17 @@ def _summarize(s: Session) -> None:
             summary.update({"crash": crash.code, "crash_time": _epoch(crash.time) or s.end_time,
                             "module": crash.place, "module_name": module_name(crash.place) if crash.place else "",
                             "category": category, "dump_written": bool(crash.dump) and not crash.dump_failed})
+    report = s.game_report()
+    if report is not None:
+        record = s.info["files"].get(GAME_REPORT_FILE) or {}
+        summary["game_report"] = True
+        summary["device_error"] = report.device_error
+        if not summary.get("crash"):
+            top = report.modules[0] if report.modules else ""
+            summary.update({"crash": report.code, "crash_from": "report",
+                            "crash_time": float(record.get("time") or s.end_time), "module": top, "module_name": module_name(top) if top else "",
+                            "category": "gpu" if report.device_error else module_place(top, [s.info.get("source", "")])[0]
+                            if top else ""})
     s.info["summary"] = summary
 
 
@@ -672,6 +905,8 @@ def prune(crash_dir, keep: int = KEEP_SESSIONS, recent: int = KEEP_RECENT) -> No
             dump = (s.info.get("files") or {}).get(DUMP_FILE)
             if isinstance(dump, dict):
                 let_go.append(f"dump:{dump.get('size')}:{dump.get('mtime')}")
+            if _report_record_key(s):
+                let_go.append(_report_record_key(s))
             try:
                 fsutil.rmtree(s.folder)
             except OSError as exc:
@@ -1126,7 +1361,7 @@ KINDS = ("plugin", "reframework", "game", "gpu", "root_dll", "system", "other", 
          "script", "lua", "plugin_load", "pak_failed", "pak_slot", "pak_none", "pak_disabled", "loose_failed",
          "init", "hooks", "present", "faulty", "faulty_loose", "faulty_pak", "faulty_game", "faulty_more",
          "faulty_unread", "material", "stuck", "no_crash", "running", "no_record", "dump_only", "corrupted_pak", "d3d",
-         "unhandled", "code", "named")
+         "unhandled", "code", "named", "game_report")
 _LEVELS = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
 
@@ -1417,10 +1652,13 @@ def explain(session: Session | None, index: ModIndex, builds=None, now: float | 
     findings: list[Finding] = []
     lead: list[Finding] = []
     crash = info.crash if info else None
+    report = session.game_report() if session is not None else None
     bases = _bases(index, info, session)
     if crash is not None:
         located = _crash_findings(crash, bases, index)
         lead, findings = located[:1], located[1:]
+    if report is not None:
+        findings += _game_report_findings(report, bases, index, session)
     if info is not None:
         findings += _lua_findings(info, bases, index)
         findings += _setup_findings(info, bases, index)
@@ -1429,32 +1667,67 @@ def explain(session: Session | None, index: ModIndex, builds=None, now: float | 
         findings += _faulty_findings(index.match_faulty(faulty, session_loose(session)), index)
     if session is None:
         lead.append(Finding("no_record", NO_RECORD))
-    elif session.dump_only:
+    elif session.dump_only and report is None:
         lead.append(Finding("dump_only", "크래시 덤프만 남아 있습니다. 그 뒤 게임을 다시 실행해 REFramework 기록이 "
                                 "지워졌습니다. 튕긴 뒤에는 매니저에서 게임을 실행하면 기록을 먼저 챙깁니다.", [], [], "info", "bisect"))
-    elif info is None:
+    elif info is None and report is None:
         lead.append(Finding("no_record", NO_RECORD))
     elif crash is None and running:
         lead.append(Finding("running", "게임이 실행 중입니다. 이 기록은 게임을 끈 뒤에 완성됩니다.", [], [], "info"))
+    elif crash is None and report is not None:
+        lead.append(_report_finding(report))
     elif crash is None:
         last = info.last_lines[-2:]
         lead.append(Finding("no_crash", "REFramework 기록에는 오류가 없습니다. 게임이 멈춰서 강제로 껐거나 게임 자체 오류 "
                                 "창이 떴다면 기록이 남지 않습니다. 오류 창이 떴다면 문구를 붙여 넣어 주세요.",
                                 [f"마지막 기록: {line}" for line in last], [], "info"))
+    if report is not None and report.device_error:  # (said better by the report)
+        findings = [f for f in findings if f.kind != "present"]
     findings += _material_findings(index)
     findings, suspects = _sorted(findings, lead)
-    code = crash.code if crash else ""
+    code = crash.code if crash else (report.code if report else "")
+    category = module_place(crash.place, bases)[0] if crash else (session.summary.get("category", "") if report else "")
     return Explanation(summary=_summary(session, info, builds, now, running), findings=findings, suspects=suspects,
-                       crashed=crash is not None or bool(session and session.dump_only), code=code,
-                       category=module_place(crash.place, bases)[0] if crash else "", has_log=info is not None)
+                       crashed=crash is not None or report is not None or bool(session and session.dump_only),
+                       code=code, category=category, has_log=info is not None)
+
+
+def _report_finding(report: crashlog.GameReport) -> Finding:
+    """The lead finding of a session the game's own crash reporter recorded (REFramework saw no error)."""
+    evidence = [e for e in (report.message, f"예외 코드: {exception_label(report.code)}" if report.code else "") if e]
+    if report.device_error:
+        return Finding("game_report", f"그래픽 장치 오류({report.device_error})로 게임이 멈췄고, 게임이 스스로 오류 보고서"
+                       "(CrashReport)를 만든 뒤 종료했습니다. 이런 오류는 REFramework 기록에 남지 않습니다.", evidence,
+                       [], "info")
+    return Finding("game_report", "게임이 스스로 오류를 잡아 오류 보고서(CrashReport)를 만든 뒤 종료했습니다. 이런 오류는 "
+                   "REFramework 기록에 남지 않습니다.", evidence, [], "info")
+
+
+def _game_report_findings(report: crashlog.GameReport, bases: list[str], index: ModIndex,
+                          session: Session | None) -> list[Finding]:
+    """What the game's own report points at: its error message (a graphics device error, a corrupted pak ...)
+    and, when the error happened outside the game's own code, that module."""
+    out = explain_text(report.message, index, session) if report.message else []
+    top = report.modules[0] if report.modules else ""
+    if top and module_place(top, bases)[0] not in ("game", "system", "unknown"):
+        out.append(crash_finding(top, bases, index, [f"오류 보고서의 첫 호출: {top}"]))
+    return out
 
 
 def _summary(session: Session | None, info: LogInfo | None, builds, now, running: bool = False) -> str:
     if session is None:
         return ""
     crash = info.crash if info else None
+    report = session.summary.get("game_report")
     if crash is not None:
         parts = [f"{_when(_epoch(crash.time) or session.end_time, now)} 종료", f"오류 코드 {exception_label(crash.code)}"]
+    elif report:
+        parts = [f"{_when(session.summary.get('crash_time') or session.end_time, now)} 종료"]
+        if session.summary.get("device_error"):
+            parts.append(f"그래픽 장치 오류 ({session.summary['device_error']})")
+        elif session.summary.get("crash"):
+            parts.append(f"오류 코드 {exception_label(session.summary['crash'])}")
+        parts.append("게임 오류 보고서")
     elif session.dump_only:
         parts = [f"{_when(session.end_time, now)} 종료", "크래시 덤프만 남음"]
     else:
@@ -1491,9 +1764,16 @@ def explain_text(text: str, index: ModIndex, session: Session | None = None) -> 
     for number, name, hresult, reason in found.d3d:
         evidence = [f"Fatal D3D error ({number}, {name}, {hresult})"
                     + (f" DeviceRemovedReason({reason})" if reason else "")]
-        if name in crashlog.D3D_OUT_OF_MEMORY:
+        removed = crashlog.DXGI_ERRORS.get(reason.removeprefix("0x"), "") if reason else ""
+        if name in crashlog.D3D_OUT_OF_MEMORY or removed == "E_OUTOFMEMORY":
             out.append(Finding("d3d", "그래픽 메모리(VRAM)가 모자라 게임이 멈췄습니다 → 그래픽 설정이나 고해상도 텍스처 모드를 "
                                "줄여 보세요", evidence, [], "info"))
+        elif removed in ("DEVICE_HUNG", "DEVICE_RESET", "DRIVER_INTERNAL_ERROR"):
+            out.append(Finding("d3d", f"그래픽카드가 응답하지 않아({removed}) 그래픽 드라이버가 장치를 다시 시작했고, 그래서 게임이 "
+                               "멈췄습니다. 대개 그래픽 드라이버, 레이 트레이싱, 프레임 생성, GPU 오버클럭·언더볼트, 화면 위 "
+                               "오버레이(녹화·FPS 표시) 때문이고, 모드가 원인인 경우는 드뭅니다(셰이더·모델·고해상도 텍스처 모드는 "
+                               "가능) → 레이 트레이싱과 프레임 생성을 끄고, 그래픽 드라이버를 새로 설치하거나 이전 버전으로 바꿔 "
+                               "보세요. 모드를 모두 끄면 괜찮다면 원인 모드 찾기를 해 보세요", evidence, [], "info", "bisect"))
         else:
             out.append(Finding("d3d", f"그래픽 오류({name})로 게임이 멈췄습니다. 드라이버·오버레이·프레임 생성 설정이나 텍스처·모델 "
                                "모드가 원인일 수 있어 기록만으로는 모드를 알 수 없습니다.", evidence, [], "info", "bisect"))

@@ -797,6 +797,55 @@ def module_name(path: str) -> str:
     return str(path).strip().replace("/", "\\").rsplit("\\", 1)[-1]
 
 
+# ---- the game's own crash reporter -----------------------------------------------------------
+# CrashReport.exe (Capcom) writes <game>\CrashReport\<YYYY_MMDD_HHMM>.zip with CrashReport.txt, a minidump,
+# DxDiag and more when the game itself catches an error - e.g. a graphics device error, which never
+# reaches REFramework's handler; the game then ends with exit code 0
+GAME_REPORT_DIR = "CrashReport"
+GAME_REPORT_TEXT = "CrashReport.txt"
+_REPORT_CODE = re.compile(r"ExceptionCode\s*:\s*([0-9A-Fa-f]{8})\b")
+_REPORT_ADDRESS = re.compile(r"ExceptionAddress\s*:\s*(?:0x)?([0-9A-Fa-f]+)")
+_REPORT_MESSAGE = re.compile(r"^\s*Message\s*:\s*(\S[^\r\n]*?)\s*$", re.MULTILINE)
+_REPORT_FRAME = re.compile(r"^\s*Stack\[\d+\]\s*:\s*(0x[0-9A-Fa-f]+)\s*\(\s*([^\r\n]*?)\s*\)\s*$", re.MULTILINE)
+# DXGI_ERROR_* (the reason the game gives for a removed graphics device)
+DXGI_ERRORS = {"887a0005": "DEVICE_REMOVED", "887a0006": "DEVICE_HUNG", "887a0007": "DEVICE_RESET",
+               "887a0020": "DRIVER_INTERNAL_ERROR", "8007000e": "E_OUTOFMEMORY"}
+
+
+@dataclass
+class GameReport:
+    """What the game's own crash report (CrashReport.txt) says."""
+    code: str = ""  # exception code, 8 hex digits
+    address: str = ""
+    message: str = ""  # e.g. "Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0006)"
+    modules: list[str] = field(default_factory=list)  # call stack modules (paths), innermost first, each once
+
+    @property
+    def device_error(self) -> str:
+        """The graphics device error ("DEVICE_HUNG", "DEVICE_REMOVED" ...; "" for another error)."""
+        m = _D3D.search(self.message)
+        if not m:
+            return ""
+        reason = (m.group(4) or "").lower().removeprefix("0x")
+        return DXGI_ERRORS.get(reason) or m.group(2).removeprefix("DXGI_ERROR_")
+
+
+def parse_game_report(text: str) -> GameReport | None:
+    """The game's CrashReport.txt; None when it names no error."""
+    text = str(text or "")
+    report = GameReport()
+    m = _REPORT_CODE.search(text)
+    report.code = normalize_code(m.group(1)) if m else ""
+    m = _REPORT_ADDRESS.search(text)
+    report.address = m.group(1).lower() if m else ""
+    m = _REPORT_MESSAGE.search(text)
+    report.message = m.group(1)[:500] if m else ""
+    for m in _REPORT_FRAME.finditer(text):
+        if m.group(2) and m.group(2) not in report.modules:
+            report.modules.append(m.group(2))
+    return report if report.code or report.message else None
+
+
 # ---- privacy -----------------------------------------------------------------------------
 _USER_DIR = re.compile(r"(?i)([a-z]:[\\/]+users[\\/]+)([^\\/\r\n\"'<>|:*?]+)")
 _HOME_DIR = re.compile(r"((?:[A-Za-z]:)?[\\/]home[\\/]+)([^\\/\r\n\"'<>|:*?]+)")  # also Wine's Z:\home\<name>

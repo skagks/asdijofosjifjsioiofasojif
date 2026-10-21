@@ -1310,7 +1310,9 @@ def exit_summary(detection) -> tuple[str, str, str]:
         return "", "게임이 어떻게 끝났는지 확인하지 못했습니다. 직접 본 대로 알려 주세요.", ""
     detail = exit_detail(detection.exit)
     if detection.record is not None:
-        detail = "\n".join(x for x in (detail, f"REFramework 기록: {detection.record.title()}") if x)
+        record = detection.record
+        what = "게임 오류 보고서" if record.summary.get("crash_from") == "report" else "REFramework 기록"
+        detail = "\n".join(x for x in (detail, f"{what}: {record.title()}") if x)
     if detection.crashed:
         return "Alert", detection.label, detail
     if detection.crashed is False:  # what was seen, not a verdict: a crash may end with code 0 too

@@ -688,7 +688,7 @@ def cmd_bisect(manager: ModManager, args) -> int:
                                      game_dir=manager.game_dir, context=manager.crash_context())
         detected = detection.label
         if detected:
-            print(f"REFramework 기록: {detected}")
+            print(f"게임 기록: {detected}")
     nxt = bisect.answer(manager, session, {"crashed": True, "fine": False}.get(args.action), detected)
     code = _maybe_deploy(manager, args) if isinstance(nxt, bisect.Step) else 0
     _print_bisect(manager, session, nxt)

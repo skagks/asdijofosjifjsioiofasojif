@@ -405,3 +405,58 @@ def test_a_real_crashing_process_on_windows():
     finally:
         child.wait(timeout=30)
     assert result is not None and result.code == 0xC0000005 and result.crashed and result.method == "handle"
+
+
+def test_a_crash_the_game_reported_itself_is_never_a_normal_exit(game, tmp_path):
+    """The game catches a graphics device error, writes CrashReport\\<time>.zip and ends with exit code 0:
+    REFramework recorded nothing, yet it crashed (and its mods are no last good set)."""
+    import zipfile
+
+    crash_dir = tmp_path / "data" / "crashes"
+    launched = datetime(2026, 10, 16, 15, 39, 0).timestamp()
+    mods = {"game_version": "v1", "mods": [{"id": "a", "name": "A", "enabled": True, "stamp": "1|"}]}
+    crashes.note_launch(crash_dir, mods, now=launched)
+    write(game / "re2_framework_log.txt", f"[{stamp(launched + 20)}] [REFramework] [info] REFramework entry\r\n")
+    exit_ = GameExit(42, 0, launched + 250, started=launched + 15)
+    # the report folder changed, but the zip is still being written: a crash already
+    (game / "CrashReport").mkdir()
+    (game / "CrashReport" / "2026_1016_1541.zip.tmp").write_bytes(b"")
+    os.utime(game / "CrashReport" / "2026_1016_1541.zip.tmp", (launched + 200, launched + 200))
+    (game / "CrashReport" / "2026_1001_0900.zip").write_bytes(b"")  # an old report: not this run's
+    os.utime(game / "CrashReport" / "2026_1001_0900.zip", (launched - 86400, launched - 86400))
+    d = gamewatch.after_exit(crash_dir, exit_, launched, game, mods, appdata="")
+    assert d.crashed is True and not d.normal and d.alarm
+    assert gamewatch.load_last_good(crash_dir) is None
+    # a last good set kept for a run the report later shows crashed (as before this fix) is forgotten
+    zipped = game / "CrashReport" / "2026_1016_1541.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:  # (no minidump: the time of its text counts)
+        written = zipfile.ZipInfo("CrashReport.txt", date_time=datetime.fromtimestamp(launched + 90).timetuple()[:6])
+        zf.writestr(written, "\tExceptionCode   : C0000005(EXCEPTION_ACCESS_VIOLATION)\r\nMessage : Fatal D3D "
+                    "error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0006)\r\n")
+    os.utime(zipped, (launched + 240, launched + 240))
+    import json
+    (crash_dir / gamewatch.LAST_GOOD_FILE).write_text(json.dumps({
+        "format": gamewatch.LAST_GOOD_FORMAT, "time": launched + 250, "started": launched + 15, "seconds": 235, "code": 0,
+        "context": mods}), encoding="utf-8")
+    crashes.collect(crash_dir, game, mods, appdata="")
+    assert gamewatch.load_last_good(crash_dir) is None and not (crash_dir / gamewatch.LAST_GOOD_FILE).exists()
+    # an earlier report does not make a later clean run a crash
+    (game / "CrashReport" / "2026_1016_1541.zip.tmp").unlink()
+    later = launched + 7200
+    d = gamewatch.detect(crash_dir, later, GameExit(43, 0, later + 900, started=later + 5), game, {}, appdata="")
+    assert d.crashed is False and d.normal
+
+
+def test_an_earlier_report_unpacked_during_a_run_is_not_this_run_s_crash(game, tmp_path):
+    crash_dir = tmp_path / "data" / "crashes"
+    launched = datetime(2026, 10, 16, 15, 39, 0).timestamp()
+    old = game / "CrashReport" / "2026_1015_2210"  # yesterday's report, unpacked during this run
+    write(old / "CrashReport.txt", "x")
+    os.utime(old, (launched + 100, launched + 100))
+    write(game / "CrashReport" / "2026_1016_1541 - copy.zip", "")  # (the name says when: during the run)
+    os.utime(game / "CrashReport" / "2026_1016_1541 - copy.zip", (launched - 86400, launched - 86400))
+    assert gamewatch.game_reported_since(game, launched, launched + 1200)
+    (game / "CrashReport" / "2026_1016_1541 - copy.zip").unlink()
+    assert not gamewatch.game_reported_since(game, launched, launched + 1200)
+    write(game / "CrashReport" / "2026_1017_0900.zip", "")  # a crash after this run ended (a wrong clock)
+    assert not gamewatch.game_reported_since(game, launched, launched + 1200)

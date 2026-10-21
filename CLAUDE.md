@@ -46,7 +46,8 @@
       올린다. 그래야 데이터 폴더 `cache\`의 예전 결과를 다시 만든다. 미리보기 캐시 폴더 이름에는 `PICTURE_FORMAT`과
       `SCAN_FORMAT`도 들어 있어(`ModManager.preview_formats`) 텍스처 해석이나 파일 규칙을 바꿔도 미리보기를 다시 그린다.
   - `mhwmm/crashlog.py`: REFramework 기록(re2_framework_log·reframework_faulty_files·re2_fw_config) 읽기, 게임 오류 창·
-    이벤트 뷰어 문구 인식. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사
+    이벤트 뷰어 문구 인식, 게임 자체 오류 보고서(`<게임>\CrashReport\*.zip`의 CrashReport.txt; 그래픽 장치 오류 등은 이것만 남고
+    게임은 종료 코드 0으로 끝남) 읽기. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사
     (최근 10개), 모드와 맞춰 보기(explain, 항상 '의심'과 근거), 진단 zip(사용자 이름 가림, state.json 제외). 창은 gui.py의
     CrashDialog. 실제 사용자 기록·덤프는 저장소에 넣지 않고 테스트는 직접 만든 가짜 기록으로 한다
   - `mhwmm/bisect.py`: 원인 모드 찾기. 다음 단계는 지금까지의 답만으로 다시 계산(`next_step`)하고, 진행 상황은 데이터 폴더
