@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from . import fsutil, matfix, nexus, requirements, steam
+from . import crashes, fsutil, matfix, nexus, requirements, steam
 from .analyzer import Variant, analyze, classify, list_files, package_name, raw_variant
 from .archive import extract, is_archive
 from .constants import GAME_EXE, NEXUS_SEARCH_URL, REFRAMEWORK_DLL, REFRAMEWORK_URL, REFW_ORIGIN
@@ -2204,3 +2204,85 @@ class ModManager:
         if not self.game_dir:
             return {}
         return self.deployer().load_manifest()["files"]
+
+    # ------------------------------------------------------------- game crash records (게임 튕김 기록)
+    @property
+    def crash_dir(self) -> Path:
+        return self.data_dir / crashes.CRASH_DIR
+
+    def crash_context(self, deployed: dict | None = None) -> dict:
+        """What a game session runs with, kept with its records: versions, profile, mods and which mod
+        placed each file outside natives\\ (plugins, scripts, PAKs: a crash record names them by path, and
+        they may be renumbered or gone by the time the record is read). ``deployed``: deployed_files()."""
+        from . import __version__
+
+        deployed = self.deployed_files() if deployed is None else deployed
+        return {"app": __version__, "game_version": self.game_version(), "profile": self.profile,
+                "mods": [{"id": m.id, "name": m.name, "enabled": m.enabled, "stamp": self._stamp(m)}
+                         for m in self.mods],
+                "owners": {e.get("path") or key: e["mod"] for key, e in deployed.items()
+                           if isinstance(e, dict) and e.get("mod") and not key.startswith("natives/")}}
+
+    def collect_crash_evidence(self, context: dict | None = None) -> list[crashes.Session]:
+        """Copy REFramework's records of the last game sessions before a game start overwrites them.
+        Thread-safe with ``context`` from crash_context (taken on the GUI thread)."""
+        if not self.game_dir:
+            return []
+        return crashes.collect(self.crash_dir, self.game_dir, context if context is not None else self.crash_context())
+
+    def note_launch(self) -> None:
+        """The game is being started from here: its session gets the mods it runs with."""
+        crashes.note_launch(self.crash_dir, self.crash_context())
+
+    def crash_sessions(self) -> list[crashes.Session]:
+        return crashes.sessions(self.crash_dir)
+
+    def crash_index(self, deployed: dict | None = None) -> crashes.ModIndex:
+        """The mods and deployed files to match crash records to (crashes.explain may then run on
+        another thread). Every mod's files are in it: a record is matched to the mods that were on when
+        it was written, which may be off now. ``deployed``: deployed_files()."""
+        mods = [crashes.ModRef(m.id, m.name, m.enabled, files=self.mod_files(m.id),
+                               material_state=self.material_state(m.id) if m.enabled else "",
+                               stuck=[i.get("label", "") for i in self.material_stuck(m.id)] if m.enabled else ())
+                for m in self.mods]
+        return crashes.ModIndex(self.game_dir, self.deployed_files() if deployed is None else deployed, mods)
+
+    def set_refw_option(self, key: str, value) -> bool:
+        """Change one REFramework setting (only while the game is closed: REFramework writes its whole
+        config file again while it runs). Returns False when it already had that value."""
+        if is_game_running():
+            raise DeployError("게임이 실행 중입니다. 게임을 종료한 뒤 다시 시도하세요.")
+        if not self.game_dir:
+            raise ValueError("게임 폴더가 설정되지 않았습니다.")
+        if isinstance(value, bool):
+            value = "true" if value else "false"  # as REFramework writes them
+        return crashes.set_refw_option(self.game_dir, key, value)
+
+    def crash_report_mods(self, kind_text=None) -> list[crashes.ReportMod]:
+        """The mods (in load order) for the support zip's report.txt."""
+        kind_text = kind_text or (lambda kinds: "+".join(sorted(kinds)))
+        rows = []
+        for m in self.mods:
+            options = [o["name"] for o in m.options if o["id"] in m.selected]
+            missing = [r["name"] for r in self.missing_requirements(m.id)] if m.enabled else []
+            rows.append(crashes.ReportMod(m.name, m.enabled, kind_text(self.mod_kinds(m.id)), m.version, m.nexus_id,
+                                          options, self.material_state(m.id), missing))
+        return rows
+
+    def export_crash_report(self, target: Path, session: crashes.Session | None,
+                            explanation: crashes.Explanation | None, mods: list[crashes.ReportMod], refw: str = "",
+                            extra: list[str] = (), include_dump: bool = False) -> Path:
+        """The zip for asking for help with a crash (crashes.write_report): report.txt, the session's
+        records, the end of manager.log and the deployed files. User names are masked and state.json
+        (the Nexus API key) is never in it. ``mods`` from crash_report_mods; thread-safe while the mods
+        do not change."""
+        from . import __version__
+
+        text = crashes.report_text(
+            app_version=__version__, game_dir=self.game_dir, game_version=self.game_version(),
+            steam=crashes.steam_info(self.game_dir), refw=refw or ("설치됨" if self.refw_installed() else "없음"),
+            profile=self.profile, mods=mods, verify=self.verify(), session=session, explanation=explanation,
+            extra=extra)
+        return crashes.write_report(target, text, [session] if session is not None else [],
+                                    manager_log=self.data_dir / "manager.log", deployed=self.deployed_files(),
+                                    names={m.id: m.name for m in self.mods}, include_dump=include_dump)

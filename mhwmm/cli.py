@@ -522,6 +522,71 @@ def cmd_equip_preview(manager: ModManager, args) -> int:
     return 0 if saved else 1
 
 
+def _print_findings(findings) -> None:
+    for f in findings:
+        print(f"• {f.text}")
+        for line in f.evidence[:3]:
+            print(f"    근거: {line}")
+
+
+def cmd_crash(manager: ModManager, args) -> int:
+    """게임 튕김 기록: copy REFramework's records of the last game sessions, list them, show what one points
+    at, save the support zip, or switch REFramework's Lua error logging."""
+    from . import crashes
+    from .crashlog import LUA_LOG_KEY
+
+    if args.action == "lua":
+        if args.ref not in (None, "on", "off"):
+            raise SystemExit("사용법: crash lua [on|off]")
+        if not manager.game_dir:
+            print("게임 폴더를 먼저 설정하세요: game <경로>", file=sys.stderr)
+            return 1
+        if args.ref is not None:
+            try:
+                changed = manager.set_refw_option(LUA_LOG_KEY, args.ref == "on")
+            except ValueError as exc:
+                print(f"오류: {exc}", file=sys.stderr)
+                return 1
+            print("REFramework 설정을 바꿨습니다." if changed else "이미 그렇게 설정되어 있습니다.")
+        on = crashes.lua_logging(manager.game_dir)
+        print(f"Lua 스크립트 오류 기록 ({LUA_LOG_KEY}): {'켜짐' if on else '꺼짐'}")
+        return 0
+    manager.collect_crash_evidence()
+    found = manager.crash_sessions()
+    if args.action == "list":
+        if not found:
+            print("모은 기록이 없습니다.")
+        for i, s in enumerate(found, 1):
+            print(f"{i:2d}. {s.id}  {s.title()}")
+        return 0
+    session = crashes.find_session(manager.crash_dir, args.ref) if args.ref else (found[0] if found else None)
+    if args.ref and session is None:
+        raise SystemExit(f"기록을 찾을 수 없습니다: {args.ref} (crash list로 번호를 확인하세요)")
+    index = manager.crash_index()
+    explanation = crashes.explain(session, index)
+    if args.action == "show":
+        if session is not None:
+            print(f"기록: {session.id}")
+        for line in explanation.lines():
+            print(line)
+        if args.text:
+            text = sys.stdin.read() if args.text == "-" else Path(args.text).read_text(encoding="utf-8",
+                                                                                       errors="replace")
+            pasted = crashes.explain_text(text, index, session)
+            print("\n붙여 넣은 문구에서 찾은 것:")
+            _print_findings(pasted)
+            if not pasted:
+                print("• 알아볼 수 있는 내용이 없습니다.")
+        return 0
+    out = Path(args.out or f"crash_report_{session.id if session else time.strftime('%Y%m%d-%H%M%S')}.zip")
+    if args.dump and (session is None or session.dump_path is None):
+        print("이 기록에는 크래시 덤프가 없습니다.", file=sys.stderr)
+    manager.export_crash_report(out, session, explanation, manager.crash_report_mods(_kinds),
+                                include_dump=args.dump)
+    print(f"저장했습니다: {out}")
+    return 0
+
+
 def cmd_game(manager: ModManager, args) -> int:
     path = Path(args.path) if args.path else manager.detect_game_dir()
     if path is None:
@@ -615,6 +680,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-test", type=int, nargs="?", const=SELFTEST_ITEMS, metavar="N",
                    help="게임의 장비 N개로 미리보기를 점검해 결과를 글로 출력 (그림은 저장하지 않음)")
 
+    p = sub.add_parser("crash", help="게임 튕김 기록: REFramework 기록 모으기 · 의심되는 원인 · 진단 파일")
+    p.add_argument("action", choices=("list", "show", "report", "lua"),
+                   help="list: 기록 목록 · show [번호]: 의심되는 원인 · report [번호] --out 파일.zip: 진단 파일 저장 · "
+                        "lua [on|off]: Lua 스크립트 오류 기록 (REFramework 설정, 게임이 꺼져 있을 때만)")
+    p.add_argument("ref", nargs="?", help="기록 번호(1 = 가장 최근) 또는 폴더 이름 · lua: on/off")
+    p.add_argument("--out", help="report: 저장할 zip 파일")
+    p.add_argument("--dump", action="store_true", help="report: 크래시 덤프 포함 (메모리 일부가 들어 있어 사용자 "
+                                                         "이름을 가리지 못함)")
+    p.add_argument("--text", metavar="파일", help="show: 게임 오류 창이나 이벤트 뷰어에서 복사한 문구 파일도 분석 "
+                                                "('-'는 표준 입력)")
+
     p = sub.add_parser("game", help="게임 폴더 설정 (경로 생략 시 자동 감지)")
     p.add_argument("path", nargs="?")
     p.add_argument("--force", action="store_true")
@@ -627,7 +703,7 @@ COMMANDS = {
     "nexus": cmd_nexus, "conflicts": cmd_conflicts, "enable": cmd_toggle, "disable": cmd_toggle,
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
-    "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview,
+    "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview, "crash": cmd_crash,
 }
 
 

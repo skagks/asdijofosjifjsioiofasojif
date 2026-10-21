@@ -45,5 +45,9 @@
       `icons.PICTURE_FORMAT`을, 미리보기 그림이 달라질 수 있는 변경(mesh.py, render.py, look.py)을 하면 `look.PREVIEW_FORMAT`을
       올린다. 그래야 데이터 폴더 `cache\`의 예전 결과를 다시 만든다. 미리보기 캐시 폴더 이름에는 `PICTURE_FORMAT`과
       `SCAN_FORMAT`도 들어 있어(`ModManager.preview_formats`) 텍스처 해석이나 파일 규칙을 바꿔도 미리보기를 다시 그린다.
+  - `mhwmm/crashlog.py`: REFramework 기록(re2_framework_log·reframework_faulty_files·re2_fw_config) 읽기, 게임 오류 창·
+    이벤트 뷰어 문구 인식. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사
+    (최근 10개), 모드와 맞춰 보기(explain, 항상 '의심'과 근거), 진단 zip(사용자 이름 가림, state.json 제외). 창은 gui.py의
+    CrashDialog. 실제 사용자 기록·덤프는 저장소에 넣지 않고 테스트는 직접 만든 가짜 기록으로 한다
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

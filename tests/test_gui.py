@@ -636,3 +636,175 @@ def test_gui_links_mods_from_file_names_and_reads_requirements(root, manager, tm
     app.tree.selection_set(plain.id)
     app._update_details()
     assert "연결 안 됨" in app.info_text.get("1.0", "end")
+
+
+def crash_log(game_dir, start: float, plugin=None) -> str:
+    """A REFramework log (CRLF, local times) with, for ``plugin``, a crash in it one minute in."""
+    from datetime import datetime
+
+    def rec(t, msg, level="info"):
+        return f"[{datetime.fromtimestamp(t):%Y-%m-%d %H:%M:%S}.000] [REFramework] [{level}] {msg}"
+
+    lines = [rec(start, "REFramework entry"), rec(start, f"Current game path: {game_dir}")]
+    if plugin is not None:
+        lines += [rec(start + 60, "Exception occurred: c0000005", "error"), rec(start + 60, "Call stack:", "error"),
+                  rec(start + 60, "", "error"), " KiUserExceptionDispatcher", r"  C:\WINDOWS\SYSTEM32\ntdll.dll + 0x165dee",
+                  "", " Unknown symbol", f"  {plugin} + 0x1234", "", rec(start + 60, f"Module: 7ff600000000 {plugin}", "error")]
+    else:
+        lines.append(rec(start + 60, "Hooked DirectX 12"))
+    return "\r\n".join(lines) + "\r\n"
+
+
+def test_gui_crash_records(root, manager, tmp_path, game_dir, monkeypatch):
+    import zipfile
+
+    import mhwmm.manager
+    from mhwmm import crashes, gui
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")  # REFramework's fallback folder of this PC is not part of the test
+    with manager.prepare_install(make_zip(tmp_path / "Boom.zip", {"reframework/plugins/Boom.dll": "dll"})) as s:
+        boom = manager.install_variant(s, s.variants[0])
+    manager.update_settings(nexus_api_key="SECRET-KEY")
+    manager.deploy()
+    write(game_dir / "dinput8.dll", "refw")
+    write(game_dir / "re2_fw_config.txt", "FontSize=16\r\nScriptRunner_LogToDisk=false\r\n")
+    write(game_dir / "re2_framework_log.txt",
+          crash_log(game_dir, time.time() - 600, game_dir / "reframework" / "plugins" / "Boom.dll"))
+
+    # at start the records are copied and the crash is told in a bar that blocks nothing (once)
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: bool(app.notice.winfo_manager()))
+    assert crashes.NOTICE_CRASH in app.notice_title.cget("text") and "0xC0000005" in app.notice_detail.cget("text")
+    (session,) = manager.crash_sessions()
+    assert session.problem() == "crash" and crashes.pending_notice(manager.crash_dir) is None
+
+    dialog = gui.CrashDialog(root, app.theme, manager, manager.crash_sessions())
+    pump(root, lambda: isinstance(dialog.explanation, crashes.Explanation))
+    shown = dialog.text.get("1.0", "end")
+    assert "플러그인 'Boom.dll'에서 오류가 났습니다 → 의심되는 모드 'Boom'" in shown
+    assert "근거: Exception occurred: c0000005" in shown and "0xC0000005" in dialog.summary.cget("text")
+    link = dialog.text.tag_ranges(f"mod:{boom.id}")  # the mod's name shows it in the list
+    assert link and dialog.text.get(*link[:2]) == "Boom"
+    assert "크래시 덤프" not in dialog.context_label.cget("text") and dialog.dump_check.instate(["disabled"])
+
+    # text pasted from the game's error window: what it gave is scrolled into view (below the session's)
+    dialog.text.configure(height=3)
+    dialog.deiconify()
+    dialog.paste.insert("1.0", "Fatal D3D error (6, E_OUTOFMEMORY, 0x8007000e)")
+    dialog.analyze()
+    pump(root, lambda: dialog.pasted is not None)
+    assert "붙여 넣은 문구에서 찾은 것" in dialog.text.get("1.0", "end") and "VRAM" in dialog.text.get("1.0", "end")
+    dialog.update()
+    assert dialog.text.yview()[0] > 0 and dialog.text.bbox(dialog.text.tag_ranges("heading")[0]) is not None
+    dialog.withdraw()
+
+    # REFramework's settings are not changed while the game runs (it writes them back from memory)
+    config = (game_dir / "re2_fw_config.txt").read_bytes()
+    monkeypatch.setattr(mhwmm.manager, "is_game_running", lambda: True)
+    dialog.lua_var.set(True)
+    dialog._toggle_lua()
+    pump(root, lambda: "바꾸지 못했습니다" in dialog.lua_note.cget("text"))
+    assert "게임이 실행 중입니다" in dialog.lua_note.cget("text") and not dialog.lua_var.get()
+    assert (game_dir / "re2_fw_config.txt").read_bytes() == config
+    monkeypatch.setattr(mhwmm.manager, "is_game_running", lambda: False)
+
+    # REFramework's Lua error logging: one line of its config changes (CRLF kept)
+    dialog.lua_var.set(True)
+    dialog._toggle_lua()
+    pump(root, lambda: "켰습니다" in dialog.lua_note.cget("text"))
+    assert (game_dir / "re2_fw_config.txt").read_bytes() == b"FontSize=16\r\nScriptRunner_LogToDisk=true\r\n"
+
+    # the support zip: the records, no state.json (the Nexus API key)
+    target = tmp_path / "out" / "report.zip"
+    target.parent.mkdir()
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **k: str(target))
+    dialog.save_report()
+    pump(root, lambda: target.is_file() and dialog.save_button.instate(["!disabled"]))
+    with zipfile.ZipFile(target) as zf:
+        names = zf.namelist()
+        everything = "".join(zf.read(n).decode("utf-8", "replace") for n in names)
+        report = zf.read("report.txt").decode("utf-8")
+    assert f"{session.id}/re2_framework_log.txt" in names and not any(n.endswith("state.json") for n in names)
+    assert "SECRET-KEY" not in everything and "[켜짐] Boom" in report and "Fatal D3D error" in report
+    dialog.destroy()
+
+    # the window from the menu; a click on a mod name selects it in the list. While it is open the
+    # manager's other events still come (a task finishing, the background material check...)
+    handled = []
+
+    def show(self):
+        app.events.put(("call", handled.append, "while open"))
+        pump(root, lambda: handled, timeout=3)
+        self.destroy()
+        return "show", boom.id
+
+    monkeypatch.setattr(gui.CrashDialog, "show", show)
+    app.show_crashes()
+    pump(root, lambda: app.tree.selection() == (boom.id,))
+    assert not app.notice.winfo_manager() and handled == ["while open"]
+    # an error opening it does not stop them either
+    real_sessions = manager.crash_sessions
+    monkeypatch.setattr(manager, "crash_sessions", lambda: (_ for _ in ()).throw(PermissionError("locked")))
+    monkeypatch.setattr(root, "report_callback_exception", lambda *a: handled.append("error"))
+    app.show_crashes()
+    pump(root, lambda: "error" in handled)
+    app.events.put(("call", handled.append, "after"))
+    pump(root, lambda: "after" in handled)
+    monkeypatch.setattr(manager, "crash_sessions", real_sessions)
+
+    # starting the game from here: the last game's records are copied first, the new one gets the mods
+    started = []
+    monkeypatch.setattr(gui.webbrowser, "open", lambda url: started.append(url))
+    monkeypatch.setattr(gui.os, "startfile", lambda url: started.append(url), raising=False)
+    write(game_dir / "re2_framework_log.txt", crash_log(game_dir, time.time() - 120))
+    asked = []  # nothing new to tell: no look at the running programs (tasklist) before the game starts
+    monkeypatch.setattr(gui, "is_game_running", lambda: asked.append(True) or False)
+    app.launch_game()
+    pump(root, lambda: bool(started))
+    assert len(manager.crash_sessions()) == 2 and asked == []
+    launch = (manager.crash_dir / crashes.LAUNCH_FILE).read_text(encoding="utf-8")
+    assert boom.id in launch
+
+
+def test_gui_crash_records_while_the_game_runs(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import crashes, gui
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: True)
+    with manager.prepare_install(make_zip(tmp_path / "Armor.zip", {"natives/STM/GameDesign/x.user.3": "u"})) as s:
+        manager.install_variant(s, s.variants[0])
+    manager.deploy()
+    # the game crashed, was started again from Steam and runs now: its record (with a file of the armor
+    # mod REFramework could not load) is not finished
+    write(game_dir / "re2_framework_log.prev.txt",
+          crash_log(game_dir, time.time() - 3600, game_dir / "MonsterHunterWilds.exe"))
+    write(game_dir / "re2_framework_log.txt", crash_log(game_dir, time.time() - 300))
+    write(game_dir / "reframework_faulty_files.txt", '"error" 2 "Invalid file" "GameDesign/x.user"\r\n')
+
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: bool(app.notice.winfo_manager()))
+    assert crashes.NOTICE_CRASH in app.notice_title.cget("text") and "0xC0000005" in app.notice_detail.cget("text")
+
+    seen = {}
+
+    def show(self):
+        seen["titles"] = [str(t) for t in self.picker["values"]]
+        seen["selected"] = self.picker.current()
+        pump(root, lambda: isinstance(self.explanation, crashes.Explanation))
+        seen["lead"] = self.explanation.findings[0].kind
+        self.picker.current(0)
+        self._explain()
+        pump(root, lambda: isinstance(self.explanation, crashes.Explanation))
+        seen["running"] = self.explanation.findings[0].text
+        self.destroy()
+
+    monkeypatch.setattr(gui.CrashDialog, "show", show)
+    app.show_crashes()
+    pump(root, lambda: "running" in seen)
+    assert "게임 실행 중" in seen["titles"][0] and "0xC0000005" in seen["titles"][1]
+    assert seen["selected"] == 1 and seen["lead"] == "game"  # the finished crash is shown first
+    assert seen["running"] == "게임이 실행 중입니다. 이 기록은 게임을 끈 뒤에 완성됩니다."

@@ -270,6 +270,9 @@ class Theme:
         for style, fg, bg, hover in (("Problem.TButton", p["danger"], p["problem_bg"], p["danger_bg"]),
                                      ("Conflict.TButton", p["warn"], p["warn_bg"], p["select"])):
             button(style, bg, fg, hover, hover, padding=(10, 3), font=f["small_bold"], width=-2)
+        # the notice bar under the toolbar (a crash record of the last game): its close button
+        button("CalloutClose.TButton", p["warn_bg"], p["muted"], p["select"], p["select"], padding=(8, 3), width=-2)
+        s.map("CalloutClose.TButton", foreground=[("active", p["text"])])
         # table of contents in the usage guide
         button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 8), width=-2)
         s.configure("Nav.TButton", anchor="w")

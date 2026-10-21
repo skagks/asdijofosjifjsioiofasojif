@@ -38,6 +38,8 @@ Nexus Mods 등에서 받은 모드 압축 파일을 끌어 놓기만 하면 설�
   없거나 꺼져 있으면 알려 줍니다.
 - **재질 복구 (MHW Mod Fixer 기능)**: 게임 업데이트로 재질(.mdf2)이나 .user·.pfb 파일 구조가 바뀌어 텍스처가 깨지거나
   게임이 멈추는 의상·무기 모드를 찾아 현재 게임에 맞게 그 자리에서 고칩니다. 모드의 원래 파일은 그대로 두고 언제든 되돌릴 수 있습니다.
+- **게임 튕김 기록**: 게임이 튕기면 REFramework가 남긴 기록(다음 실행 때 지워짐)을 미리 챙겨 두었다가, 어디서 오류가 났는지와
+  의심되는 모드를 근거와 함께 보여 줍니다. 게임 오류 창 문구를 붙여 넣어 분석하거나, 문제를 알릴 때 보낼 진단 파일(zip)을 만들 수 있습니다.
 - **안전한 적용/해제**
   - 게임 폴더에 넣은 파일을 모두 기록하고, 바뀐 부분만 복사·삭제·이름 변경합니다.
   - 모드가 원래 게임 파일을 덮어쓰면 백업해 두었다가 모드를 끌 때 복원합니다.
@@ -264,6 +266,42 @@ MH Wilds RSZ 덤프와 그 기록을 바탕으로 만들었습니다.
 적용 후 미리보기의 모델(.mesh) 구조와 재질 규칙은 REasy(Battlezone, MIT)를 바탕으로 했고, 3D 그리기는 이 프로그램을 위해
 순수 파이썬으로 새로 썼습니다.
 
+### 게임 튕김 기록 (게임이 튕길 때)
+
+게임이 바탕 화면으로 꺼지면 REFramework가 게임 폴더에 기록(`re2_framework_log.txt`, `reframework_crash.dmp`,
+`reframework_faulty_files.txt`)을 남깁니다. 이 기록은 게임을 다시 켤 때 지워지므로(2026-10-11 이후 REFramework는 바로 전
+기록 하나를 `re2_framework_log.prev.txt`로 남김), 이 프로그램은 **프로그램을 켤 때**와 **▶ 게임 실행으로 게임을 시작하기 직전에**
+기록을 데이터 폴더의 `crashes\`에 복사해 둡니다(최근 10개, 문제 없는 기록부터 정리). 복사만 하고 게임 폴더의 파일은 바꾸거나 지우지 않습니다.
+
+- 지난번 게임이 비정상적으로 종료됐으면 프로그램을 켤 때 목록 위에 알림이 뜹니다(작업을 막지 않음, 기록 하나에 한 번).
+  REFramework가 모드 파일을 읽지 못했을 때도 알립니다. **기록 보기** 또는 **☰ 메뉴 → 게임 튕김 기록**에서 볼 수 있습니다.
+- **의심되는 원인**에는 기록에서 찾은 것을 그 근거(기록의 해당 줄)와 함께 보여 줍니다. 모드를 단정하지 않고 "의심되는 모드"로만
+  말하며, 모드 이름을 누르면 목록에서 그 모드를 고릅니다.
+  - REFramework 플러그인(`reframework\plugins\*.dll`)이나 모드가 넣은 DLL에서 오류가 났으면 그 모드를 짚습니다.
+  - REFramework가 읽지 못한 파일(게임 업데이트 뒤 검은 화면 · 무한 로딩의 흔한 원인)은 그 파일이 들어 있는 모드를 찾습니다.
+    루스 파일은 경로로, PAK 모드는 PAK 안의 파일 이름 해시로 맞춰 보고, 어느 모드에도 없으면 직접 넣은 파일이 있는지
+    살펴봅니다. 모드 없이도 기록되는 경우가 있어 켜진 모드에 없는 게임 파일은 약하게 표시합니다. **재질 점검·복구**
+    버튼으로 그 모드를 바로 점검할 수 있습니다.
+  - 읽다가 멈춘 Lua 스크립트, 오류를 낸 스크립트, 적용되지 않은 PAK, 시작하지 못한 플러그인, 재질이 맞지 않는 모드도 알려 줍니다.
+  - 기록은 그 게임을 실행할 때 켜져 있던 모드와 게임 폴더에 넣어 둔 파일로 맞춰 봅니다. 그 뒤에 모드를 끄거나 새로 설치해도
+    지난 기록의 의심은 바뀌지 않으며, 지금 꺼져 있는 모드에는 "(지금은 꺼져 있음)"이 붙습니다.
+  - 게임 본체(`MonsterHunterWilds.exe`)나 그래픽(D3D12 · 드라이버)에서 오류가 났다고만 나오면 기록만으로는 모드를 알 수
+    없습니다(텍스처 · 모델 모드는 이름이 기록에 남지 않음). 이때는 모드를 절반씩 꺼 가며 실행해 좁혀 보세요.
+- 게임이 멈춰서 강제로 껐거나 게임이 자체 오류 창("RE ENGINE - Aborted", "Fatal D3D error")을 띄웠다면 REFramework 기록이
+  남지 않습니다. 오류 창이나 Windows 이벤트 뷰어 · 안정성 모니터의 문구를 **오류 창 문구** 칸에 붙여 넣으면 PAK 이름(`file looks corrupted`),
+  D3D 오류 번호, 오류가 난 모듈 등으로 원인을 찾아봅니다.
+- **Lua 스크립트 오류도 기록하기**를 켜면 REFramework 설정 파일(`re2_fw_config.txt`)의 `ScriptRunner_LogToDisk` 한 줄만 바꿔,
+  다음 실행부터 스크립트 오류가 기록에 남습니다. 게임이 켜져 있으면 REFramework가 설정을 덮어쓰므로 게임을 끈 뒤에만 바꿉니다.
+- **진단 파일 저장**은 모드 목록(순서 · 켜짐 · 옵션 · 재질 상태 · 없는 필수 모드), 적용 상태 점검, 게임 · REFramework 기록,
+  `manager.log`의 마지막 2000줄, 게임 폴더에 넣은 파일 목록을 zip 하나로 저장합니다. 경로의 사용자 이름(`C:\Users\<이름>`)은
+  가리고, Nexus API 키가 들어 있는 `state.json`은 넣지 않습니다. 크래시 덤프는 메모리 일부가 들어 있고 그 안의 사용자 이름은
+  가리지 못해 **크래시 덤프 포함**을 켰을 때만 넣습니다.
+- 매니저를 켜지 않은 채 Steam에서 게임을 다시 실행하면 튕긴 게임의 기록이 지워질 수 있습니다. 게임이 튕긴 뒤에는 먼저
+  이 프로그램을 켜거나 **▶ 게임 실행**으로 게임을 시작하세요.
+
+기록 형식은 [REFramework](https://github.com/praydog/REFramework)(praydog, MIT)의 소스를 바탕으로 읽습니다.
+REFramework 빌드마다 기록이 조금씩 달라 모르는 줄은 건너뜁니다.
+
 ### 모드를 전부 빼고 싶을 때
 
 **☰ 메뉴 → 게임 폴더에서 모든 모드 파일 제거**를 누르면 이 프로그램이 넣은 파일을 모두 지우고 백업해 둔 원본을
@@ -285,6 +323,7 @@ v1.2.1 이하에서 `%LOCALAPPDATA%\MHWildsModManager`에 쌓인 데이터는 v1
 - `mods\<id>\matfix\` : 재질 복구로 만든 파일 (모드의 원래 파일은 그대로)
 - `cache\` : 재질 점검에 쓰는 게임 파일 목록, 장비 외형에 쓰는 장비 이름과 미리보기 그림, 적용 후 미리보기 그림
   (게임이 업데이트되면 다시 만듦)
+- `crashes\` : 게임 튕김 기록 (게임 폴더에서 복사한 REFramework 기록, 최근 10개)
 - `state.json` : 모드 목록, 순서, 활성 상태, 설정
 - `deployment.json` : 게임 폴더에 넣은 파일 기록
 - `backups\` : 모드가 덮어쓴 원본 게임 파일
@@ -320,6 +359,10 @@ python -m mhwmm equipment --icons 아이콘.png  # 게임의 무기 아이콘 �
 python -m mhwmm equip-preview "모드 이름" weapon/09/000021/main 그림.png [--before] [--size 512]
                                              # 적용 후 3D 미리보기 그림 저장 (--before: 원래 모습도 그림-before.png로)
 python -m mhwmm equip-preview --self-test [N] # 게임의 장비 N개로 적용 후 미리보기 점검 (결과는 글로 출력)
+python -m mhwmm crash list                   # 게임 튕김 기록 목록 (REFramework 기록을 먼저 복사)
+python -m mhwmm crash show [번호] [--text 오류문구.txt]   # 의심되는 원인과 근거 (번호 1 = 가장 최근)
+python -m mhwmm crash report [번호] --out 진단.zip [--dump]   # 진단 파일 저장 (--dump: 크래시 덤프 포함)
+python -m mhwmm crash lua [on|off]           # Lua 스크립트 오류 기록 (REFramework 설정, 게임이 꺼져 있을 때만)
 python -m mhwmm deploy | purge | verify
 ```
 
@@ -356,6 +399,8 @@ python -m pytest
   장비 이름·그림 찾기, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처, `icons.py` 게임 아이콘·레어도 색,
   적용 후 미리보기: `mesh.py` 모델 읽기, `render.py` 3D 그리기, `look.py` 모드·게임 파일 고르기, `selftest.py` 점검),
   `mhwmm/equipview.py` : 장비 외형 창, `tools/make_equip_paths.py` : 장비 파일 목록(`equip_paths.txt.xz`) 다시 만들기
+- `mhwmm/crashlog.py` : REFramework 기록(로그 · 읽지 못한 파일 목록 · 설정)과 게임 오류 창 문구 읽기,
+  `mhwmm/crashes.py` : 게임 튕김 기록 모으기 · 모드와 맞춰 보기 · 진단 파일 (테스트는 직접 만든 가짜 기록으로)
 - `mhwmm/gui.py` : tkinter GUI, `mhwmm/theme.py` : 색상·글꼴·스타일, `mhwmm/cli.py` : 명령줄
 - `tools/make_assets.py` : 체크박스·스위치·아이콘 이미지 다시 만들기 (Pillow 필요)
 

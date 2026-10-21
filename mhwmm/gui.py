@@ -16,7 +16,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, fsutil, matfix, nexus, refw, steam, updater
+from . import __version__, crashes, crashlog, fsutil, matfix, nexus, refw, steam, updater
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL,
@@ -24,7 +24,7 @@ from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MO
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .helptext import SECTIONS as HELP_SECTIONS
 from .manager import (InstallError, InstallSession, MaterialJob, MaterialRun, Mod, ModManager,
-                      acquire_instance_lock, prepare_data_dir, resolve_data_dir, setup_logging)
+                      acquire_instance_lock, is_game_running, prepare_data_dir, resolve_data_dir, setup_logging)
 from .matfix import MatfixError
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
 from .updater import Release, UpdateError
@@ -846,6 +846,411 @@ class SettingsDialog(Dialog):
         self.destroy()
 
 
+FINDING_COLORS = {"high": "danger", "medium": "warn", "low": "subtle", "info": "info"}  # the dot before a finding
+PASTE_HINT = "게임 오류 창(RE ENGINE - Aborted, Fatal D3D error 등)이나 Windows 이벤트 뷰어의 문구를 붙여 넣으면 분석합니다."
+
+
+def session_context_text(session) -> str:
+    """How a session was started and what was on, in a line (게임 튕김 기록 window)."""
+    if session is None:
+        return ""
+    context = session.context
+    mods = context.get("mods") if isinstance(context.get("mods"), list) else None
+    on = sum(1 for m in mods or () if isinstance(m, dict) and m.get("enabled"))
+    if session.launched:
+        parts = ["매니저에서 실행"]
+        if context.get("profile"):
+            parts.append(f"프로필 {context['profile']}")
+        if mods is not None:
+            parts.append(f"켜진 모드 {on}개")
+    else:
+        parts = ["매니저 밖에서 실행했거나 실행 기록 없음"]
+        if mods is not None:
+            parts.append(f"기록을 모을 때 켜진 모드 {on}개")
+    if session.dump_path is not None:
+        parts.append("크래시 덤프 있음")
+    return " · ".join(parts)
+
+
+class CrashDialog(Dialog):
+    """게임 튕김 기록: the kept game sessions and what each one's records point at, text pasted from an
+    error window, REFramework's Lua error logging and the support zip. Matching the records to the mods
+    reads paks, so it runs off the GUI thread. Result: ("show", mod id), ("matfix", [mod ids]),
+    ("refw",) or None."""
+
+    def __init__(self, parent, theme: Theme, manager: ModManager, sessions: list, selected=None,
+                 builds: list | None = None, refw_text: str = "", live: str = ""):
+        super().__init__(parent, theme, crashes.TITLE)
+        px, f, p = theme.px, theme.fonts, theme.p
+        self.manager = manager
+        self.sessions = sessions
+        self.builds = builds
+        self.refw_text = refw_text
+        self.live = live  # start of the session of the game running now (its records are not finished)
+        self.explanation = None  # crashes.Explanation of the shown session (None while it is read)
+        self.pasted: list | None = None  # findings in the pasted text (None: nothing analysed)
+        self.pasted_text = ""
+        self._show_paste = False  # scroll to what the pasted text gave once it is shown
+        self._events: queue.Queue = queue.Queue()
+        self._jobs: dict[str, int] = {}  # kind -> number of the latest job (older results are dropped)
+        self._poll_id = None
+        self._links = False  # mod names in the findings are links
+        self._saving = False  # the support zip is being written
+        wrap = px(640)
+
+        ttk.Label(self.body, text=crashes.TITLE, style="DialogTitle.TLabel").pack(anchor="w")
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", pady=(px(10), 0))
+        self.session_var = tk.StringVar()
+        if sessions:
+            ttk.Label(row, text="기록").pack(side="left", padx=(0, px(10)))
+            titles = [f"{i}. {s.title(running=self._running(s))}" for i, s in enumerate(sessions, 1)]
+            self.picker = ttk.Combobox(row, textvariable=self.session_var, values=titles, state="readonly", width=58)
+            self.picker.pack(side="left")
+            if selected is not None:
+                index = next((i for i, s in enumerate(sessions) if s.id == selected.id), 0)
+            else:  # the newest finished one (not the game running now)
+                index = next((i for i, s in enumerate(sessions) if not self._running(s)), 0)
+            self.picker.current(index)
+            self.picker.bind("<<ComboboxSelected>>", lambda e: (self.picker.selection_clear(), self._explain()))
+            ttk.Button(row, text="기록 폴더 열기", style="Link.TButton", command=self._open_folder).pack(side="right")
+        self.summary = ttk.Label(self.body, text="", wraplength=wrap, justify="left")
+        self.summary.pack(anchor="w", pady=(px(10), 0))
+        self.context_label = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                                       justify="left")
+        self.context_label.pack(anchor="w", pady=(px(2), 0))
+
+        ttk.Label(self.body, text=crashes.SUSPECTS_HEADER, style="DialogSection.TLabel").pack(
+            anchor="w", pady=(px(14), px(4)))
+        card = theme.mark(tk.Frame(self.body), "card")
+        card.pack(fill="both", expand=True)
+        self.actions = ttk.Frame(card, style="Card.TFrame", padding=(px(16), px(2), px(12), px(10)))
+        lines = 9 if self.winfo_screenheight() >= px(900) else 6  # the window fits a 768-pixel screen
+        self.text = theme.mark(tk.Text(card, wrap="word", width=80, height=lines, font=f["base"], padx=px(16),
+                                       pady=px(10), cursor="arrow", spacing1=px(2)), "text")
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=autohide(sb, side="right", fill="y"))
+        self.text.pack(side="left", fill="both", expand=True)
+        t = self.text
+        t.tag_configure("finding", lmargin1=0, lmargin2=px(20), tabs=(px(20),), spacing1=px(8))
+        t.tag_configure("lead", font=f["bold"])
+        t.tag_configure("evidence", foreground=p["muted"], font=f["small"], lmargin1=px(20), lmargin2=px(20))
+        t.tag_configure("heading", foreground=p["accent"], font=f["small_bold"], spacing1=px(14))
+        t.tag_configure("muted", foreground=p["muted"])
+        t.tag_configure("link", foreground=p["accent"], underline=True)
+        t.tag_bind("link", "<Enter>", lambda e: t.configure(cursor="hand2"))
+        t.tag_bind("link", "<Leave>", lambda e: t.configure(cursor="arrow"))
+        t.tag_bind("link", "<Button-1>", self._on_link)
+        for level, color in FINDING_COLORS.items():
+            t.tag_configure(f"dot_{level}", foreground=p[color], font=f["bold"])
+
+        ttk.Label(self.body, text="오류 창 문구", style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+        ttk.Label(self.body, text=PASTE_HINT, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                  justify="left").pack(anchor="w", pady=(0, px(6)))
+        row = ttk.Frame(self.body)
+        row.pack(fill="x")
+        paste_card = theme.mark(tk.Frame(row), "card")
+        paste_card.pack(side="left", fill="x", expand=True)
+        self.paste = theme.mark(tk.Text(paste_card, height=2, width=60, wrap="word", font=f["small"], padx=px(10),
+                                        pady=px(6), undo=True), "text")
+        self.paste.pack(fill="both", expand=True)
+        self.paste.bind("<<Paste>>", lambda e: self.after(50, self.analyze), add="+")
+        self.analyze_button = ttk.Button(row, text="문구 분석", command=self.analyze)
+        self.analyze_button.pack(side="left", anchor="n", padx=(px(8), 0))
+
+        refw_ready = bool(manager.game_dir) and (manager.refw_installed() or crashes.config_path(manager.game_dir).is_file())
+        self.lua_var = tk.BooleanVar(value=refw_ready and crashes.lua_logging(manager.game_dir))
+        self.lua_check = theme.checkbutton(self.body, crashes.LUA_LOG_CHECKBOX, self.lua_var, command=self._toggle_lua)
+        self.lua_check.pack(anchor="w", pady=(px(12), 0))
+        self.lua_note = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                                  justify="left")
+        if not refw_ready:
+            self.lua_check.state(["disabled"])
+            self._lua_note("REFramework가 설치되어 있지 않습니다.")
+
+        ttk.Separator(self.body).pack(fill="x", pady=(px(14), px(10)))
+        ttk.Label(self.body, text=crashes.REPORT_NOTE, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                  justify="left").pack(anchor="w")
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", pady=(px(6), 0))
+        self.dump_var = tk.BooleanVar(value=False)
+        self.dump_check = theme.checkbutton(row, crashes.DUMP_CHECKBOX, self.dump_var)
+        self.dump_check.pack(side="left")
+        ttk.Button(row, text="닫기", command=self.cancel).pack(side="right")
+        self.save_button = ttk.Button(row, text="진단 파일 저장", style="Accent.TButton", command=self.save_report)
+        self.save_button.pack(side="right", padx=(0, px(8)))
+        self._explain()
+
+    # ---- background work
+    def _run(self, kind: str, func):
+        """Run ``func`` on another thread; its result (or exception) reaches _done on this one."""
+        job = self._jobs[kind] = self._jobs.get(kind, 0) + 1
+
+        def worker():
+            try:
+                result = func()
+            except Exception as exc:  # shown in the window
+                if not isinstance(exc, EXPECTED_ERRORS):
+                    log.error("게임 기록을 읽다가 오류가 났습니다:\n%s", traceback.format_exc())
+                result = exc
+            self._events.put((kind, job, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        if self._poll_id is None:
+            self._poll_id = self.after(60, self._poll)
+
+    def _poll(self):
+        self._poll_id = None
+        try:
+            while self.winfo_exists():
+                kind, job, result = self._events.get_nowait()
+                if job == self._jobs.get(kind):
+                    self._done(kind, result)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self._poll_id = self.after(60, self._poll)
+
+    def destroy(self):
+        if self._poll_id is not None:
+            self.after_cancel(self._poll_id)
+            self._poll_id = None
+        super().destroy()
+
+    def _done(self, kind: str, result):
+        if kind == "explain":
+            self.explanation = result
+            self._render()
+        elif kind == "paste":
+            self.pasted = result
+            self._render()
+        elif kind == "lua":
+            self._lua_done(*(result if isinstance(result, tuple) else (self.lua_var.get(), result)))
+        elif kind == "report":
+            self._saving = False
+            self.save_button.configure(text="진단 파일 저장")
+            self.save_button.state(["!disabled"])
+            if isinstance(result, Exception):
+                log.error("진단 파일을 만들지 못했습니다: %s", result)
+                messagebox.showerror(crashes.TITLE, f"진단 파일을 만들지 못했습니다:\n{result}", parent=self)
+            else:
+                log.info("게임 튕김 진단 파일을 저장했습니다: %s", result)
+                messagebox.showinfo(crashes.TITLE, f"저장했습니다:\n{result}", parent=self)
+
+    # ---- the shown session
+    def _running(self, session) -> bool:
+        return bool(self.live) and session is not None and session.started == self.live
+
+    def _session(self):
+        if not self.sessions:
+            return None
+        index = self.picker.current() if self.picker.current() >= 0 else 0
+        return self.sessions[index]
+
+    def _open_folder(self):
+        session = self._session()
+        try:
+            if session is not None:
+                fsutil.open_in_explorer(session.folder)
+        except OSError as exc:
+            messagebox.showerror(crashes.TITLE, f"폴더를 열지 못했습니다: {exc}", parent=self)
+
+    def _explain(self):
+        session = self._session()
+        running = self._running(session)
+        self.explanation = None
+        self._show_paste = False  # another session: from the top
+        if session is None:
+            self.summary.configure(text="모은 기록이 없습니다. 매니저를 켤 때와 매니저에서 게임을 실행할 때 REFramework "
+                                        "기록을 챙겨 둡니다.", style="Muted.TLabel")
+        else:
+            self.summary.configure(text=session.title(running=running), style="TLabel")
+        self.context_label.configure(text=session_context_text(session))
+        has_dump = session is not None and session.dump_path is not None
+        self.dump_check.state(["!disabled"] if has_dump else ["disabled"])
+        if not has_dump:
+            self.dump_var.set(False)
+        if not self._saving:
+            self.save_button.state(["disabled"])
+        self._render()
+        index, builds = self.manager.crash_index(), self.builds
+        self._run("explain", lambda: crashes.explain(session, index, builds, running=running))
+        if self.pasted_text:
+            self._analyze(self.pasted_text)
+
+    def analyze(self):
+        """Look at the text pasted from an error window."""
+        text = self.paste.get("1.0", "end-1c").strip()
+        if text == self.pasted_text and self.pasted is not None:
+            return
+        self.pasted_text = text
+        if not text:
+            self.pasted = None
+            self._render()
+            return
+        self._show_paste = True
+        self._analyze(text)
+
+    def _analyze(self, text: str):
+        session, index = self._session(), self.manager.crash_index()
+        self._run("paste", lambda: crashes.explain_text(text, index, session))
+
+    # ---- what is shown
+    def _finding(self, finding, lead: bool = False):
+        t = self.text
+        t.insert("end", "●", ("finding", f"dot_{finding.level}" if finding.level in FINDING_COLORS else "dot_info"))
+        start = t.index("end-1c")
+        t.insert("end", "\t" + finding.text + "\n", ("finding", "lead") if lead else ("finding",))
+        installed = {m.id: m.name for m in self.manager.mods}
+        for mod_id in finding.mods:  # the mod's name (always in quotes) shows it in the list
+            name = installed.get(mod_id)
+            if not name:
+                continue
+            pos = start
+            while True:
+                pos = t.search(f"'{name}'", pos, stopindex="end", exact=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(name) + 2}c"
+                t.tag_add("link", f"{pos}+1c", f"{end}-1c")
+                t.tag_add(f"mod:{mod_id}", f"{pos}+1c", f"{end}-1c")
+                self._links = True
+                pos = end
+        for line in finding.evidence[:3]:
+            t.insert("end", f"근거: {line}\n", ("evidence",))
+
+    def _on_link(self, event):
+        for tag in self.text.tag_names(f"@{event.x},{event.y}"):
+            if tag.startswith("mod:"):
+                self.finish(("show", tag[4:]))
+                return
+
+    def _render(self):
+        t = self.text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        for tag in t.tag_names():
+            if tag.startswith("mod:"):
+                t.tag_delete(tag)
+        self._links = False
+        e = self.explanation
+        if e is None:
+            t.insert("end", "기록을 읽는 중...\n", ("muted",))
+        elif isinstance(e, Exception):
+            t.insert("end", f"기록을 읽지 못했습니다: {e}\n", ("muted",))
+        else:
+            if e.summary:
+                self.summary.configure(text=e.summary, style="TLabel")
+            for i, finding in enumerate(e.findings):
+                self._finding(finding, lead=i == 0)
+            if not e.findings:
+                t.insert("end", "찾은 것이 없습니다.\n", ("muted",))
+        if self.pasted is not None:
+            t.insert("end", "붙여 넣은 문구에서 찾은 것\n", ("heading",))
+            if isinstance(self.pasted, Exception):
+                t.insert("end", f"문구를 분석하지 못했습니다: {self.pasted}\n", ("muted",))
+            for finding in self.pasted if isinstance(self.pasted, list) else ():
+                self._finding(finding)
+            if self.pasted == []:
+                t.insert("end", "알아볼 수 있는 내용이 없습니다. 오류 창의 문구를 고치지 말고 그대로 붙여 넣어 주세요.\n",
+                         ("muted",))
+        t.delete("end-2c", "end-1c")  # no empty line at the end
+        t.configure(state="disabled")
+        heading = t.tag_ranges("heading")
+        if self._show_paste and self.pasted is not None and heading:  # below the session's findings: show it
+            t.see("end")
+            t.see(heading[0])
+        self._fill_actions()
+        if e is not None and not self._saving:  # also without findings: the zip has the mods and the logs
+            self.save_button.state(["!disabled"])
+
+    def _findings(self) -> list:
+        found = list(self.explanation.findings) if isinstance(self.explanation, crashes.Explanation) else []
+        return found + (list(self.pasted) if isinstance(self.pasted, list) else [])
+
+    def _fill_actions(self):
+        """Buttons for what may help (the material repair, a REFramework update) under the findings."""
+        for child in self.actions.winfo_children():
+            child.destroy()
+        px = self.theme.px
+        findings = self._findings()
+        installed = {m.id for m in self.manager.mods}
+        matfix_ids = list(dict.fromkeys(i for f in findings if f.action == "matfix" for i in f.mods if i in installed))
+        refw_update = any(f.action == "update_refw" for f in findings)
+        if self._links:
+            ttk.Label(self.actions, text="모드 이름을 누르면 목록에서 그 모드를 보여 줍니다.", style="CardMuted.TLabel",
+                      font=self.theme.fonts["small"]).pack(side="left")
+        if refw_update:
+            ttk.Button(self.actions, text="REFramework 확인", style="Compact.TButton",
+                       command=lambda: self.finish(("refw",))).pack(side="right", padx=(px(6), 0))
+        if matfix_ids:
+            ttk.Button(self.actions, text="재질 점검·복구", style="Compact.TButton",
+                       command=lambda: self.finish(("matfix", matfix_ids))).pack(side="right", padx=(px(6), 0))
+        if self.actions.winfo_children():
+            if not self.actions.winfo_manager():
+                self.actions.pack(side="bottom", fill="x", before=self.text)
+        else:
+            self.actions.pack_forget()
+
+    def finish(self, result):
+        self.result = result
+        self.destroy()
+
+    # ---- REFramework's Lua error logging
+    def _lua_note(self, text: str):
+        self.lua_note.configure(text=text)
+        if not self.lua_note.winfo_manager():
+            self.lua_note.pack(anchor="w", padx=(self.theme.px(30), 0), after=self.lua_check)
+
+    def _toggle_lua(self):
+        """Switch ScriptRunner_LogToDisk in REFramework's config: the user ticked the box; only while
+        the game is closed (REFramework writes its config again while it runs)."""
+        want = self.lua_var.get()
+        self.lua_check.state(["disabled"])
+        self._lua_note("REFramework 설정을 바꾸는 중...")
+
+        def work():
+            try:
+                self.manager.set_refw_option(crashlog.LUA_LOG_KEY, want)
+            except (DeployError, ValueError, OSError) as exc:
+                return want, exc
+            return want, None
+
+        self._run("lua", work)
+
+    def _lua_done(self, want: bool, error):
+        self.lua_check.state(["!disabled"])
+        if error is not None:
+            self.lua_var.set(not want)
+            self._lua_note(f"바꾸지 못했습니다: {error}")
+            return
+        log.info("REFramework 설정: Lua 스크립트 오류 기록 %s (%s)", "켬" if want else "끔", crashlog.LUA_LOG_KEY)
+        self._lua_note("켰습니다. 다음에 게임을 실행할 때부터 Lua 스크립트 오류가 REFramework 기록에 남습니다." if want
+                       else "껐습니다. REFramework의 기본 설정입니다.")
+
+    # ---- the support zip
+    def save_report(self):
+        session = self._session()
+        stamp = session.id if session is not None else time.strftime("%Y%m%d-%H%M%S")
+        path = filedialog.asksaveasfilename(parent=self, title="진단 파일 저장", defaultextension=".zip",
+                                            initialfile=f"게임튕김기록_{stamp}.zip", filetypes=[("zip", "*.zip")])
+        if not path:
+            return
+        mods = self.manager.crash_report_mods(kinds_text)
+        extra = []
+        if self.pasted_text:
+            extra = ["[붙여 넣은 오류 창 문구]", self.pasted_text[:4000], ""]
+            for finding in self.pasted if isinstance(self.pasted, list) else ():
+                extra += [f"• {finding.text}", *(f"    근거: {e}" for e in finding.evidence[:3])]
+        explanation = self.explanation if isinstance(self.explanation, crashes.Explanation) else None
+        include_dump = self.dump_var.get() and session is not None and session.dump_path is not None
+        self._saving = True
+        self.save_button.configure(text="저장 중...")
+        self.save_button.state(["disabled"])
+        self._run("report", lambda: self.manager.export_crash_report(
+            Path(path), session, explanation, mods, self.refw_text, extra, include_dump))
+
+
 class App:
     MUTATING_OK_DURING = (None, "deploy")
 
@@ -883,6 +1288,9 @@ class App:
         self._equip_again = False
         self._matfix_again = False  # ... and another one was asked for meanwhile
         self._offer_scheduled = False
+        self._launching = False  # copying the last game's records before starting the game
+        self._notice_session: str | None = None  # the crash record the notice bar tells about
+        self._live_record = ""  # start of the record of the game running now (from the last collect)
 
         self.theme = Theme(root, manager.settings.theme)
         self.theme.mark(root, "window")
@@ -899,6 +1307,7 @@ class App:
         self._build_statusbar()
         self._build_log()
         self._build_main()
+        self._build_notice()
         root.update_idletasks()
         root.minsize(max(px(980), self.toolbar.winfo_reqwidth()), px(620))  # the whole toolbar stays visible
         self._configure_tags()
@@ -1028,6 +1437,7 @@ class App:
         m.add_separator()
         m.add_command(label="게임에 적용", accelerator="Ctrl+S", command=self.apply)
         m.add_command(label="적용 상태 점검", command=self.verify)
+        m.add_command(label=crashes.TITLE, command=self.show_crashes)
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
         m.add_command(label="장비 외형 보기", command=lambda: self.show_equipment())
         m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
@@ -1116,6 +1526,20 @@ class App:
         self.log_text.configure(yscrollcommand=autohide(lsb, side="right", fill="y", padx=(0, px(3)), pady=px(3)),
                                 state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
+
+    def _build_notice(self):
+        """A bar under the toolbar, shown when the last game ended in a crash (it does not block anything)."""
+        t, px = self.theme, self.theme.px
+        self.notice = ttk.Frame(self.root, style="Callout.TFrame", padding=(px(16), px(8), px(8), px(8)))
+        self.notice_title = ttk.Label(self.notice, text="", style="CalloutTitle.TLabel")
+        self.notice_title.pack(side="left")
+        self.notice_detail = ttk.Label(self.notice, text="", style="Callout.TLabel")
+        self.notice_detail.pack(side="left", padx=(px(12), 0))
+        close = ttk.Button(self.notice, text="✕", style="CalloutClose.TButton", command=self._hide_notice)
+        close.pack(side="right")
+        Tooltip(t, close, "알림 닫기 (기록은 ☰ → 게임 튕김 기록에서 다시 볼 수 있습니다)")
+        ttk.Button(self.notice, text="기록 보기", style="Update.TButton",
+                   command=lambda: self.show_crashes(self._notice_session)).pack(side="right", padx=(0, px(6)))
 
     def _build_main(self):
         t, px = self.theme, self.theme.px
@@ -2609,8 +3033,9 @@ class App:
                     self._after_task()
         except queue.Empty:
             pass
-        if not self._closed:
-            self.root.after(80, self._poll_events)
+        finally:  # also after a handler failed: the events after it still come
+            if not self._closed:
+                self.root.after(80, self._poll_events)
 
     def _after_task(self):
         if self._closed:
@@ -2643,6 +3068,7 @@ class App:
         if not m.game_dir.is_dir():
             log.warning("게임 폴더가 없습니다: %s", m.game_dir)
             return
+        self.collect_crashes()  # before anything is applied: the records go with the mods as they are
         try:
             problems = m.verify(include_outdated=False)
             outdated = m.outdated_paks()
@@ -2702,6 +3128,7 @@ class App:
             self.request_apply()
             self.check_materials_background()
             self.warm_equipment()
+            self.collect_crashes()
 
         self.run_task("game", "게임 폴더 변경 중...", lambda p: self.manager.set_game_dir(path, p), on_done=done)
 
@@ -2985,6 +3412,19 @@ class App:
 
     # ------------------------------------------------------------------ misc actions
     def launch_game(self):
+        """Start the game: first copy the last game's REFramework records (starting the game overwrites
+        them), then apply what is left to apply."""
+        if self._launching:
+            return
+        self._launching = True
+        if self.busy is None:
+            self.status_var.set("게임 기록 확인 중...")
+        self.collect_crashes(self._continue_launch)
+
+    def _continue_launch(self):
+        self._launching = False
+        if self.busy is None:
+            self.status_var.set("준비")
         m = self.manager
         if m.game_dir and not m.dirty and m.outdated_paks():
             log.warning("게임이 읽지 않는 예전 방식의 PAK이 있어 %s 폴더로 옮깁니다.", PAK_MODS_DIR)
@@ -3004,6 +3444,7 @@ class App:
 
     def _start_game(self):
         url = f"steam://rungameid/{STEAM_APP_ID}"
+        self.manager.note_launch()  # the session this starts gets the mods it runs with
         try:
             if sys.platform == "win32":
                 os.startfile(url)  # type: ignore[attr-defined]
@@ -3461,6 +3902,99 @@ class App:
             self._changed(select=mod_id)
         else:
             self.refresh(select=mod_id)
+
+    # ------------------------------------------------------------------ crash records (게임 튕김 기록)
+    def collect_crashes(self, then=None, notice: bool = True):
+        """Copy REFramework's records of the last game sessions in the background (a game start overwrites
+        them) and tell about a new crash in the notice bar (``notice``; else, for the 게임 튕김 기록 window,
+        find which record is the running game's); ``then`` runs on this thread afterwards."""
+        m = self.manager
+        if not m.game_dir or not m.game_dir.is_dir():
+            if then is not None:
+                then()
+            return
+        try:
+            deployed = m.deployed_files()
+            context = m.crash_context(deployed)
+            index = m.crash_index(deployed) if notice else None
+        except Exception as exc:  # never in the way of starting the game
+            log.warning("게임 기록을 모으지 못했습니다: %s", exc)
+            if then is not None:
+                then()
+            return
+
+        def worker():
+            pending, live = None, ""
+            try:
+                m.collect_crash_evidence(context)
+                if notice:
+                    pending = crashes.pending_notice(m.crash_dir, index=index)
+                # the running game's own record is not finished: not told about (nor explained) until it ends
+                if (pending is not None or not notice) and is_game_running():
+                    live = crashes.live_started(m.game_dir)
+                    if pending is not None and pending.started == live:
+                        pending = crashes.pending_notice(m.crash_dir, index=index, skip_started=live)
+            except Exception as exc:  # never in the way of starting the game
+                log.warning("게임 기록을 모으지 못했습니다: %s", exc)
+            self.events.put(("call", self._crashes_collected, pending, live, then))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _crashes_collected(self, pending, live, then):
+        if self._closed:
+            return
+        self._live_record = live
+        if then is not None:  # outside the event pump: a window opened there would hold up every other event
+            self.root.after_idle(lambda: None if self._closed else then())
+        if pending is not None:
+            try:
+                self._show_notice(pending)
+            except Exception:
+                log.exception("게임 기록 알림을 보이지 못했습니다.")
+
+    def _show_notice(self, session):
+        """The notice bar about a crash (or files the game could not load), told once per record."""
+        px = self.theme.px
+        crashes.mark_notified(self.manager.crash_dir, session)
+        self._notice_session = session.id
+        self.notice_title.configure(text="⚠  " + crashes.notice_text(session))
+        self.notice_detail.configure(text=session.title())
+        if not self.notice.winfo_manager():
+            self.notice.pack(fill="x", padx=px(20), pady=(px(10), 0), before=self.paned)
+        log.warning("%s (%s) ☰ → %s에서 볼 수 있습니다.", crashes.notice_text(session), session.title(), crashes.TITLE)
+
+    def _hide_notice(self):
+        self.notice.pack_forget()
+
+    def show_crashes(self, select: str | None = None):
+        """The 게임 튕김 기록 window (after copying records not copied yet)."""
+        if self._modal_open():
+            return
+        if self.busy is None:
+            self.status_var.set("게임 기록 확인 중...")
+        self.collect_crashes(lambda: self._open_crashes(select), notice=False)
+
+    def _open_crashes(self, select: str | None):
+        if self.busy is None:
+            self.status_var.set("준비")
+        if self._modal_open():
+            return
+        self._hide_notice()
+        sessions = self.manager.crash_sessions()
+        selected = next((s for s in sessions if s.id == select), None) if select else None
+        status = self._refw_status
+        dialog = CrashDialog(self.root, self.theme, self.manager, sessions, selected,
+                             builds=status.builds if status else None,
+                             refw_text=refw.describe_installed(status) if status else "", live=self._live_record)
+        result = dialog.show()
+        if not result:
+            return
+        if result[0] == "show":
+            self.show_mod(result[1])
+        elif result[0] == "matfix":
+            self.check_materials(result[1])
+        elif result[0] == "refw":
+            self._on_refw_click()
 
     # ------------------------------------------------------------------ closing
     def on_close(self):

@@ -466,3 +466,40 @@ def test_settings_type_checks(manager):
 
     s = _from_dict(Settings, {"sash_ratio": 1, "remember_window": "yes", "window_geometry": 5})
     assert s.sash_ratio == 1.0 and s.remember_window is True and s.window_geometry == ""
+
+
+def test_crash_records_keep_the_mods_they_ran_with(manager, tmp_path, game_dir, monkeypatch):
+    """A record names the mod of a crashing plugin after that mod is turned off (or its PAK renumbered)."""
+    import time
+    from datetime import datetime
+
+    from mhwmm import crashes
+
+    monkeypatch.setenv("APPDATA", "")
+    with manager.prepare_install(make_zip(tmp_path / "Boom.zip", {"reframework/plugins/Boom.dll": "dll"})) as s:
+        boom = manager.install_variant(s, s.variants[0])
+    with manager.prepare_install(make_zip(tmp_path / "Armor.zip", {"natives/STM/GameDesign/a.user.3": "u"})) as s:
+        armor = manager.install_variant(s, s.variants[0])
+    manager.deploy()
+    manager.note_launch()  # started from the manager
+    start = time.time() - 60
+    plugin = game_dir / "reframework" / "plugins" / "Boom.dll"
+
+    def rec(msg):
+        return f"[{datetime.fromtimestamp(start):%Y-%m-%d %H:%M:%S}.000] [REFramework] [error] {msg}"
+
+    write(game_dir / "re2_framework_log.txt", "\r\n".join([
+        rec(f"Current game path: {game_dir}"), rec("Exception occurred: c0000005"),
+        rec(f"Module: 7ff600000000 {plugin}")]) + "\r\n")
+    write(game_dir / "reframework_faulty_files.txt", '"error" 2 "Invalid file" "GameDesign/a.user"\r\n')
+    (session,) = manager.collect_crash_evidence()
+    assert session.context["owners"] == {"reframework/plugins/Boom.dll": boom.id}  # (natives\ left out)
+    before = crashes.explain(session, manager.crash_index())
+    for mod in (boom, armor):
+        manager.set_enabled(mod.id, False)
+    manager.deploy()
+    assert not plugin.exists()
+    after = crashes.explain(session, manager.crash_index())
+    assert after.suspects == before.suspects == [boom.id, armor.id]
+    assert after.findings[0].text == "플러그인 'Boom.dll'에서 오류가 났습니다 → 의심되는 모드 'Boom' (지금은 꺼져 있음)"
+    assert "'Armor' (지금은 꺼져 있음)의 a.user" in next(f.text for f in after.findings if f.kind == "faulty")
