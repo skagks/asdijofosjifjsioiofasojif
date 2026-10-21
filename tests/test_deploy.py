@@ -147,6 +147,35 @@ def test_user_modified_config_is_kept(tmp_path, game_dir):
     assert r.copied == 0
     d.run([])
     assert not cfg.exists()
+    # kept aside while the mod is off, and back when it is on again (still the user's after that)
+    assert (tmp_path / "data/edited/reframework/data/a/config.json").read_text() == "user settings"
+    d.run([a])
+    assert cfg.read_text() == "user settings" and not (tmp_path / "data/edited").exists()
+    d.run([])
+    d.run([a])
+    assert cfg.read_text() == "user settings"
+    # an update of the mod brings its new copy
+    d.run([])
+    touch_later(a.files_dir / "reframework/data/a/config.json", "default 2")
+    d.run([a])
+    assert cfg.read_text() == "default 2" and not (tmp_path / "data/edited").exists()
+
+
+def test_an_edited_file_under_another_mod_s_and_a_removed_mod(tmp_path, game_dir):
+    a = mod(tmp_path, "a", {"reframework/data/shared.ini": "a", "natives/STM/a.tex": "a"})
+    b = mod(tmp_path, "b", {"reframework/data/shared.ini": "b"})
+    d = Deployer(game_dir, tmp_path / "data")
+    d.run([a])
+    ini = game_dir / "reframework/data/shared.ini"
+    touch_later(ini, "a, edited")
+    d.run([a, b])  # b's copy wins now: a's edited one is kept aside, not lost
+    assert ini.read_text() == "b"
+    d.run([a])
+    assert ini.read_text() == "a, edited"
+    d.run([], installed={"b"})  # (a is uninstalled: nothing of it is kept)
+    assert not ini.exists() and not (tmp_path / "data/edited").exists()
+    d.run([a])
+    assert ini.read_text() == "a"
 
 
 def test_externally_deleted_file_is_restored(tmp_path, game_dir):

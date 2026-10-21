@@ -2166,9 +2166,10 @@ class ModManager:
     def run_deploy(self, sources: list[ModSource], progress: ProgressFn | None = None) -> DeployReport:
         """Thread-safe part of a deploy: only touches the game folder and the manifest."""
         deployer = self.deployer()
+        installed = {m.id for m in list(self.mods)}  # (a mod installed meanwhile has nothing kept yet)
         if self.settings.check_game_running and is_game_running():
             raise DeployError("게임이 실행 중입니다. 게임을 종료한 뒤 다시 시도하세요.")
-        return deployer.run(sources, progress)
+        return deployer.run(sources, progress, installed)
 
     def finish_deploy(self, report: DeployReport, revision: int) -> None:
         if not report.errors and revision == self.revision:
@@ -2205,6 +2206,13 @@ class ModManager:
             return {}
         return self.deployer().load_manifest()["files"]
 
+    def deployed_backups(self) -> dict:
+        """Game files kept aside because a mod's file took their place ({key: {"path", "backup"}}); each
+        comes back when no enabled mod places that file any more."""
+        if not self.game_dir:
+            return {}
+        return self.deployer().load_manifest()["backups"]
+
     # ------------------------------------------------------------- game crash records (게임 튕김 기록)
     @property
     def crash_dir(self) -> Path:
@@ -2213,12 +2221,14 @@ class ModManager:
     def crash_context(self, deployed: dict | None = None) -> dict:
         """What a game session runs with, kept with its records: versions, profile, mods and which mod
         placed each file outside natives\\ (plugins, scripts, PAKs: a crash record names them by path, and
-        they may be renumbered or gone by the time the record is read). ``deployed``: deployed_files()."""
+        they may be renumbered or gone by the time the record is read). The chosen options' names let
+        원인 모드 찾기 see what changed since the last normal exit. ``deployed``: deployed_files()."""
         from . import __version__
 
         deployed = self.deployed_files() if deployed is None else deployed
         return {"app": __version__, "game_version": self.game_version(), "profile": self.profile,
-                "mods": [{"id": m.id, "name": m.name, "enabled": m.enabled, "stamp": self._stamp(m)}
+                "mods": [{"id": m.id, "name": m.name, "enabled": m.enabled, "stamp": self._stamp(m),
+                          "options": [o["name"] for o in m.options if o["id"] in m.selected]}
                          for m in self.mods],
                 "owners": {e.get("path") or key: e["mod"] for key, e in deployed.items()
                            if isinstance(e, dict) and e.get("mod") and not key.startswith("natives/")}}
@@ -2231,8 +2241,14 @@ class ModManager:
         return crashes.collect(self.crash_dir, self.game_dir, context if context is not None else self.crash_context())
 
     def note_launch(self) -> None:
-        """The game is being started from here: its session gets the mods it runs with."""
-        crashes.note_launch(self.crash_dir, self.crash_context())
+        """The game is being started from here: its session gets the mods it runs with (a step of 원인
+        모드 찾기 is marked: its mods are not the user's own setup, even if the search ends meanwhile)."""
+        from . import bisect
+
+        context = self.crash_context()
+        if bisect.active(self.data_dir):
+            context["bisect"] = True
+        crashes.note_launch(self.crash_dir, context)
 
     def crash_sessions(self) -> list[crashes.Session]:
         return crashes.sessions(self.crash_dir)

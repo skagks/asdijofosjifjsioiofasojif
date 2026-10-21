@@ -10,6 +10,9 @@ manifest of the previous run and only performs the difference:
   name order, so later files take priority.
 * Game files that a mod overwrites are backed up and restored when no longer needed.
 * A manifest entry whose file changed on disk is re-checked before touching it.
+* A mod file changed in the game folder (settings a script saved, an edited .ini) is not
+  thrown away when its mod goes off: it is kept in ``edited/`` of the data folder and put back
+  when the same file of the same mod is placed again (an update of the mod drops it).
 * Older versions renamed PAKs into the patch chain in the game folder.  The next run
   moves those to ``pak_mods``; one that a game update overwrote with its own patch is
   left alone as a game file.
@@ -32,6 +35,7 @@ log = logging.getLogger(__name__)
 ProgressFn = Callable[[int, int, str], None]
 MANIFEST_VERSION = 1
 TMP_SUFFIX = ".mhwmm-tmp"
+EDITED_DIR = "edited"  # in the data folder: mod files the user changed, while their mod is off
 
 
 def path_key(rel: str) -> str:
@@ -114,6 +118,7 @@ class Deployer:
         self.game_dir = Path(game_dir)
         self.manifest_path = Path(data_dir) / "deployment.json"
         self.backup_dir = Path(data_dir) / "backups"
+        self.edited_dir = Path(data_dir) / EDITED_DIR
 
     # ------------------------------------------------------------------ manifest
     def load_manifest(self) -> dict:
@@ -126,6 +131,8 @@ class Deployer:
             data["files"] = {}
         if not isinstance(data.get("backups"), dict):
             data["backups"] = {}
+        if not isinstance(data.get("edited"), dict):
+            data["edited"] = {}  # key -> {"path", "backup", "mod", "src", "src_size", "src_mtime"}
         return data
 
     def _save(self, manifest: dict) -> None:
@@ -169,6 +176,30 @@ class Deployer:
         report.backed_up += 1
         log.info("기존 파일 백업: %s", rel)
 
+    @staticmethod
+    def _user_edited(entry: dict, state: str | None) -> bool:
+        """A placed mod file that is not the mod's own copy any more (not a PAK: those are not edited)."""
+        return not entry.get("pak") and (state == "modified" or bool(entry.get("edited")))
+
+    def _stash(self, key: str, entry: dict, edited: dict) -> None:
+        """Keep a mod file changed in the game folder aside (instead of deleting it): it comes back
+        when the same file of the same mod is placed again."""
+        old = edited.pop(key, None)
+        if old:
+            fsutil.remove_file(self.edited_dir / old["backup"])
+        rel = entry["path"]
+        fsutil.move_file(self._target(rel), self.edited_dir / rel)
+        edited[key] = {"path": rel, "backup": rel, "mod": entry.get("mod"), "src": entry.get("src"),
+                       "src_size": entry.get("src_size"), "src_mtime": entry.get("src_mtime")}
+        log.info("사용자가 바꾼 모드 파일을 따로 보관합니다 (모드를 다시 켜면 되돌립니다): %s", rel)
+
+    def _drop_stash(self, key: str, edited: dict, why: str) -> None:
+        old = edited.pop(key, None)
+        if old:
+            fsutil.remove_file(self.edited_dir / old["backup"])
+            fsutil.prune_empty_dirs((self.edited_dir / old["backup"]).parent, self.edited_dir.parent)
+            log.info("보관해 둔 모드 파일을 지웁니다 (%s): %s", why, old.get("path"))
+
     def verify(self, include_outdated: bool = True) -> list[str]:
         """Problems with deployed files, without changing anything."""
         manifest = self.load_manifest()
@@ -192,19 +223,25 @@ class Deployer:
                 if is_chain_pak(e) and self._entry_state(e) == "ok"]
 
     # ------------------------------------------------------------------ deploy
-    def run(self, sources: list[ModSource], progress: ProgressFn | None = None) -> DeployReport:
-        """Make the game folder match ``sources`` (in load order, last one wins)."""
+    def run(self, sources: list[ModSource], progress: ProgressFn | None = None,
+            installed: set[str] | None = None) -> DeployReport:
+        """Make the game folder match ``sources`` (in load order, last one wins). ``installed``: ids
+        of every installed mod (the kept edits of other mods are dropped)."""
         report = DeployReport()
         manifest = self.load_manifest()
         self._check_game_dir(manifest)
         files: dict = manifest["files"]
         backups: dict = manifest["backups"]
+        edited: dict = manifest["edited"]
         progress = progress or (lambda done, total, msg: None)
 
         try:
+            if installed is not None:
+                for key in [k for k, e in edited.items() if not isinstance(e, dict) or e.get("mod") not in installed]:
+                    self._drop_stash(key, edited, "모드를 지움")
             status = self._reconcile(files, backups, report)
             desired = self._desired(sources, files, status, report)
-            self._apply(desired, files, backups, status, report, progress)
+            self._apply(desired, files, backups, edited, status, report, progress, installed)
         finally:
             self._save(manifest)
         return report
@@ -279,8 +316,12 @@ class Deployer:
     def _identity(item: dict) -> tuple:
         return (item["mod"], item["src"], item["src_size"], item["src_mtime"])
 
-    def _apply(self, desired: dict, files: dict, backups: dict, status: dict,
-               report: DeployReport, progress: ProgressFn) -> None:
+    @staticmethod
+    def _identity_of(kept: dict) -> tuple:
+        return (kept.get("mod"), kept.get("src"), kept.get("src_size"), kept.get("src_mtime"))
+
+    def _apply(self, desired: dict, files: dict, backups: dict, edited: dict, status: dict,
+               report: DeployReport, progress: ProgressFn, installed: set[str] | None = None) -> None:
         to_place = []
         for key, item in desired.items():
             entry = files.get(key)
@@ -320,15 +361,18 @@ class Deployer:
             done += 1
             progress(done, total, entry["path"])
 
-        # 2) remove files that are no longer wanted
+        # 2) remove files that are no longer wanted (one changed in the game folder is kept aside)
         for key in to_remove:
             entry = files.get(key)
             if entry is None:
                 continue
-            if status.get(key) == "modified":
-                log.info("수정된 모드 파일을 삭제합니다: %s", entry["path"])
             try:
-                fsutil.remove_file(self._target(entry["path"]))
+                if self._user_edited(entry, status.get(key)) and (installed is None or entry.get("mod") in installed):
+                    self._stash(key, entry, edited)
+                else:
+                    if status.get(key) == "modified":
+                        log.info("수정된 모드 파일을 삭제합니다: %s", entry["path"])
+                    fsutil.remove_file(self._target(entry["path"]))
             except OSError as exc:
                 report.errors.append(f"{entry['path']} 삭제 실패: {exc}")
                 continue
@@ -338,18 +382,33 @@ class Deployer:
             done += 1
             progress(done, total, entry["path"])
 
-        # 3) place new or changed files
+        # 3) place new or changed files (or the changed copy kept aside while the mod was off)
         for key in to_place:
             item = desired[key]
             rel = item["path"]
             target = self._target(rel)
+            from_stash = False
             try:
                 if key in files:
-                    fsutil.remove_file(target)
+                    entry = files[key]
+                    if entry.get("mod") != item["mod"] and self._user_edited(entry, status.get(key)) and \
+                            (installed is None or entry.get("mod") in installed):
+                        self._stash(key, entry, edited)  # another mod's file goes there now
+                    else:
+                        fsutil.remove_file(target)
                     del files[key]
                 elif fsutil.exists(target):
                     self._backup(key, rel, backups, report)
-                if key in relocate:
+                kept = edited.get(key)
+                if kept and self._identity_of(kept) == self._identity(item) and \
+                        fsutil.exists(self.edited_dir / kept["backup"]):
+                    fsutil.move_file(self.edited_dir / kept["backup"], target)
+                    del edited[key]
+                    fsutil.prune_empty_dirs((self.edited_dir / kept["backup"]).parent, self.edited_dir.parent)
+                    log.info("보관해 둔 모드 파일을 되돌립니다: %s", rel)
+                    from_stash = True
+                    report.copied += 1
+                elif key in relocate:
                     entry = files.pop(relocate[key])
                     fsutil.makedirs(target.parent)
                     fsutil.replace_file(self._target(entry["path"]), target)
@@ -357,6 +416,8 @@ class Deployer:
                     dirs_to_prune.add(self._target(entry["path"]).parent)
                     log.info("PAK 이름 변경: %s -> %s", entry["path"].removesuffix(TMP_SUFFIX), rel)
                 else:
+                    if kept and kept.get("mod") == item["mod"]:  # the mod was updated: its new copy instead
+                        self._drop_stash(key, edited, "모드가 바뀜")
                     fsutil.copy_file(item["src_path"], target)
                     report.copied += 1
             except OSError as exc:
@@ -373,6 +434,8 @@ class Deployer:
                 "mtime": st.st_mtime_ns if st else -1,
                 "pak": item["pak"],
             }
+            if from_stash:
+                files[key]["edited"] = True  # not the mod's copy, though it reads as unchanged now
             done += 1
             progress(done, total, rel)
 

@@ -808,3 +808,519 @@ def test_gui_crash_records_while_the_game_runs(root, manager, tmp_path, game_dir
     assert "게임 실행 중" in seen["titles"][0] and "0xC0000005" in seen["titles"][1]
     assert seen["selected"] == 1 and seen["lead"] == "game"  # the finished crash is shown first
     assert seen["running"] == "게임이 실행 중입니다. 이 기록은 게임을 끈 뒤에 완성됩니다."
+
+
+# ---- 원인 모드 찾기 ----------------------------------------------------------------------------------
+def bisect_mods(manager, tmp_path):
+    """REFramework and three plain mods, applied."""
+    ids = {}
+    for name, files in (("REFramework", {"dinput8.dll": "MZ"}), ("Armor A", {"natives/STM/a.tex": "a"}),
+                        ("Armor B", {"natives/STM/b.tex": "b"}), ("Armor C", {"natives/STM/c.tex": "c"})):
+        with manager.prepare_install(make_zip(tmp_path / "zips" / f"{name}.zip", files)) as s:
+            ids[name] = manager.install_variant(s, s.variants[0]).id
+    manager.deploy()
+    return ids
+
+
+def texts(widget):
+    """Every label's and button's text in a window."""
+    out = []
+    for child in widget.winfo_children():
+        try:
+            out.append(str(child.cget("text")))
+        except tk.TclError:
+            pass
+        out += texts(child)
+    return out
+
+
+class FakeGame:
+    """The game's processes for the watcher (as gamewatch.ProcessApi; the Windows API in the app): each
+    launch starts one that ends after ``run`` seconds of real time with the exit code ``code_for()``
+    gives at its start (the test pumps the event loop meanwhile)."""
+
+    def __init__(self, game_dir, code_for, run=0.3):
+        import threading
+
+        self.game_dir, self.code_for, self.run = game_dir, code_for, run
+        self.procs = {}
+        self.lock = threading.Lock()
+
+    def launch(self, url=None, run=None):
+        now = time.time()
+        with self.lock:
+            pid = 1000 + len(self.procs)
+            self.procs[pid] = {"created": now, "ended": now + (self.run if run is None else run),
+                               "code": self.code_for()}
+        return pid
+
+    def alive(self, pid):
+        return time.time() < self.procs[pid]["ended"]
+
+    def find(self, exe_name):
+        with self.lock:
+            return [pid for pid, p in self.procs.items() if p["created"] <= time.time() < p["ended"]]
+
+    def open(self, pid):
+        return pid
+
+    def image_path(self, pid):
+        return str(self.game_dir / "MonsterHunterWilds.exe")
+
+    def times(self, pid):
+        p = self.procs[pid]
+        return p["created"], None if self.alive(pid) else p["ended"]
+
+    def wait(self, pid, ms):
+        left = self.procs[pid]["ended"] - time.time()
+        if left > 0:
+            time.sleep(min(ms / 1000, left, 0.05))
+        return not self.alive(pid)
+
+    def exit_code(self, pid):
+        return 259 if self.alive(pid) else self.procs[pid]["code"]
+
+    def close(self, pid):
+        pass
+
+
+def watch_fast(watcher, game):
+    """The app's watcher on a FakeGame, looking often and not waiting for a relaunch."""
+    watcher.api, watcher.poll, watcher.relaunch_seconds, watcher.relaunch_wait = game, 0.05, 0, 0.1
+
+
+def launcher(monkeypatch, game=None):
+    """steam:// opens (and starts ``game``) here: the launches, in order."""
+    from mhwmm import gui
+
+    started = []
+
+    def start(url):
+        started.append(url)
+        if game is not None:
+            game.launch(url)
+
+    monkeypatch.setattr(gui.webbrowser, "open", start)
+    monkeypatch.setattr(gui.os, "startfile", start, raising=False)
+    return started
+
+
+def test_gui_bisect_finds_the_mod_and_goes_back(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import bisect, gamewatch, gui
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    ids = bisect_mods(manager, tmp_path)
+    manager.update_settings(auto_apply=False, apply_before_launch=False)  # the steps are applied anyway
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    # the game crashes (0xC0000005) when Armor B is in the game folder; the watcher sees it end
+    game = FakeGame(game_dir, lambda: 0xC0000005 if (game_dir / "natives/STM/b.tex").exists() else 0)
+    watch_fast(app.watcher, game)
+
+    seen = {}
+
+    def start_show(self):
+        seen["start"] = texts(self)
+        self.destroy()
+        return True
+
+    monkeypatch.setattr(gui.BisectStartDialog, "show", start_show)
+    app.show_bisect()  # ☰ → 원인 모드 찾기
+    pump(root, lambda: app._bisect is not None and app.busy is None and not manager.dirty)
+    assert any("켜져 있는 모드 4개 중" in t for t in seen["start"])
+    assert any("계속 켜 둘 모드: REFramework" in t for t in seen["start"])
+    assert manager.profile == bisect.TEMP_PROFILE and app.bisect_bar.winfo_manager() == "pack"
+    assert app.bisect_title.cget("text").startswith("원인 찾기 1/")
+    assert "적용했습니다" in app.bisect_text.cget("text")
+    assert app.bisect_main.cget("text") == "▶  " + bisect.BUTTON_LAUNCH
+    assert "원인 찾기 (임시)" in app.profile_button.cget("text")
+
+    started = launcher(monkeypatch, game)
+    asked = []
+
+    def ask_show(self):
+        on = {m.id for m in manager.mods if m.enabled}
+        asked.append((self.default, ids["Armor B"] in on))
+        self.destroy()
+        return "crashed" if ids["Armor B"] in on else "fine"
+
+    def result_show(self):
+        seen["result"] = texts(self)
+        self.destroy()
+        return "disable", self.mods
+
+    monkeypatch.setattr(gui.BisectAskDialog, "show", ask_show)
+    monkeypatch.setattr(gui.BisectResultDialog, "show", result_show)
+    for _ in range(14):
+        if app._bisect is None:
+            break
+        n = len(started)
+        pump(root, lambda: not app.watcher.busy)
+        app.launch_game()  # ▶ 게임 실행: the watcher finds the game, and asks when it ends
+        pump(root, lambda: len(started) > n)
+        assert app._bisect.awaiting_answer and app.bisect_main.cget("text") == gui.BISECT_ANSWER
+        assert app.bisect_text.cget("text") == gui.BISECT_PLAYING
+        on = {m.id for m in manager.mods if m.enabled}
+        assert (game_dir / "natives/STM/b.tex").exists() == (ids["Armor B"] in on)  # the step is in the game folder
+        pump(root, lambda: len(asked) > n and app.busy is None and not app._apply_pending)
+    # only a crash the manager saw is the answer picked first (an exit with code 0 is not taken as fine)
+    assert asked and all(default == ("crashed" if crash else None) for default, crash in asked)
+    assert any("원인으로 보이는 모드: Armor B" in t for t in seen["result"])
+    assert app._bisect is None and not app.bisect_bar.winfo_manager() and not bisect.active(manager.data_dir)
+    pump(root, lambda: app.busy is None and not manager.dirty)
+    assert manager.profile == "기본" and list(manager.profiles) == ["기본"]
+    assert not manager.get(ids["Armor B"]).enabled and manager.get(ids["Armor A"]).enabled
+    assert not (game_dir / "natives/STM/b.tex").exists() and (game_dir / "natives/STM/a.tex").exists()
+    # the steps were not the user's setup: no last good set from them, and no crash notice either
+    assert not (manager.crash_dir / gamewatch.LAST_GOOD_FILE).exists() and not app.notice.winfo_manager()
+
+    # outside a search: a crash is told in the notice bar; with no record of it, its button finds the mod
+    game.code_for = lambda: 0xC0000409
+    pump(root, lambda: not app.watcher.busy)
+    app.launch_game()
+    pump(root, lambda: bool(app.notice.winfo_manager()))
+    assert "비정상적으로 종료" in app.notice_title.cget("text") and "0xC0000409" in app.notice_detail.cget("text")
+    assert app.notice_button.cget("text") == bisect.TITLE
+    now = time.time()
+    app._on_game_exit(gamewatch.GameExit(8, 0, now, now - 1200))  # a normal exit keeps its mods as the last good set
+    pump(root, lambda: (manager.crash_dir / gamewatch.LAST_GOOD_FILE).exists())
+    good = gamewatch.load_last_good(manager.crash_dir)
+    assert good["code"] == 0 and {m["id"] for m in good["context"]["mods"] if m["enabled"]} == \
+        {ids["REFramework"], ids["Armor A"], ids["Armor C"]}
+
+
+def test_gui_bisect_waits_for_changes_and_goes_on_after_a_restart(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import bisect, gui
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    ids = bisect_mods(manager, tmp_path)
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    # while the search is being prepared (its plan holds the mods' state) nothing changes either
+    app._bisect_preparing = True
+    app.toggle([ids["Armor A"]])
+    assert manager.get(ids["Armor A"]).enabled and app.status_var.get() == bisect.BLOCKED
+    app._bisect_preparing = False
+    monkeypatch.setattr(gui.BisectStartDialog, "show", lambda self: (self.destroy(), True)[1])
+    app._open_bisect_start(bisect.prepare(manager), False, "")
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+
+    # what would change the mods the search turns on and off waits until it ends
+    told, opened = [], []
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a, **k: told.append(a[1]))
+    monkeypatch.setattr(gui.TextDialog, "show", lambda self: (opened.append("text"), self.destroy(), None)[2])
+    monkeypatch.setattr(gui.filedialog, "askdirectory", lambda *a, **k: opened.append("folder") or "")
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: opened.append("ask") or False)
+    monkeypatch.setattr(manager, "detect_game_dir", lambda: opened.append("detect"))
+    enabled = {m.id: m.enabled for m in manager.mods}
+    order = [m.id for m in manager.mods]
+    app.tree.selection_set(ids["Armor C"])
+    app.toggle([ids["Armor A"]])
+    app.move_selected(-1)
+    app._set_options(ids["Armor C"], [])
+    app.set_enabled_all(False)
+    app.switch_profile("기본")
+    app.add_paths([str(tmp_path / "zips" / "Armor A.zip")])
+    app.remove_selected()
+    app.purge()
+    for action in (lambda: app.new_profile(True), app.rename_profile, app.delete_profile, app.browse_game,
+                   app.detect_game, lambda: app.install_refw(None)):
+        action()
+    assert {m.id: m.enabled for m in manager.mods} == enabled and [m.id for m in manager.mods] == order
+    assert manager.profile == bisect.TEMP_PROFILE and not app._install_queue and manager.get(ids["Armor C"])
+    assert told == [bisect.BLOCKED] * 11 and app.status_var.get() == bisect.BLOCKED and not opened
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: True)
+
+    # the step's game is started, then the manager is closed; the game crashes meanwhile
+    started = launcher(monkeypatch)
+    app.launch_game()
+    pump(root, lambda: bool(started))
+    session = app._bisect
+    session.mark_launched(time.time() - 300)
+    write(game_dir / "re2_framework_log.txt",
+          crash_log(game_dir, time.time() - 290, game_dir / "MonsterHunterWilds.exe"))
+    app._destroy()
+
+    root2 = tk.Tk()
+    try:
+        asked = []
+
+        def ask_show(self):
+            asked.append((self.default, texts(self)))
+            self.destroy()
+            return None  # answered later, from the bar
+
+        monkeypatch.setattr(gui.BisectAskDialog, "show", ask_show)
+        app2 = gui.App(root2, manager.__class__(manager.data_dir), queue.Queue())
+        pump(root2, lambda: bool(asked))
+        m2 = app2.manager
+        assert app2._bisect is not None and app2.bisect_bar.winfo_manager() == "pack"
+        default, shown = asked[0]
+        assert default == "crashed" and any("비정상 종료를 확인했습니다 (0xC0000005)" in t for t in shown)
+        assert app2._bisect.awaiting_answer and app2.bisect_main.cget("text") == gui.BISECT_ANSWER
+        assert not app2.notice.winfo_manager()  # the crash of a step is the search's own question
+        app2._answer_bisect(True, "비정상 종료를 확인했습니다 (0xC0000005)")
+        assert app2._bisect.steps[-1]["crashed"] and app2._bisect.steps[-1]["detected"].endswith("(0xC0000005)")
+        pump(root2, lambda: app2.busy is None and not m2.dirty and not app2._apply_pending)
+
+        # a game update stops the search; its window takes the user back to the profile
+        write(game_dir / "re_chunk_000.pak.sub_000.pak.patch_002.pak", "update")
+        results = []
+
+        def result_show(self):
+            results.append(texts(self))
+            self.destroy()
+            return ("restore",)
+
+        monkeypatch.setattr(gui.BisectResultDialog, "show", result_show)
+        app2.launch_game()
+        pump(root2, lambda: bool(results) and app2.busy is None and not m2.dirty)
+        assert any("게임이 업데이트되어" in t for t in results[0]) and len(started) == 1
+        assert m2.profile == "기본" and all(m.enabled for m in m2.mods) and app2._bisect is None
+        assert (game_dir / "natives/STM/a.tex").exists() and (game_dir / "natives/STM/b.tex").exists()
+        app2._destroy()
+    finally:
+        gc.collect()
+        try:
+            root2.destroy()
+        except tk.TclError:
+            pass
+
+
+def test_gui_bisect_from_the_crash_records(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import bisect, gamewatch, gui
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    bisect_mods(manager, tmp_path)
+    write(game_dir / "re2_framework_log.txt", crash_log(game_dir, time.time() - 600, game_dir / "MonsterHunterWilds.exe"))
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: bool(app.notice.winfo_manager()))
+    (record,) = manager.crash_sessions()
+
+    dialog = gui.CrashDialog(root, app.theme, manager, manager.crash_sessions())
+    assert gui.bisect.TITLE in texts(dialog)
+    dialog._bisect()  # its 원인 모드 찾기 button
+    assert dialog.result == ("bisect", record.id)
+
+    seen = []
+
+    def start_show(self):
+        seen.append(texts(self))
+        self.destroy()
+        return None  # 취소
+
+    monkeypatch.setattr(gui.BisectStartDialog, "show", start_show)
+    monkeypatch.setattr(gui.CrashDialog, "show", lambda self: (self.destroy(), ("bisect", record.id))[1])
+    app.show_crashes()
+    pump(root, lambda: bool(seen))
+    assert any(t == f"게임 튕김 기록: {record.title()}" for t in seen[0]) and app._bisect is None
+    assert manager.profile == "기본" and not bisect.active(manager.data_dir)
+
+    # the texts of how a step's game ended
+    now = time.time()
+    crash = gamewatch.Detection(True, "c0000005", gamewatch.GameExit(1, 0xC0000005, now, now - 573), record)
+    style, head, detail = gui.exit_summary(crash)
+    assert (style, head) == ("Alert", "비정상 종료를 확인했습니다 (0xC0000005)")
+    assert "종료 코드 0xC0000005 (메모리 접근 오류) · 9분 33초 실행" in detail and "REFramework 기록: " in detail
+    normal = gamewatch.Detection(False, "", gamewatch.GameExit(1, 0, now, now - 1260))
+    style, head, detail = gui.exit_summary(normal)  # what was seen, not a verdict (code 0 may be a crash too)
+    assert (style, head) == ("Banner", "게임이 종료 코드 0으로 끝났고 REFramework 오류 기록은 없습니다.")
+    assert "21분 0초 실행" in detail and "'튕겼어요'를 고르세요" in detail
+    polled = gamewatch.Detection(None, "", gamewatch.GameExit(1, None, now, None, now - 95, method="poll"))
+    assert gui.exit_summary(polled)[0] == "" and "1분 35초 실행 이상" in gui.exit_summary(polled)[2]
+    assert "확인하지 못했습니다" in gui.exit_summary(None)[1]
+    # only a detected crash is the answer picked first
+    step = bisect.Step(1, 3, "half", ["a"], [])
+    for detection, default in ((crash, "crashed"), (normal, None), (polled, None), (None, None)):
+        dialog = gui.BisectAskDialog(root, app.theme, step, detection)
+        assert dialog.default == default
+        dialog.destroy()
+
+
+def test_gui_bisect_asks_when_the_answer_can_be_taken(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import bisect, gamewatch, gui
+
+    monkeypatch.setenv("APPDATA", "")
+    bisect_mods(manager, tmp_path)
+    game = FakeGame(game_dir, lambda: 0, run=600)
+    monkeypatch.setattr(gui, "is_game_running", lambda: bool(game.find("MonsterHunterWilds.exe")))
+    monkeypatch.setattr(gamewatch, "default_api", lambda: game)  # the app watches the fake game from its start
+    app = gui.App(root, manager, queue.Queue())
+    watch_fast(app.watcher, game)
+    pump(root, lambda: app.busy is None)
+    monkeypatch.setattr(gui.BisectStartDialog, "show", lambda self: (self.destroy(), True)[1])
+    app._open_bisect_start(bisect.prepare(manager), False, "")
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    asked, told = [], []
+
+    def ask_show(self):
+        asked.append((self.default, texts(self)))
+        self.destroy()
+        return "crashed"
+
+    monkeypatch.setattr(gui.BisectAskDialog, "show", ask_show)
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a, **k: told.append(a[1]))
+    launcher(monkeypatch, game)
+    app.launch_game()
+    pump(root, lambda: app.watcher.pid is not None)
+    app.ask_bisect()  # 결과 알리기 while the game still runs: asked once it has ended
+    assert told == [gui.BISECT_STILL_RUNNING] and not asked and app._bisect.awaiting_answer
+    (pid,) = game.find("MonsterHunterWilds.exe")
+    app._destroy()  # the manager is closed while the game runs
+
+    root2 = tk.Tk()
+    try:
+        app2 = gui.App(root2, manager.__class__(manager.data_dir), queue.Queue())
+        watch_fast(app2.watcher, game)
+        pump(root2, lambda: app2.watcher.pid == pid)  # opened again: it finds the game and waits for it
+        assert app2._bisect.awaiting_answer and app2.bisect_text.cget("text") == gui.BISECT_PLAYING and not asked
+        # the game crashes while 모든 모드 재질 점검 runs: the question waits until the answer can be taken
+        app2.busy = "matfix"
+        game.procs[pid].update(ended=time.time(), code=0xC0000005)
+        pump(root2, lambda: app2._bisect_detection is not None)
+        end = time.time() + 1.5
+        while time.time() < end:
+            root2.update()
+            time.sleep(0.02)
+        assert not asked and not app2._bisect.steps
+        app2.busy = None
+        pump(root2, lambda: bool(asked))
+        default, shown = asked[0]
+        assert default == "crashed" and any("비정상 종료를 확인했습니다 (0xC0000005)" in t for t in shown)
+        pump(root2, lambda: app2.busy is None and not app2._apply_pending and not app2.manager.dirty)
+        session = app2._bisect
+        assert session.steps[0]["crashed"] and session.steps[0]["exit"]["code"] == 0xC0000005
+        assert "적용했습니다" in app2.bisect_text.cget("text")
+        app2.manager.dirty = True  # (a deploy runs, or failed): the line does not say it is applied
+        app2._show_bisect_bar()
+        assert "게임을 실행하면 먼저 게임 폴더에 적용합니다" in app2.bisect_text.cget("text")
+        app2.manager.dirty = False
+
+        # the next step's game is not found in time (Steam had to start first): the bar says to answer by hand
+        pump(root2, lambda: not app2.watcher.busy)
+        session.mark_launched(time.time())
+        app2._show_bisect_bar()
+        assert app2.bisect_text.cget("text") == gui.BISECT_PLAYING
+        assert app2.watcher.watch(session.launched, seconds=0.2)
+        pump(root2, lambda: app2.bisect_text.cget("text") == gui.BISECT_PLAYING_MANUAL)
+        app2._destroy()
+    finally:
+        gc.collect()
+        try:
+            root2.destroy()
+        except tk.TclError:
+            pass
+
+
+def test_gui_bisect_refw_result_and_old_paks(root, manager, tmp_path, game_dir, monkeypatch):
+    import json
+
+    from mhwmm import bisect, gui
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    ids = bisect_mods(manager, tmp_path)
+    # a PAK left in the game's patch chain by a version before 1.7.0
+    with manager.prepare_install(make_zip(tmp_path / "zips" / "Pak.zip", {"x.pak": "P"})) as s:
+        manager.install_variant(s, s.variants[0])
+    manager.deploy()
+    path = manager.data_dir / "deployment.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    key = next(k for k, e in manifest["files"].items() if e.get("pak"))
+    entry = manifest["files"].pop(key)
+    chain = "re_chunk_000.pak.sub_000.pak.patch_003.pak"
+    (game_dir / entry["path"]).replace(game_dir / chain)
+    st = (game_dir / chain).stat()
+    entry.update(path=chain, size=st.st_size, mtime=st.st_mtime_ns)
+    manifest["files"][chain] = entry
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    told, shown = [], []
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a, **k: told.append(a[1]))
+    monkeypatch.setattr(gui.BisectStartDialog, "show", lambda self: (shown.append(1), self.destroy(), True)[2])
+    app.show_bisect()  # moved first (the search would read moving them as a game update), then press again
+    assert any("예전 방식" in t for t in told) and not shown
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    assert not manager.outdated_paks() and app._bisect is None
+    app.show_bisect()
+    pump(root, lambda: app._bisect is not None and app.busy is None and not manager.dirty)
+    assert shown
+
+    # REFramework itself crashes: going back without turning it off comes first, and its update is offered
+    session = app._bisect
+    refw_id = ids["REFramework"]
+    for _ in range(12):
+        nxt = session.next()
+        if isinstance(nxt, bisect.Result):
+            break
+        session.mark_launched()
+        bisect.answer(manager, session, refw_id in nxt.on)
+    assert nxt.kind == "core" and nxt.mods == [refw_id]
+    dialog = gui.BisectResultDialog(root, app.theme, manager, session, nxt)
+    styles = {}
+
+    def buttons(widget):
+        for child in widget.winfo_children():
+            if isinstance(child, gui.ttk.Button):
+                styles[str(child.cget("text"))] = str(child.cget("style"))
+            buttons(child)
+
+    buttons(dialog)
+    assert styles[bisect.RESULT_RESTORE] == "Accent.TButton" and styles[bisect.RESULT_DISABLE] == "TButton"
+    assert gui.BISECT_REFW in styles and any("모두 동작하지 않습니다" in t for t in texts(dialog))
+    dialog.destroy()
+    clicked = []
+    monkeypatch.setattr(app, "_on_refw_click", lambda: clicked.append(1))
+    monkeypatch.setattr(gui.BisectResultDialog, "show", lambda self: (self.destroy(), ("refw",))[1])
+    app.show_bisect_result()
+    pump(root, lambda: bool(clicked) and app.busy is None)
+    assert app._bisect is None and manager.profile == "기본" and manager.get(refw_id).enabled
+
+
+def test_gui_bisect_resumes_after_the_startup_checks(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import bisect, deploy, gui, manager as manager_module
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    ids = bisect_mods(manager, tmp_path)
+    with manager.prepare_install(make_zip(tmp_path / "zips" / "Big.zip", {
+            f"natives/STM/big/f{i:03d}.tex": "x" for i in range(60)})) as s:
+        manager.install_variant(s, s.variants[0])
+    manager.deploy()
+    session, step = bisect.start(manager, bisect.prepare(manager))
+    manager.deploy()
+    bisect.answer(manager, session, ids["Armor B"] in step.on)  # the next step is set, then the manager closes
+    assert manager.dirty
+
+    state = {"deploying": False, "verified": []}
+    real_run, real_verify = deploy.Deployer.run, manager_module.ModManager.verify
+
+    def run(self, *a, **k):
+        state["deploying"] = True
+        try:
+            return real_run(self, *a, **k)
+        finally:
+            state["deploying"] = False
+
+    def verify(self, *a, **k):
+        state["verified"].append(state["deploying"])
+        return real_verify(self, *a, **k)
+
+    asked = []
+    monkeypatch.setattr(deploy.Deployer, "run", run)
+    monkeypatch.setattr(manager_module.ModManager, "verify", verify)
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: asked.append(a[1]) or False)
+    app = gui.App(root, manager.__class__(manager.data_dir), queue.Queue())
+    pump(root, lambda: bool(state["verified"]) and app.busy is None and not app.manager.dirty)
+    # the folder was checked before the step's deploy started, not while it changed the folder
+    assert state["verified"] == [False] and not asked
+    assert app._bisect is not None and "적용했습니다" in app.bisect_text.cget("text")

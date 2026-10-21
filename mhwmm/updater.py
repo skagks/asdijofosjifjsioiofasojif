@@ -237,12 +237,20 @@ def launch_finisher(staged: Path, target: Path) -> None:
 def _wait_for_exit(pid: int, timeout: float) -> None:
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
-        if handle:
-            kernel32.WaitForSingleObject(handle, int(timeout * 1000))
-            kernel32.CloseHandle(handle)
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # its own prototypes, not windll's shared ones
+            kernel32.OpenProcess.restype = wintypes.HANDLE  # 64 bits: the default int return would cut it
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if handle:
+                kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+                kernel32.CloseHandle(handle)
+        except (OSError, AttributeError) as exc:  # the copy below retries until the old exe is unlocked
+            log.warning("이전 프로그램이 끝나기를 기다리지 못했습니다: %s", exc)
         return
     deadline = time.time() + timeout
     while time.time() < deadline:

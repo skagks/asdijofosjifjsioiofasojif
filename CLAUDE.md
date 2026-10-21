@@ -24,7 +24,7 @@
 - UI 이미지 다시 만들기: `python tools/make_assets.py` (Pillow 필요)
 - 구조
   - `mhwmm/analyzer.py`: 압축 파일 구조 분석, 옵션(variant) 찾기
-  - `mhwmm/deploy.py`: 게임 폴더 적용·해제, PAK 모드 pak_mods 배치, 원본 백업
+  - `mhwmm/deploy.py`: 게임 폴더 적용·해제, PAK 모드 pak_mods 배치, 원본 백업, 사용자가 바꾼 모드 파일 보관(`edited\`)
   - `mhwmm/manager.py`: 모드 목록·옵션·설정·설치(옵션별 미리보기 그림은 `mods/<id>/previews/<옵션 id>.<확장자>`),
     재질 점검·복구 기록(`mods/<id>/matfix.json`, 고친 파일은 `matfix/`)
   - `mhwmm/matfix/`: 재질(.mdf2) 복구 (MHWmodfixer 기반, MIT). `pak.py` 게임 pak 읽기·모드 pak 쓰기, `game.py` 게임 파일 색인,
@@ -49,5 +49,14 @@
     이벤트 뷰어 문구 인식. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사
     (최근 10개), 모드와 맞춰 보기(explain, 항상 '의심'과 근거), 진단 zip(사용자 이름 가림, state.json 제외). 창은 gui.py의
     CrashDialog. 실제 사용자 기록·덤프는 저장소에 넣지 않고 테스트는 직접 만든 가짜 기록으로 한다
+  - `mhwmm/bisect.py`: 원인 모드 찾기. 다음 단계는 지금까지의 답만으로 다시 계산(`next_step`)하고, 진행 상황은 데이터 폴더
+    `bisect.json`. 현재 프로필을 복제한 임시 프로필 '원인 찾기 (임시)'에서만 켜고 끈다(사용자 프로필은 건드리지 않음).
+    진행 중에는 GUI·CLI가 설치·삭제·켜기/끄기·옵션·순서·프로필·게임 폴더 변경을 막는다(`bisect.BLOCKED`, 매니저 자체는 막지 않음).
+    결과는 답 하나에만 기대지 않는다(원인 모드로 튕긴 것과 그 모드 없이 괜찮았던 것을 각각 두 번 본다). 찾는 순서를 바꾸면
+    test_bisect.py의 답 하나가 틀린 경우 시험이 엉뚱한 모드를 짚지 않는지 확인한다
+    창은 gui.py의 BisectStartDialog·BisectAskDialog·BisectResultDialog와 목록 위 안내 줄
+  - `mhwmm/gamewatch.py`: 매니저에서 실행한(또는 켤 때 실행 중인) 게임 프로세스가 어떻게 끝났는지 확인(Windows API, 안 되면
+    tasklist, 다른 OS에서는 아무것도 하지 않음). 종료 코드는 모두 manager.log에 남기고, 정상 종료면 `crashes\last_good.json`.
+    테스트는 가짜 ProcessApi로 한다 (진짜 프로세스는 Windows CI에서만)
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
   - `mhwmm/cli.py`: 명령줄

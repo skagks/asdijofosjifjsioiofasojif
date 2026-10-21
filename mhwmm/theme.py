@@ -216,6 +216,12 @@ class Theme:
         s.configure("Callout.TFrame", background=p["warn_bg"])
         s.configure("CalloutTitle.TLabel", background=p["warn_bg"], foreground=p["warn"], font=f["bold"])
         s.configure("Callout.TLabel", background=p["warn_bg"], foreground=p["text"])
+        # the 원인 모드 찾기 bar under the toolbar (Banner) and how a game ended in its question (Banner, Alert)
+        for prefix, fg, bg in (("Banner", "info", "info_bg"), ("Alert", "danger", "danger_bg")):
+            s.configure(f"{prefix}.TFrame", background=p[bg])
+            s.configure(f"{prefix}Title.TLabel", background=p[bg], foreground=p[fg], font=f["bold"])
+            s.configure(f"{prefix}.TLabel", background=p[bg], foreground=p["text"])
+            s.configure(f"{prefix}Muted.TLabel", background=p[bg], foreground=p["muted"], font=f["small"])
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
         s.configure("Thumb.TFrame", background=p["bg"])
         s.configure("Thumb.TLabel", background=p["bg"], foreground=p["subtle"], font=f["small"])
@@ -273,11 +279,14 @@ class Theme:
         # the notice bar under the toolbar (a crash record of the last game): its close button
         button("CalloutClose.TButton", p["warn_bg"], p["muted"], p["select"], p["select"], padding=(8, 3), width=-2)
         s.map("CalloutClose.TButton", foreground=[("active", p["text"])])
+        button("BannerGhost.TButton", p["info_bg"], p["muted"], p["hover"], p["pressed"], padding=(10, 5),
+               font=f["small"], width=-2)
+        s.map("BannerGhost.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])
         # table of contents in the usage guide
-        button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 8), width=-2)
+        button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 6), width=-2)
         s.configure("Nav.TButton", anchor="w")
         s.map("Nav.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])
-        button("NavActive.TButton", p["select"], p["select_text"], p["select"], p["select"], padding=(14, 8),
+        button("NavActive.TButton", p["select"], p["select_text"], p["select"], p["select"], padding=(14, 6),
                font=f["bold"], width=-2)
         s.configure("NavActive.TButton", anchor="w")
 
