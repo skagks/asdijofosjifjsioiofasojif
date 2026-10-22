@@ -15,7 +15,8 @@ real App (gui.App) with the log pane open and full, and measures resizing the wi
   freeze, on its own: the gap to the next Configure), and the drag time against the input time.
   Also: the longest stall of the event loop after the last move (a 5 ms after() heartbeat, in Windows'
   ~15.6 ms timer ticks; the layout deferred to the end of the drag runs then).
-* synthetic steps: SetWindowPos on the wrapper window for each size of the same path, each call timed, and
+* synthetic steps (by the time rules: no mouse button is down, so gui.RESIZE_FIRST_STEP is off for them):
+  SetWindowPos on the wrapper window for each size of the same path, each call timed, and
   the call plus update() (the Configure, layout and paints it queued), and the time from the window's
   Configure until update() returned; then the longest single update() while the app settles. On
   Linux/macOS root.geometry() steps with update() instead (to smoke-test the tool under xvfb). (Not inside
@@ -24,16 +25,23 @@ real App (gui.App) with the log pane open and full, and measures resizing the wi
 
 Each variant runs in its own process (a hang or a crash is reported, not inherited; a timed out variant is
 killed and the mouse button released). Variants change the app before/after it is built, to find what costs
-on Windows; join modifiers with '+', e.g. --variant nolog+scale150. --list shows them. With the freeze (the
-default) the steps of a drag after the first are frozen whatever the window holds, so 'all' runs the removals
-with +nofreeze (what costs in a layout), and base against nofreeze (what the freeze saves).
+on Windows; join modifiers with '+', e.g. --variant nolog+scale150. --list shows them. The resize modes
+(gui.RESIZE_MODE: snapshot, the default; freeze; off) and the first-step detection (gui.RESIZE_FIRST_STEP,
+Windows) are variants too; 'all' compares them. In the freeze and snapshot modes the steps of a drag after the
+first are the same frozen step whatever the window holds, so the removals (nolog, emptylist, ...) say what costs
+in a layout only with +off. Each variant reports the mode that was in effect (snapshot falls back to freeze where
+there is no capture: off Windows, unless +fakecapture), the time to take and show the content's picture at the
+drag's start and to bring the content back at its end (FreezeContent.timings), whether the drag's first step
+was frozen and what the first-step probe read at it (the mouse button, Windows' move or size loop, the cursor on
+the sizing border). A last check times the parts of a picture (GDI grab, PhotoImage, Label) and, on Windows, compares the
+grab with the screen.
 
 Output: a readable table, and one line per variant: RESIZE_BENCH_JSON {...} (also --json-out FILE, rewritten
 after each variant; --report FILE prints its tables again). --budget SECONDS caps the whole run: variants that
 do not fit are reported as skipped and the tables are printed either way.
 
   python tools/resize_bench.py                          all variants (see --list)
-  python tools/resize_bench.py --variant base --variant nofreeze --repeat 3
+  python tools/resize_bench.py --variant snapshot --variant freeze --variant off --repeat 3
   python tools/resize_bench.py --screen 1920x1080       try that display mode first (Windows, CI runners)
   python tools/resize_bench.py --report resize-bench.json
   xvfb-run -a python tools/resize_bench.py --quick      smoke test of the fallback on Linux
@@ -87,20 +95,54 @@ MODIFIERS = {
     "conflicts": "the 충돌 tab shown",
     "files": "the 파일 tab shown",
     "nodefer": "RESIZE_SETTLE_MS = RESIZE_FIRST_MS = 0: no change is taken for a drag step, so every step is laid "
-               "out (the same as nofreeze since the freeze; not in 'all')",
-    "freeze": "gui.RESIZE_FREEZE = True, the default (skipped when gui has no RESIZE_FREEZE; not in 'all')",
-    "nofreeze": "gui.RESIZE_FREEZE = False: the window's content laid out again on every step of a drag, as "
-                "before the freeze (skipped when gui has no RESIZE_FREEZE)",
+               "out (the same as off; not in 'all')",
+    "snapshot": "gui.RESIZE_MODE = 'snapshot', the default: a picture of the content stands in for it during a drag "
+                "and the content is moved out of the window (needs a capture: Windows, or +fakecapture; else it is "
+                "the freeze)",
+    "freeze": "gui.RESIZE_MODE = 'freeze': the content keeps its size during a drag (on Windows still drawn again on "
+              "every step); with a gui before RESIZE_MODE: RESIZE_FREEZE = True",
+    "off": "gui.RESIZE_MODE = 'off': the window's content laid out again on every step of a drag, as before the "
+           "freeze; with a gui before RESIZE_MODE: RESIZE_FREEZE = False",
+    "nofreeze": "the same as off (its older name)",
+    "firststep": "gui.RESIZE_FIRST_STEP = True, the default: on Windows a size change while the mouse button is down "
+                 "(or Windows' move or size loop runs) with the cursor on the sizing border is a drag step already at "
+                 "the drag's first step (not in 'all')",
+    "nofirststep": "gui.RESIZE_FIRST_STEP = False: the drag's first step is laid out at once (it is not told apart "
+                   "from a maximize)",
+    "unmap": "gui.RESIZE_SNAPSHOT_HIDE = 'unmap': while its picture shows the content is unmapped (place_forget) "
+             "instead of moved out of the window (not in 'all')",
+    "fakecapture": "the snapshot's picture made by a stand-in (gui.photo_from_bgrx of plain bytes, the content's "
+                   "size) instead of taken from the screen: the snapshot path off Windows (not in 'all')",
+    "noclassredraw": "Windows: CS_HREDRAW|CS_VREDRAW taken off Tk's window classes (TkTopLevel, TkChild) once the "
+                     "window is shown, so that Windows repaints only the uncovered part of a resized window and not "
+                     "every child window (an experiment, not in the app; not in 'all')",
     "nodnd": "tk.Tk() instead of TkinterDnD.Tk()",
     "scale150": "tk scaling for 150% (144 dpi) before the app is built (default: 100%, 96 dpi)",
 }
-# With the freeze (the default) every step of a drag after the first is the same frozen step, whatever the window
-# holds: what a removal changes then shows only in the first step and the stall after the drag. So the removals run
-# with +nofreeze (every step laid out: what makes a layout costly); base/nofreeze is the pair that shows the freeze.
+# The resize modes against each other (snapshot is the default: base), with and without the first-step detection
+# (Windows), and at 150 %. A removal (nolog, emptylist, ...) shows what costs in a layout only with +off: in the
+# freeze and snapshot modes every step after the drag's first is the same frozen step.
 REMOVALS = ["nolog", "emptylist", "noimages", "nobisect", "noheader", "nodetails", "nolist", "noinfo", "fewwidgets",
             "options", "conflicts", "files"]
-ALL = ["bare", "base", "nofreeze", "scale150", "scale150+nofreeze", "nodnd"] + [f"{m}+nofreeze" for m in REMOVALS]
-QUICK = ["bare", "base", "nofreeze", "nolog+nofreeze"]
+ALL = ["bare", "base", "off", "freeze", "snapshot", "freeze+nofirststep", "snapshot+nofirststep", "scale150",
+       "scale150+off"]
+QUICK = ["bare", "base", "off", "freeze", "snapshot+fakecapture"]
+MODE_PARTS = {"snapshot": "snapshot", "freeze": "freeze", "off": "off", "nofreeze": "off"}
+
+
+def effective_mode(gui, fake: bool = False) -> str:
+    """What the window's content does during a drag with this gui as set: snapshot (snapshot-fake: +fakecapture),
+    freeze (freeze*: snapshot asked for, but no capture here), off, or layout (a gui before the freeze)."""
+    if hasattr(gui, "resize_mode"):
+        mode = gui.resize_mode()
+        if mode == "snapshot":
+            if getattr(gui, "_capture_content", None) is None:
+                return "freeze*"
+            return "snap-fake" if fake else "snapshot"
+        return mode
+    if hasattr(gui, "RESIZE_FREEZE"):
+        return "freeze" if gui.RESIZE_FREEZE else "off"
+    return "layout"
 
 
 def parse_spec(spec: str) -> list[str]:
@@ -394,6 +436,12 @@ class WinApi:
             self.GetDpiForWindow = proto("GetDpiForWindow", wt.UINT, HWND)
         except AttributeError:  # before Windows 10 1607
             self.GetDpiForWindow = None
+        try:
+            self.GetClassLong = proto("GetClassLongPtrW", ctypes.c_size_t, HWND, ctypes.c_int)
+            self.SetClassLong = proto("SetClassLongPtrW", ctypes.c_size_t, HWND, ctypes.c_int, ctypes.c_ssize_t)
+        except AttributeError:  # (32-bit: only the ...Long names)
+            self.GetClassLong = proto("GetClassLongW", wt.DWORD, HWND, ctypes.c_int)
+            self.SetClassLong = proto("SetClassLongW", wt.DWORD, HWND, ctypes.c_int, wt.LONG)
 
     def last_error(self) -> int:
         return self.ctypes.get_last_error()
@@ -426,6 +474,17 @@ class WinApi:
 
     def dpi(self, hwnd: int) -> int | None:
         return int(self.GetDpiForWindow(hwnd)) if self.GetDpiForWindow else None
+
+    GCL_STYLE, CS_VREDRAW, CS_HREDRAW = -26, 0x0001, 0x0002
+
+    def drop_class_redraw(self, hwnd: int) -> tuple[int, int]:
+        """Take CS_HREDRAW|CS_VREDRAW off the window class of ``hwnd`` (all windows of that class in this process);
+        (the class style before, after)."""
+        before = int(self.GetClassLong(hwnd, self.GCL_STYLE))
+        after = before & ~(self.CS_HREDRAW | self.CS_VREDRAW)
+        if after != before:
+            self.SetClassLong(hwnd, self.GCL_STYLE, after)
+        return before, int(self.GetClassLong(hwnd, self.GCL_STYLE))
 
     # -- screen
     def work_area(self) -> tuple[int, int, int, int]:
@@ -542,14 +601,19 @@ class ConfigureLog:
     than a pass in that pass; the placer queues the content's pack/grid arrangement and the redraws as newer idle
     work, so most of the layout comes after it (on Windows a sizing loop runs one idle pass per window message).
     The layout's cost is the synthetic path's Configure->done and call+update, and the real drag's gap between
-    Configures and move->Configure latency."""
+    Configures and move->Configure latency. ``frozen()`` is read after the app's handlers (whether the window's
+    content was frozen for that size: the drag's first step with the first-step detection); ``probe()`` before
+    them at a drag's first step (what gui's first-step probe reads: the mouse button, Windows' move or size loop,
+    the cursor on the sizing border)."""
 
     FIRST, LAST = "ResizeBenchFirst", "ResizeBenchLast"
 
     def __init__(self, root):
         self.root = root
-        self.events: list[list] = []  # [time, width, height, after the app's handlers, idle]
+        self.events: list[list] = []  # [time, width, height, after the app's handlers, idle, frozen, probe]
         self._current: list | None = None
+        self.frozen = lambda: None
+        self.probe = lambda: None
         root.bind_class(self.FIRST, "<Configure>", self._first)
         root.bind_class(self.LAST, "<Configure>", self._last)
         self.reset()
@@ -569,7 +633,13 @@ class ConfigureLog:
             self._current = None
             return
         self.size = size
-        record = [t, event.width, event.height, None, None]
+        reading = None
+        if not self.events or t - self.events[-1][0] > 0.3:  # (a drag's first step)
+            try:
+                reading = self.probe()
+            except Exception as exc:
+                reading = {"error": f"{type(exc).__name__}: {exc}"}
+        record = [t, event.width, event.height, None, None, None, reading]
         self.events.append(record)
         self._current = record
         self.root.after_idle(self._idle, record)
@@ -577,6 +647,10 @@ class ConfigureLog:
     def _last(self, event):
         if self._current is not None and str(event.widget) == ".":
             self._current[3] = pc()
+            try:
+                self._current[5] = self.frozen()
+            except Exception:
+                pass
             self._current = None
 
     @staticmethod
@@ -607,6 +681,23 @@ def path_extent(moves: list[tuple[int, int]]) -> tuple[int, int, int, int]:
     return lo_x, hi_x, lo_y, hi_y
 
 
+def same_share(data: bytes, width: int, height: int, screen) -> dict:
+    """The share of sampled pixels of ``data`` (B, G, R, unused a pixel, width × height) that match the PIL image
+    ``screen`` (within 8 of each channel), over the part both cover."""
+    from PIL import Image
+
+    mine = Image.frombuffer("RGB", (width, height), data, "raw", "BGRX", 0, 1)
+    w, h = min(width, screen.size[0]), min(height, screen.size[1])
+    same = total = 0
+    step_x, step_y = max(1, w // 160), max(1, h // 100)
+    for y in range(0, h, step_y):
+        for x in range(0, w, step_x):
+            a, b = mine.getpixel((x, y)), screen.getpixel((x, y))
+            total += 1
+            same += max(abs(a[i] - b[i]) for i in range(3)) <= 8
+    return {"share": round(same / max(1, total), 4), "samples": total, "size": [w, h]}
+
+
 class Child:
     def __init__(self, args):
         self.args = args
@@ -618,6 +709,7 @@ class Child:
         self.root = None
         self.app = None
         self.restore_drag_setting: bool | None = None
+        self.grabs: list = []  # (width, height, data) of the GDI grabs (the snapshot's pictures) of a drag
 
     # -- setup
     def make_root(self):
@@ -656,6 +748,7 @@ class Child:
         env["scale"] = scale
 
         if "bare" in self.parts:
+            env["mode"] = "bare"
             root.title("resize bench (bare)")
             root.geometry("1240x800")
             root.minsize(400, 300)
@@ -682,13 +775,10 @@ class Child:
         if "nodefer" in self.parts:
             gui.RESIZE_SETTLE_MS = 0
             gui.RESIZE_FIRST_MS = 0
-        for part, value in (("freeze", True), ("nofreeze", False)):
-            if part in self.parts:
-                if not hasattr(gui, "RESIZE_FREEZE"):
-                    self.result["skipped"] = "gui.RESIZE_FREEZE does not exist in this version"
-                    return
-                gui.RESIZE_FREEZE = value
-        env["resize_freeze"] = getattr(gui, "RESIZE_FREEZE", None)
+        skip = self.set_modes(gui)
+        if skip:
+            self.result["skipped"] = skip
+            return
         env["resize_settle_ms"] = gui.RESIZE_SETTLE_MS
 
         work = Path(self.args.work)
@@ -713,6 +803,182 @@ class Child:
         self.modify()
         pump(root, max(0.5, self.args.settle))
         env["shown"] = self.shown()
+
+    def set_modes(self, gui) -> str | None:
+        """The resize switches the variant names (gui.RESIZE_MODE, RESIZE_FIRST_STEP, ...), before the app is built;
+        the reason to skip the variant when this gui does not have one."""
+        parts, env = self.parts, self.result["env"]
+        modes = {MODE_PARTS[p] for p in parts if p in MODE_PARTS}
+        if len(modes) > 1:
+            return f"more than one resize mode: {', '.join(sorted(modes))}"
+        if modes:
+            mode = modes.pop()
+            if hasattr(gui, "RESIZE_MODE"):
+                gui.RESIZE_MODE = mode
+                if hasattr(gui, "RESIZE_FREEZE"):
+                    gui.RESIZE_FREEZE = True  # (its False would be "off" whatever the mode)
+            elif mode != "snapshot" and hasattr(gui, "RESIZE_FREEZE"):
+                gui.RESIZE_FREEZE = mode == "freeze"  # (a gui before RESIZE_MODE)
+            else:
+                return f"gui has no RESIZE_MODE{'' if mode == 'snapshot' else ' or RESIZE_FREEZE'} in this version"
+        for part, value in (("firststep", True), ("nofirststep", False)):
+            if part in parts:
+                if not hasattr(gui, "RESIZE_FIRST_STEP"):
+                    return "gui.RESIZE_FIRST_STEP does not exist in this version"
+                gui.RESIZE_FIRST_STEP = value
+        if "unmap" in parts:
+            if not hasattr(gui, "RESIZE_SNAPSHOT_HIDE"):
+                return "gui.RESIZE_SNAPSHOT_HIDE does not exist in this version"
+            gui.RESIZE_SNAPSHOT_HIDE = "unmap"
+        if "fakecapture" in parts:
+            if not hasattr(gui, "_capture_content") or not hasattr(gui, "photo_from_bgrx"):
+                return "gui has no snapshot capture in this version"
+
+            def fake(frame, width, height):  # (the same conversion and Label as a real picture)
+                return gui.photo_from_bgrx(frame, b"\x60\x48\x30\x00" * (width * height), width, height)
+
+            gui._capture_content = fake
+        env["resize_mode"] = getattr(gui, "RESIZE_MODE", None)
+        env["resize_freeze"] = getattr(gui, "RESIZE_FREEZE", None)
+        env["mode"] = effective_mode(gui, fake="fakecapture" in parts)
+        env["first_step"] = getattr(gui, "RESIZE_FIRST_STEP", None)
+        pointer = getattr(gui, "_pointer", None)
+        env["first_step_probe"] = (pointer() is not None) if pointer else None  # (Windows' mouse button state)
+        env["snapshot_hide"] = getattr(gui, "RESIZE_SNAPSHOT_HIDE", None)
+        return None
+
+    def timings_reset(self) -> None:
+        """Forget the content's picture timings (FreezeContent.timings) before a measurement."""
+        timings = getattr(getattr(self.app, "freeze", None), "timings", None)
+        if timings is not None:
+            timings.clear()
+
+    def timings_take(self) -> dict:
+        """What FreezeContent did during a measurement: pictures taken and shown at a drag's start (snapshot_ms),
+        content brought back at its end (restore_ms: laid out and drawn), frozen without a picture (no_snapshot)."""
+        timings = list(getattr(getattr(self.app, "freeze", None), "timings", None) or [])
+        snaps = [ms_ for what, ms_ in timings if what == "snapshot"]
+        restores = [ms_ for what, ms_ in timings if what == "restore"]
+        return {"snapshots": len(snaps), "no_snapshot": sum(1 for what, _ in timings if what == "no snapshot"),
+                "snapshot_ms": stats(snaps), "restore_ms": stats(restores),
+                "first_snapshot_ms": round(snaps[0], 1) if snaps else None}
+
+    def capture_check(self) -> dict:
+        """The parts of a picture of the content timed: the PhotoImage made from pixels (Pillow, or PPM without it)
+        and its Label (Tk makes the image's copy for the screen then), at the content's size and at 2560x1400; on
+        Windows also the GDI grab, and how much of it matches the screen (ImageGrab, the window on top)."""
+        import tkinter as tk
+
+        from mhwmm import gui
+
+        content = getattr(self.app, "content", None)
+        if content is None or not hasattr(gui, "photo_from_bgrx"):
+            return {"path": "capture", "skipped": "no content frame or no photo_from_bgrx in this gui"}
+        root = self.root
+        width, height = content.winfo_width(), content.winfo_height()
+        out: dict = {"path": "capture", "size": [width, height], "pillow": gui.Image is not None}
+        label = tk.Label(root, borderwidth=0, highlightthickness=0)  # (never placed)
+
+        def photo(w: int, h: int) -> dict:
+            data = b"\x60\x48\x30\x00" * (w * h)
+            t0 = pc()
+            image = gui.photo_from_bgrx(root, data, w, h)
+            t1 = pc()
+            label.configure(image=image)
+            t2 = pc()
+            label.configure(image="")
+            del image
+            t3 = pc()
+            return {"size": [w, h], "photo_ms": round((t1 - t0) * 1000, 1), "label_ms": round((t2 - t1) * 1000, 1),
+                    "drop_ms": round((t3 - t2) * 1000, 1)}
+
+        try:
+            photo(16, 16)  # (Pillow's Tk part loads at its first picture)
+            out["photos"] = [photo(width, height), photo(2560, 1400)]
+            capture = getattr(gui, "_capture_content", None)
+            if WIN and capture is not None and capture is getattr(gui, "_gdi_capture", None):
+                grabber = gui._CAPTURE[0] if gui._CAPTURE else gui._WinCapture()
+                times = []
+                for _ in range(3):
+                    t0 = pc()
+                    data = grabber.grab(content.winfo_id(), width, height)
+                    times.append((pc() - t0) * 1000)
+                out["grab_ms"] = stats(times)
+                out["grab_bytes"] = len(data)
+                out["same_as_screen"] = self.compare_with_screen(content, width, height)
+        finally:
+            label.destroy()
+        out["ok"] = True
+        return out
+
+    def compare_with_screen(self, content, width: int, height: int) -> dict:
+        """The share of sampled pixels of a GDI grab of the content that match a screen grab (ImageGrab) of the
+        same place, with the window on top (a grab that missed the window's surface is black or stale)."""
+        from PIL import ImageGrab
+
+        from mhwmm import gui
+
+        root = self.root
+        grabber = gui._CAPTURE[0] if gui._CAPTURE else gui._WinCapture()
+        try:
+            root.attributes("-topmost", True)
+            root.lift()
+            pump(root, 0.4)
+            x, y = content.winfo_rootx(), content.winfo_rooty()
+            data = grabber.grab(content.winfo_id(), width, height)
+            screen = ImageGrab.grab(bbox=(x, y, x + width, y + height), all_screens=True).convert("RGB")
+        finally:
+            try:
+                root.attributes("-topmost", False)
+            except Exception:
+                pass
+        if screen.size != (width, height):
+            return {"error": f"screen grab {screen.size} vs {(width, height)}"}
+        return dict(same_share(data, width, height, screen), at=[x, y])
+
+    def record_grabs(self) -> None:
+        """Keep the GDI grabs (the snapshot's pictures) of a drag, to compare them with the screen before it."""
+        from mhwmm import gui
+
+        cls = getattr(gui, "_WinCapture", None)
+        if not WIN or cls is None:
+            return
+        original, grabs = cls.grab, self.grabs
+
+        def grab(capture, hwnd, width, height):
+            data = original(capture, hwnd, width, height)
+            if len(grabs) < 3:
+                grabs.append((width, height, data))
+            return data
+
+        cls.grab = grab
+
+    def screen_of_content(self):
+        """What the screen shows where the window's content is (the window is on top), as a PIL image; None off
+        Windows or without Pillow."""
+        content = getattr(self.app, "content", None)
+        if content is None or not WIN:
+            return None
+        try:
+            from PIL import ImageGrab
+
+            x, y = content.winfo_rootx(), content.winfo_rooty()
+            w, h = content.winfo_width(), content.winfo_height()
+            return ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).convert("RGB")
+        except Exception as exc:
+            self.notes.append(f"no screen grab before the drag: {exc}")
+            return None
+
+    def drop_class_redraw(self) -> dict | None:
+        """noclassredraw: CS_HREDRAW|CS_VREDRAW off Tk's toplevel (wrapper) and child window classes."""
+        if not self.api:
+            self.notes.append("noclassredraw: only on Windows")
+            return None
+        root, out = self.root, {}
+        for name, hwnd in (("TkTopLevel", self.api.wrapper(root)), ("TkChild", root.winfo_id())):
+            before, after = self.api.drop_class_redraw(hwnd)
+            out[name] = [hex(before), hex(after)]
+        return out
 
     def shown(self) -> dict:
         """Which parts of the window are on screen after modify() (a variant that hides nothing shows up here)."""
@@ -987,7 +1253,10 @@ class Child:
                     return
             root.after(20, poll)
 
+        before = self.screen_of_content()  # (what the snapshot's picture should show)
+        self.grabs.clear()
         rec.reset()
+        self.timings_reset()
         cpu0, wall0 = time.process_time(), pc()
         worker = threading.Thread(target=drive, name="resize-bench-mouse", daemon=True)
         worker.start()
@@ -1004,6 +1273,13 @@ class Child:
             out["error"] = f"timed out after {self.args.drag_timeout} s"
         if state["error"]:
             out["error"] = state["error"]
+        out.update(self.timings_take())
+        if before is not None and self.grabs:  # the drag's first picture against the screen before the drag
+            try:
+                out["picture_vs_screen"] = same_share(*self.grabs[0], before)
+            except Exception as exc:
+                out["picture_vs_screen"] = {"error": f"{type(exc).__name__}: {exc}"}
+        self.grabs.clear()
         out["cursor_start"], out["cursor_end"] = state.get("cursor_start"), state.get("cursor_end")
         if state.get("cursor_end") and max(abs(a - b) for a, b in zip(state["cursor_end"], path[-1])) > 1:
             self.notes.append(f"the cursor ended at {state['cursor_end']}, the path at {path[-1]}")
@@ -1047,6 +1323,10 @@ class Child:
             # so its layout is in the gap to the next Configure; the steps after it are what dragging costs
             "first_gap_ms": round(gaps[0] * 1000, 1) if gaps else None,
             "first_latency_ms": round(latencies[0] * 1000, 1) if latencies[0] is not None else None,
+            # the drag's first step frozen (on Windows with the first-step detection), None: no freeze in this gui
+            "first_frozen": events[0][5],
+            # what the first-step probe read at it (Windows: the button, the move or size loop, on the border)
+            "first_probe": events[0][6],
             "gap_ms": stats(ms(gaps[1:])),
             "latency_ms": stats(ms([v for v in latencies[1:] if v is not None])),
             "handlers_ms": stats(ms([e[3] - e[0] for e in events if e[3] is not None])),
@@ -1061,6 +1341,22 @@ class Child:
         return out
 
     def synthetic(self, moves: list[tuple[int, int]], plan: dict, rec: ConfigureLog) -> dict:
+        """The synthetic steps, by the time rules: no mouse button is pressed for them, so on Windows the
+        first-step detection (gui.RESIZE_FIRST_STEP) would take each one for a change on its own (each laid out
+        at once whenever the one before took longer than RESIZE_SETTLE_MS). Off for them, the first step is laid
+        out at once and the next ones are frozen, as in a drag the mouse does not show."""
+        from mhwmm import gui
+
+        first_step = getattr(gui, "RESIZE_FIRST_STEP", None)
+        if first_step:
+            gui.RESIZE_FIRST_STEP = False
+        try:
+            return self._synthetic(moves, plan, rec)
+        finally:
+            if first_step:
+                gui.RESIZE_FIRST_STEP = first_step
+
+    def _synthetic(self, moves: list[tuple[int, int]], plan: dict, rec: ConfigureLog) -> dict:
         root, api = self.root, self.api
         sizes = []
         if api:
@@ -1075,6 +1371,7 @@ class Child:
         out: dict = {"path": path, "n": len(sizes)}
         sync, step, done = [], [], []  # done: from the root's Configure until update() returned (or None)
         rec.reset()
+        self.timings_reset()
         t_start = pc()
         cpu0 = time.process_time()
 
@@ -1116,6 +1413,8 @@ class Child:
         out["stall_ms"] = round(pump(root, 0.6) * 1000, 1)  # (what was deferred to the end of the "drag")
         events = rec.since(t_start)
         out["configures"] = len(events)
+        out.update(self.timings_take())
+        out["first_frozen"] = events[0][5] if events else None
         # the first step is laid out at once (with the freeze too: a change on its own); from the second on, the
         # steps of a drag
         out["sync_ms"] = stats(ms(sync[1:]))
@@ -1150,6 +1449,15 @@ class Child:
             if self.api:
                 env["dpi"] = self.api.dpi(self.api.wrapper(root))
             rec = ConfigureLog(root)
+            freeze = getattr(self.app, "freeze", None)
+            if freeze is not None:
+                rec.frozen = lambda: bool(freeze.frozen)
+            probe = first_step_probe()
+            if probe is not None:
+                rec.probe = lambda: probe_reading(probe, root)
+            if "noclassredraw" in self.parts:
+                env["class_styles"] = self.drop_class_redraw()
+            self.record_grabs()
             moves = plan_moves(self.args.moves)
             plan = self.place(moves)
             self.result["plan"] = plan
@@ -1174,6 +1482,8 @@ class Child:
                 self.result["steps"] = merge_steps(steps)
                 self.emit(PARTIAL_PREFIX)
                 self.restore(plan)
+            if self.app is not None:
+                self.result["capture"] = self.guarded(self.capture_check, "capture")
             self.result["ok"] = bool((self.result["drag"] or {}).get("ok") or (self.result["steps"] or {}).get("ok"))
         except BaseException as exc:
             self.result["error"] = f"{type(exc).__name__}: {exc}"
@@ -1217,12 +1527,42 @@ def join_stats(parts: list[dict | None]) -> dict | None:
             "p95": max(p["p95"] for p in parts), "max": max(p["max"] for p in parts)}
 
 
+# what the first-step probe is asked (gui._WinPointer): {key: (method, it takes the toplevel)}
+PROBE_QUERIES = {"down": ("button_down", False), "loop": ("in_move_size", True), "border": ("on_sizing_border", True)}
+
+
+def first_step_probe():
+    """gui's first-step probe (gui._pointer(): Windows only), or None."""
+    from mhwmm import gui
+
+    pointer = getattr(gui, "_pointer", None)
+    try:
+        return pointer() if pointer is not None and getattr(gui, "RESIZE_FIRST_STEP", False) else None
+    except Exception:
+        return None
+
+
+def probe_reading(probe, top) -> dict:
+    """What the first-step probe reads now: {key: True/False, None (no such query in this gui), or the error}."""
+    out: dict = {}
+    for key, (name, with_top) in PROBE_QUERIES.items():
+        query = getattr(probe, name, None)
+        try:
+            out[key] = None if query is None else bool(query(top) if with_top else query())
+        except Exception as exc:
+            out[key] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def merge_drags(runs: list[dict]) -> dict:
     """All repeats of the real drag in one summary (lists joined), with each run's short form."""
     good = [r for r in runs if r.get("configures")]
     out: dict = {"path": "SendInput", "runs": [{k: r.get(k) for k in ("ok", "moves", "configures", "matched",
                                                                        "coalesced", "first_gap_ms", "input_s",
                                                                        "drag_s", "tail_ms", "stall_ms", "final_ok",
+                                                                       "first_frozen", "first_probe",
+                                                                       "snapshots",
+                                                                       "first_snapshot_ms", "picture_vs_screen",
                                                                        "error", "cpu_s", "wall_s")}
                                                 for r in runs]}
     if not good:
@@ -1232,9 +1572,16 @@ def merge_drags(runs: list[dict]) -> dict:
         out["traceback"] = next((r["traceback"] for r in runs if r.get("traceback")), None)
         return out
     out["ok"] = all(r.get("ok") for r in good)
-    for key in ("moves", "configures", "matched", "coalesced"):
+    for key in ("moves", "configures", "matched", "coalesced", "snapshots", "no_snapshot"):
         out[key] = sum(r.get(key) or 0 for r in good)
-    for key in ("gap_ms", "latency_ms", "handlers_ms", "first_idle_ms", "send_ms"):
+    out["first_frozen"] = sum(1 for r in good if r.get("first_frozen"))  # (runs whose first step was frozen)
+    readings = [r["first_probe"] for r in good if isinstance(r.get("first_probe"), dict)]
+    if readings:  # (runs where each of the probe's queries read true, or failed)
+        out["first_probe"] = {key: sum(1 for p in readings if p.get(key) is True) for key in PROBE_QUERIES}
+        out["first_probe"]["runs"] = len(readings)
+        out["first_probe"]["errors"] = sum(1 for p in readings if any(isinstance(v, str) for v in p.values()))
+    out["n_runs"] = len(good)
+    for key in ("gap_ms", "latency_ms", "handlers_ms", "first_idle_ms", "send_ms", "snapshot_ms", "restore_ms"):
         joined = join_stats([r.get(key) for r in good])
         if joined:
             out[key] = joined
@@ -1244,6 +1591,8 @@ def merge_drags(runs: list[dict]) -> dict:
         out[key] = round(statistics.median(r[key] for r in good if r.get(key) is not None), 3)
     stalls = [r["stall_ms"] for r in good if r.get("stall_ms") is not None]
     out["stall_ms"] = max(stalls) if stalls else None  # (the worst run)
+    shares = [r["picture_vs_screen"]["share"] for r in good if (r.get("picture_vs_screen") or {}).get("share") is not None]
+    out["picture_vs_screen"] = min(shares) if shares else None  # (the worst run)
     out["final_ok"] = all(r.get("final_ok") for r in good)
     errors = [r.get("error") for r in runs if r.get("error")]
     if errors:
@@ -1262,7 +1611,11 @@ def merge_steps(runs: list[dict]) -> dict:
     out["ok"] = all(r.get("ok") for r in good)
     out["n"] = sum(r["n"] for r in good)
     out["configures"] = sum(r["configures"] for r in good)
-    for key in ("sync_ms", "step_ms", "done_ms", "handlers_ms", "first_idle_ms"):
+    for key in ("snapshots", "no_snapshot"):
+        out[key] = sum(r.get(key) or 0 for r in good)
+    out["first_frozen"] = sum(1 for r in good if r.get("first_frozen"))
+    out["n_runs"] = len(good)
+    for key in ("sync_ms", "step_ms", "done_ms", "handlers_ms", "first_idle_ms", "snapshot_ms", "restore_ms"):
         joined = join_stats([r.get(key) for r in good])
         if joined:
             out[key] = joined
@@ -1305,18 +1658,109 @@ def fmt_runs(s: dict | None) -> str:
     return f"{s['median']:.0f}/{s['max']:.0f}"
 
 
+def fmt_mm(s: dict | None) -> str:
+    """median/max."""
+    if not s:
+        return "-"
+    return f"{s['median']:.0f}/{s['max']:.0f}"
+
+
+def mode_of(r: dict) -> str:
+    env = r.get("env") or {}
+    mode = env.get("mode")
+    if mode is None:  # (a result from before the modes)
+        freeze = env.get("resize_freeze")
+        mode = "-" if freeze is None else ("freeze" if freeze else "off")
+    return str(mode)[:9]
+
+
+def print_picture_tables(results: list[dict]) -> None:
+    print()
+    print("Resize mode and the content's picture (FreezeContent.timings; ms as median/max over the drags/step runs): "
+          "1st step = RESIZE_FIRST_STEP\n  (probe: Windows' mouse button read); 1st frz = runs whose first step was "
+          "frozen / runs; snaps = pictures taken; snapshot = taking and\n  showing the picture at the drag's start; "
+          "restore = bringing the content back at its end (laid out and drawn); no snap = frozen without a\n  "
+          "picture (capture failed or refused); pic=scr = share of the drag's first picture equal to the screen before "
+          "the drag\n  (Windows, worst run; 1.0: the picture showed the content)")
+    head = f"{'variant':<24} {'mode':<9} {'1st step':<9} | {'drag: 1st frz':>13} {'snaps':>5} {'snapshot':>9} " \
+           f"{'restore':>9} {'no snap':>7} {'pic=scr':>7} | {'steps: 1st frz':>14} {'snaps':>5} {'snapshot':>9} " \
+           f"{'restore':>9}"
+    print(head)
+    print("-" * len(head))
+    for r in results:
+        name = r["variant"][:24]
+        if r.get("skipped"):
+            print(f"{name:<24} skipped: {r['skipped']}")
+            continue
+        env = r.get("env") or {}
+        first = env.get("first_step")
+        first = "-" if first is None else ("on" if first else "off") + ("+probe" if env.get("first_step_probe") else "")
+        cells = []
+        for part in (r.get("drag") or {}, r.get("steps") or {}):
+            runs = part.get("n_runs")
+            cells.append((f"{part.get('first_frozen', 0)}/{runs}" if runs else "-",
+                          part.get("snapshots", "-") if runs else "-", fmt_mm(part.get("snapshot_ms")),
+                          fmt_mm(part.get("restore_ms")), part.get("no_snapshot", "-") if runs else "-"))
+        (df, ds, dsn, dr, dn), (sf, ss, ssn, sr, _sn) = cells
+        share = (r.get("drag") or {}).get("picture_vs_screen")
+        share = "-" if share is None else f"{share:.3f}"
+        print(f"{name:<24} {mode_of(r):<9} {first:<9} | {df:>13} {ds!s:>5} {dsn:>9} {dr:>9} {dn!s:>7} {share:>7} | "
+              f"{sf:>14} {ss!s:>5} {ssn:>9} {sr:>9}")
+    probed = [(r["variant"], (r.get("drag") or {}).get("first_probe")) for r in results if not r.get("skipped")]
+    probed = [(variant, p) for variant, p in probed if p]
+    if probed:
+        print()
+        print("First-step probe at the real drag's first step (gui._pointer, read before the app's handlers): runs "
+              "where it read true / runs;\n  down = the primary mouse button, loop = Windows' move or size loop, "
+              "border = the cursor on the sizing border; errors = runs where a query failed")
+        head = f"{'variant':<24} {'down':>6} {'loop':>6} {'border':>6} {'errors':>6}"
+        print(head)
+        print("-" * len(head))
+        for variant, p in probed:
+            runs = p.get("runs", 0)
+            print(f"{variant[:24]:<24} " + " ".join(f"{p.get(key, 0)}/{runs}".rjust(6) for key in PROBE_QUERIES)
+                  + f" {p.get('errors', 0):>6}")
+    checks = [(r["variant"], r.get("capture")) for r in results if not r.get("skipped") and r.get("capture")]
+    if not checks:
+        return
+    print()
+    print("Parts of a picture (once per variant, after the measurements): photo = PhotoImage from pixels (Pillow, or "
+          "PPM), label = giving it to\n  a Label (Tk's copy for the screen), at the content's size and at 2560x1400; "
+          "grab = GDI BitBlt from the content's window (Windows);\n  same = share of sampled grab pixels equal to a "
+          "screen grab of the same place (1.0: the grab is what the screen shows)")
+    head = f"{'variant':<24} {'content':>9} {'photo':>6} {'label':>6} | {'2560x1400':>9} {'photo':>6} {'label':>6} | " \
+           f"{'grab':>11} {'same':>6}"
+    print(head)
+    print("-" * len(head))
+    for variant, c in checks:
+        name = variant[:24]
+        if c.get("error") or c.get("skipped"):
+            print(f"{name:<24} {(c.get('error') or c.get('skipped'))[:100]}")
+            continue
+        photos = c.get("photos") or []
+        a = photos[0] if photos else {}
+        b = photos[1] if len(photos) > 1 else {}
+        size = "x".join(str(v) for v in a.get("size", [])) or "-"
+        same = (c.get("same_as_screen") or {})
+        share = same.get("share")
+        print(f"{name:<24} {size:>9} {fmt_num(a.get('photo_ms')):>6} {fmt_num(a.get('label_ms')):>6} | {'':>9} "
+              f"{fmt_num(b.get('photo_ms')):>6} {fmt_num(b.get('label_ms')):>6} | {fmt_stat(c.get('grab_ms')):>11} "
+              f"{'-' if share is None else f'{share:.3f}':>6}" + (f"  ({same['error']})" if same.get("error") else ""))
+
+
 def print_tables(results: list[dict]) -> None:
     print()
-    print("Read: with the freeze (the default) only the drag's first step and one layout after it (stall) lay the "
-          "window's content out;\n  +nofreeze lays it out on every step. base vs nofreeze: what the freeze saves; "
-          "the +nofreeze variants vs each other: what costs in a layout.")
+    print("Read: mode = what the window's content does during a drag (snapshot: its picture stands in for it and "
+          "the content is out of the\n  window; freeze: it keeps its size; off: laid out on every step; freeze*: "
+          "snapshot asked for, no capture here; snap-fake:\n  +fakecapture). snapshot/freeze vs off: what they save; "
+          "vs bare: what is left. +nofirststep: the drag's first step laid out at once.")
     print()
     print("Real edge drag (SendInput; ms as median/p95/max; cfg/moves = Configure events / mouse moves; coal = moves "
           "without their own Configure;\n  1st gap = from the drag's first Configure to the next (its layout; "
           "median/max of the runs); gap and move->Configure: from the second step on;\n  tail = last Configure after "
           "the last move; stall = longest gap of a 5 ms after() heartbeat after the last move (Windows timers tick "
           "every\n  ~15.6 ms: below ~20 is no stall))")
-    head = f"{'variant':<24} {'cfg/moves':>9} {'coal':>5} {'1st gap':>9} {'gap between Configures':>23} " \
+    head = f"{'variant':<24} {'mode':<9} {'cfg/moves':>9} {'coal':>5} {'1st gap':>9} {'gap between Configures':>23} " \
            f"{'move->Configure':>18} {'drag/input s':>13} {'tail':>6} {'stall':>6}"
     print(head)
     print("-" * len(head))
@@ -1330,7 +1774,7 @@ def print_tables(results: list[dict]) -> None:
             why = r.get("error") or d.get("error") or d.get("skipped") or "no data"
             print(f"{name:<24} {why[:110]}")
             continue
-        print(f"{name:<24} {d['configures']:>4}/{d['moves']:<4} {d['coalesced']:>5} "
+        print(f"{name:<24} {mode_of(r):<9} {d['configures']:>4}/{d['moves']:<4} {d['coalesced']:>5} "
               f"{fmt_runs(d.get('first_gap_ms')):>9} {fmt_stat(d.get('gap_ms')):>23} {fmt_stat(d.get('latency_ms')):>18} "
               f"{d['drag_s']:>6.2f}/{d['input_s']:<6.2f} {d['tail_ms']:>6.0f} {fmt_num(d.get('stall_ms')):>6}")
     print()
@@ -1338,8 +1782,8 @@ def print_tables(results: list[dict]) -> None:
           "call, call+update and\n  Configure->done (from the window's Configure until update() returned: handlers, layout, "
           "redraw) from the second step on; 1st = the first step's\n  call+update (median/max of the runs); stall = "
           "longest update() while it settles)")
-    head = f"{'variant':<24} {'path':<13} {'n':>4} {'call':>17} {'call+update':>20} {'Configure->done':>20} " \
-           f"{'1st':>9} {'stall':>6} {'total s':>8}"
+    head = f"{'variant':<24} {'mode':<9} {'path':<13} {'n':>4} {'call':>17} {'call+update':>20} " \
+           f"{'Configure->done':>20} {'1st':>9} {'stall':>6} {'total s':>8}"
     print(head)
     print("-" * len(head))
     for r in results:
@@ -1352,9 +1796,10 @@ def print_tables(results: list[dict]) -> None:
             why = r.get("error") or s.get("error") or "no data"
             print(f"{name:<24} {why[:110]}")
             continue
-        print(f"{name:<24} {s['path']:<13} {s['n']:>4} {fmt_stat(s.get('sync_ms')):>17} "
+        print(f"{name:<24} {mode_of(r):<9} {s['path']:<13} {s['n']:>4} {fmt_stat(s.get('sync_ms')):>17} "
               f"{fmt_stat(s.get('step_ms')):>20} {fmt_stat(s.get('done_ms')):>20} {fmt_runs(s.get('first_ms')):>9} "
               f"{fmt_num(s.get('stall_ms')):>6} {s['total_s']:>8.2f}")
+    print_picture_tables(results)
     shown = [(r["variant"], (r.get("env") or {}).get("shown")) for r in results if not r.get("skipped")]
     shown = [(v, parts) for v, parts in shown if parts]
     if shown:
@@ -1454,7 +1899,7 @@ def parent_main(args) -> int:
         return report(args.report)
     if args.list:
         for name in MODIFIERS:
-            print(f"{name:<11} {MODIFIERS[name]}")
+            print(f"{name:<14} {MODIFIERS[name]}")
         print(f"\nall: {' '.join(ALL)}\nquick: {' '.join(QUICK)}")
         return 0
     specs: list[str] = []

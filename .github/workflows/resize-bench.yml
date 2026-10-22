@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       args:
-        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant base --variant nofreeze --variant nolog+scale150 --repeat 3"
+        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant snapshot --variant freeze --variant off --variant snapshot+unmap --repeat 3"
         type: string
         default: ""
       patch:
