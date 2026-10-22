@@ -2,14 +2,17 @@ name: Resize bench
 
 # Measures how the main window keeps up while its edge is dragged, on real Windows: tools/resize_bench.py
 # drags the bottom-right corner with SendInput (needs the runner's interactive desktop) and also steps the
-# size with SetWindowPos (works without one). Results: the job log (one RESIZE_BENCH_JSON line per variant,
-# then a table), the job summary and the resize-bench artifact. Synthetic mods only, no game files.
+# size with SetWindowPos (works without one), and checks the window's pixels (stale pixels after a forced repaint,
+# the content kept during a drag, the same layout as a plain resize; also of two dialogs and the 장비 외형 window,
+# resized the same way). Results: the job log (one RESIZE_BENCH_JSON line per variant, then the tables), the job
+# summary and the resize-bench artifact (with the visual checks' pictures: resize-bench-frames/<variant>/).
+# Synthetic mods only, no game files.
 
 on:
   workflow_dispatch:
     inputs:
       args:
-        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant snapshot --variant freeze --variant off --variant snapshot+unmap --repeat 3"
+        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant both+freeze --variant freeze --variant snapshot --repeat 3 (--no-visual: no pixel checks; --no-windows: none of the other windows)"
         type: string
         default: ""
       patch:
@@ -104,4 +107,5 @@ jobs:
           path: |
             resize-bench.json
             resize-bench.log
+            resize-bench-frames/
           if-no-files-found: warn

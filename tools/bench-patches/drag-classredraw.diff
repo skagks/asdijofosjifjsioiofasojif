@@ -55,7 +55,7 @@ index b986986..154bcb4 100644
  
      def _bind_wheel(self, widget, canvas):
 diff --git a/mhwmm/gui.py b/mhwmm/gui.py
-index a3864cc..bc01c33 100644
+index a3864cc..0a28865 100644
 --- a/mhwmm/gui.py
 +++ b/mhwmm/gui.py
 @@ -2,6 +2,7 @@
@@ -66,7 +66,7 @@ index a3864cc..bc01c33 100644
  import gc
  import logging
  import os
-@@ -151,28 +152,362 @@ def autohide(scrollbar: ttk.Scrollbar, **pack_options):
+@@ -151,28 +152,509 @@ def autohide(scrollbar: ttk.Scrollbar, **pack_options):
  
  
  # While a window's edge is dragged, Tk gets a new size for every mouse step (on Windows each one is handled
@@ -86,9 +86,9 @@ index a3864cc..bc01c33 100644
 +#   "snapshot": a picture of the content stands in for it (one Label) and the content is moved out of the window.
 +#               On Windows each step of the drag makes Windows repaint every child window of the toplevel, also
 +#               the ones whose size did not change (Tk's window classes have CS_HREDRAW|CS_VREDRAW: the resized
-+#               toplevel is invalidated with all its children), and Tk draws each of them again: with the content
-+#               out of the window only the picture is drawn. Needs _capture_content (Windows only); elsewhere, or
-+#               when taking the picture fails, it is "freeze".
++#               toplevel is invalidated with all its children; see RESIZE_CLASS_REDRAW), and Tk draws each of them
++#               again: with the content out of the window only the picture is drawn. Needs _capture_content
++#               (Windows only); elsewhere, or when taking the picture fails, it is "freeze".
 +#   "freeze":   the content keeps its size (nothing in it is laid out again; on Windows it is still drawn again).
 +#   "off":      the content is laid out again on every step (for comparing in the resize benchmark).
 +RESIZE_MODE = "snapshot"
@@ -115,6 +115,21 @@ index a3864cc..bc01c33 100644
 +RESIZE_SNAPSHOT_HIDE = "away"
 +# No picture of a bigger content (it is copied a few times, 4 bytes a pixel, while the picture is made)
 +SNAPSHOT_MAX_PIXELS = 3840 * 2160
++# Windows: Tk registers its window classes with CS_HREDRAW|CS_VREDRAW (TkTopLevel, a toplevel's outer window:
++# tkWinWm.c; TkChild, every other Tk window, the toplevel's own one too: tkWinX.c), so on each step of a drag of
++# the window's edge Windows has the resized windows repainted whole, with all their child windows, also the ones
++# whose size did not change (the content FreezeContent keeps as it is too), and Tk draws each of them again. What
++# class_redraw takes these two styles off, once per process (a class's style is the process's: all its Tk
++# windows of that class):
++#   "keep":  nothing (Tk as it is);
++#   "top":   the outer windows' class only;
++#   "child": the class of all the other windows only;
++#   "both":  both classes.
++# Without them Windows repaints only what a resize uncovered; Tk's widgets draw themselves again whole when their
++# own size changes (their <Configure>). Combines with RESIZE_MODE. Chosen with the resize benchmark
++# (tools/resize_bench.py: its visual checks look for stale pixels after a drag, a maximize and a theme switch).
++RESIZE_CLASS_REDRAW = "keep"
++RESIZE_CLASS_REDRAWS = ("keep", "top", "child", "both")
  _RESIZE_TAG = "MhwmmResize"
  
  
@@ -412,10 +427,142 @@ index a3864cc..bc01c33 100644
 +_capture_content = _gdi_capture if sys.platform == "win32" else None
 +
 +
++def _last_error(ctypes) -> int:
++    """Windows' last error of a ctypes call made with use_last_error (0 elsewhere)."""
++    get = getattr(ctypes, "get_last_error", None)
++    return int(get()) if get is not None else 0
++
++
++class _WinClasses:
++    """Tk's window classes for RESIZE_CLASS_REDRAW: found from a toplevel's windows with GetClassNameW (never by a
++    name taken for granted), and CS_HREDRAW|CS_VREDRAW taken off their style (SetClassLongPtrW, GCL_STYLE)."""
++
++    GCL_STYLE = -26
++    CS_VREDRAW, CS_HREDRAW = 0x0001, 0x0002
++
++    def __init__(self):
++        import ctypes
++        from ctypes import wintypes as wt
++
++        self.ctypes, self.wt = ctypes, wt
++        self.f = _win_functions("user32", {
++            "GetClassNameW": (ctypes.c_int, wt.HWND, wt.LPWSTR, ctypes.c_int),
++            "GetParent": (wt.HWND, wt.HWND),
++            "GetWindowThreadProcessId": (wt.DWORD, wt.HWND, ctypes.POINTER(wt.DWORD)),
++        })
++        try:  # (64-bit; a 32-bit user32 has only the ...Long functions, the same there)
++            styles = _win_functions("user32", {
++                "GetClassLongPtrW": (ctypes.c_size_t, wt.HWND, ctypes.c_int),
++                "SetClassLongPtrW": (ctypes.c_size_t, wt.HWND, ctypes.c_int, ctypes.c_ssize_t),
++            })
++            self.get_style, self.set_style = styles["GetClassLongPtrW"], styles["SetClassLongPtrW"]
++        except AttributeError:
++            styles = _win_functions("user32", {
++                "GetClassLongW": (wt.DWORD, wt.HWND, ctypes.c_int),
++                "SetClassLongW": (wt.DWORD, wt.HWND, ctypes.c_int, wt.LONG),
++            })
++            self.get_style, self.set_style = styles["GetClassLongW"], styles["SetClassLongW"]
++
++    def class_name(self, hwnd: int) -> str:
++        buf = self.ctypes.create_unicode_buffer(256)
++        n = self.f["GetClassNameW"](hwnd, buf, len(buf))
++        return buf.value[:n] if n > 0 else ""
++
++    def ours(self, hwnd: int) -> bool:
++        """The window is this process's."""
++        pid = self.wt.DWORD()
++        return bool(self.f["GetWindowThreadProcessId"](hwnd, self.ctypes.byref(pid))) and pid.value == os.getpid()
++
++    def windows(self, top: tk.Misc) -> dict:
++        """{"child": (class name, handle) of the toplevel's own window, "top": (class name, handle) of its outer
++        window: the parent of its own window (GetParent) that `wm frame` names, there once the toplevel has been
++        shown}. A kind is left out while its window is not there, is not this process's or has the other's class."""
++        inner = int(top.winfo_id())
++        name = self.class_name(inner)
++        if not name or not self.ours(inner):
++            return {}
++        out = {"child": (name, inner)}
++        outer = int(self.f["GetParent"](inner) or 0)
++        try:
++            frame = int(str(top.wm_frame()), 16)
++        except (tk.TclError, ValueError):
++            frame = 0
++        if outer and outer == frame and outer != inner and self.ours(outer):
++            outer_name = self.class_name(outer)
++            if outer_name and outer_name != name:
++                out["top"] = (outer_name, outer)
++        return out
++
++    def drop_redraw(self, hwnd: int) -> tuple[int, int]:
++        """CS_HREDRAW|CS_VREDRAW off the class of the window ``hwnd``: (its style before, after)."""
++        mask = self.CS_HREDRAW | self.CS_VREDRAW
++        before = int(self.get_style(hwnd, self.GCL_STYLE))
++        if before & mask:
++            self.set_style(hwnd, self.GCL_STYLE, before & ~mask)
++        after = int(self.get_style(hwnd, self.GCL_STYLE))
++        if after & mask:
++            raise OSError(f"the class style is still {after:#x} (error {_last_error(self.ctypes)})")
++        return before, after
++
++
++_CLASSES: list = []  # [the _WinClasses, or None], made the first time it is needed
++# What class_redraw did, by kind ("top", "child"): {"class": its name, "before": style, "after": style}, or with
++# "error" (not tried again). Read by the resize benchmark.
++_CLASS_REDRAW: dict = {}
++_CLASS_REDRAW_KINDS = {"top": ("top",), "child": ("child",), "both": ("top", "child")}
++
++
++def _win_classes():
++    """Tk's window classes on Windows (_WinClasses), or None (not Windows, or not usable here)."""
++    if not _CLASSES:
++        api = None
++        if sys.platform == "win32":
++            try:
++                api = _WinClasses()
++            except Exception as exc:
++                log.debug("창 클래스를 바꿀 수 없습니다: %s", exc)
++        _CLASSES.append(api)
++    return _CLASSES[0]
++
++
++def class_redraw(top: tk.Misc) -> None:
++    """Take CS_HREDRAW|CS_VREDRAW off Tk's window classes as RESIZE_CLASS_REDRAW says (Windows; nothing elsewhere),
++    each class once per process: the class of the toplevel's own window at once, its outer window's once the
++    toplevel has been shown (called again at each <Configure> until then). Never raises: a class that cannot be
++    changed stays as it is."""
++    todo = [kind for kind in _CLASS_REDRAW_KINDS.get(RESIZE_CLASS_REDRAW, ()) if kind not in _CLASS_REDRAW]
++    if not todo:
++        return
++    api = _win_classes()
++    if api is None:
++        return
++    try:
++        found = api.windows(top)
++    except Exception as exc:
++        for kind in todo:
++            _CLASS_REDRAW[kind] = {"error": f"{type(exc).__name__}: {exc}"}
++        log.debug("창 클래스를 찾지 못했습니다: %s", exc)
++        return
++    for kind in todo:
++        if kind not in found:
++            continue  # (the outer window: not shown yet)
++        name, hwnd = found[kind]
++        try:
++            before, after = api.drop_redraw(hwnd)
++        except Exception as exc:
++            _CLASS_REDRAW[kind] = {"class": name, "error": f"{type(exc).__name__}: {exc}"}
++            log.debug("창 클래스 %s의 스타일을 바꾸지 못했습니다: %s", name, exc)
++            continue
++        _CLASS_REDRAW[kind] = {"class": name, "before": before, "after": after}
++        log.debug("창 클래스 %s: CS_HREDRAW|CS_VREDRAW 끔 (%#x -> %#x)", name, before, after)
++
++
  def _note_resize(event):
      top = event.widget
      if isinstance(top, str):  # (a toplevel tkinter does not know)
          return
++    if RESIZE_CLASS_REDRAW != "keep":
++        class_redraw(top)  # (the outer window's class once the toplevel has been shown; then nothing)
 +    probe = _pointer() if RESIZE_FIRST_STEP else None
 +    before = getattr(top, "_mhwmm_place", None)
 +    top._mhwmm_place = after = _place(top, probe) if probe is not None else None  # (Windows: also when moved)
@@ -436,7 +583,18 @@ index a3864cc..bc01c33 100644
          top._mhwmm_size, top._mhwmm_changed = size, now
          top._mhwmm_resized, top._mhwmm_alone = (now, alone) if drag else (None, now)
          for on_size in getattr(top, "_mhwmm_on_size", ()):
-@@ -195,185 +530,191 @@ def watch_resizing(top: tk.Misc, on_size=None):
+@@ -181,7 +663,9 @@ def _note_resize(event):
+ 
+ def watch_resizing(top: tk.Misc, on_size=None):
+     """Note when the toplevel ``top`` changes size (for ``resizing``) and then call ``on_size(event)``: before
+-    anything in the window is laid out for the new size. One binding on the toplevel only."""
++    anything in the window is laid out for the new size. One binding on the toplevel only. Also takes the redraw
++    styles off Tk's window classes as RESIZE_CLASS_REDRAW says (class_redraw)."""
++    class_redraw(top)
+     if on_size is not None:
+         top._mhwmm_on_size = getattr(top, "_mhwmm_on_size", ()) + (on_size,)
+     tags = top.bindtags()
+@@ -195,185 +679,191 @@ def watch_resizing(top: tk.Misc, on_size=None):
  def resizing(widget: tk.Misc) -> bool:
      """True while the window of ``widget`` is being resized by dragging its edge: its size changed less than
      RESIZE_SETTLE_MS ago, and less than RESIZE_SETTLE_MS after the change before (or soon after a change on its
@@ -781,7 +939,7 @@ index a3864cc..bc01c33 100644
  
  
  class QueueLogHandler(logging.Handler):
-@@ -478,6 +819,10 @@ class RowTooltip(Tooltip):
+@@ -478,6 +968,10 @@ class RowTooltip(Tooltip):
  class Dialog(tk.Toplevel):
      """Small modal dialog base."""
  
@@ -792,7 +950,7 @@ index a3864cc..bc01c33 100644
      def __init__(self, parent, theme: Theme, title: str):
          super().__init__(parent)
          self.withdraw()
-@@ -503,6 +848,8 @@ class Dialog(tk.Toplevel):
+@@ -503,6 +997,8 @@ class Dialog(tk.Toplevel):
      def show(self):
          self.update_idletasks()
          x, y = self._position()
@@ -801,7 +959,7 @@ index a3864cc..bc01c33 100644
          self.geometry(f"+{x}+{y}")
          set_dark_titlebar(self, self.theme.name == "dark")
          self.deiconify()
-@@ -511,6 +858,15 @@ class Dialog(tk.Toplevel):
+@@ -511,6 +1007,15 @@ class Dialog(tk.Toplevel):
          self.wait_window()
          return self.result
  
@@ -817,7 +975,7 @@ index a3864cc..bc01c33 100644
      def _position(self) -> tuple[int, int]:
          """Where show() puts the dialog: over its parent, centred and a third of the way down."""
          parent = self.master
-@@ -647,6 +1003,7 @@ class HelpDialog(Dialog):
+@@ -647,6 +1152,7 @@ class HelpDialog(Dialog):
      """Usage guide: topics on the left, the whole guide as one scrolling page on the right."""
  
      INLINE = re.compile(r"\*\*(.+?)\*\*|\[\[(.+?)\]\]")
@@ -825,7 +983,7 @@ index a3864cc..bc01c33 100644
  
      def __init__(self, parent, theme: Theme, topic: str | None = None):
          super().__init__(parent, theme, "사용법")
-@@ -785,6 +1142,8 @@ class HelpDialog(Dialog):
+@@ -785,6 +1291,8 @@ class HelpDialog(Dialog):
  class ConflictsDialog(Dialog):
      """Every two enabled mods that change the same files; result is a mod id to show in the list."""
  
@@ -834,7 +992,7 @@ index a3864cc..bc01c33 100644
      def __init__(self, parent, theme: Theme, manager: ModManager):
          super().__init__(parent, theme, "충돌 한눈에 보기")
          px = theme.px
-@@ -2443,6 +2802,9 @@ class App:
+@@ -2443,6 +2951,9 @@ class App:
          self._restore_window()
          self._set_icon()
  
@@ -844,7 +1002,7 @@ index a3864cc..bc01c33 100644
          self._build_header()
          self._build_toolbar()
          self._build_statusbar()
-@@ -2483,7 +2845,13 @@ class App:
+@@ -2483,7 +2994,13 @@ class App:
          s = self.manager.settings
          ratio = min(0.8, max(0.3, s.sash_ratio)) if s.remember_window else 0.58
          if width > 1:
@@ -859,7 +1017,7 @@ index a3864cc..bc01c33 100644
  
      def _restore_window(self):
          s = self.manager.settings
-@@ -2508,7 +2876,8 @@ class App:
+@@ -2508,7 +3025,8 @@ class App:
      def _save_window_state(self):
          s = self.manager.settings
          try:
@@ -869,7 +1027,7 @@ index a3864cc..bc01c33 100644
              changes: dict = {"log_visible": self._log_visible}
              if s.remember_window:
                  zoomed = self.root.state() == "zoomed"
-@@ -2531,9 +2900,9 @@ class App:
+@@ -2531,9 +3049,9 @@ class App:
  
      def _build_header(self):
          t, px = self.theme, self.theme.px
@@ -881,7 +1039,7 @@ index a3864cc..bc01c33 100644
  
          ttk.Label(header, image=t.image("logo", 40), style="Header.TLabel").pack(side="left")
          titles = ttk.Frame(header, style="Header.TFrame")
-@@ -2611,7 +2980,7 @@ class App:
+@@ -2611,7 +3129,7 @@ class App:
  
      def _build_toolbar(self):
          t, px = self.theme, self.theme.px
@@ -890,7 +1048,7 @@ index a3864cc..bc01c33 100644
          bar.pack(fill="x")
          self.buttons: dict[str, ttk.Button] = {}
  
-@@ -2654,9 +3023,9 @@ class App:
+@@ -2654,9 +3172,9 @@ class App:
  
      def _build_statusbar(self):
          px = self.theme.px
@@ -902,7 +1060,7 @@ index a3864cc..bc01c33 100644
          self.status_sep.pack(side="bottom", fill="x")
          self.status_var = tk.StringVar(value="준비")
          ttk.Label(self.status_frame, textvariable=self.status_var, style="StatusMuted.TLabel").pack(side="left")
-@@ -2671,7 +3040,7 @@ class App:
+@@ -2671,7 +3189,7 @@ class App:
  
      def _build_log(self):
          t, px = self.theme, self.theme.px
@@ -911,7 +1069,7 @@ index a3864cc..bc01c33 100644
          self.log_frame.pack(side="bottom", fill="x")
          card = t.mark(tk.Frame(self.log_frame), "card")
          card.pack(fill="x")
-@@ -2685,7 +3054,7 @@ class App:
+@@ -2685,7 +3203,7 @@ class App:
      def _build_notice(self):
          """A bar under the toolbar, shown when the last game ended in a crash (it does not block anything)."""
          t, px = self.theme, self.theme.px
@@ -920,7 +1078,7 @@ index a3864cc..bc01c33 100644
          self.notice_title = ttk.Label(self.notice, text="", style="CalloutTitle.TLabel")
          self.notice_title.pack(side="left")
          self.notice_detail = ttk.Label(self.notice, text="", style="Callout.TLabel")
-@@ -2700,7 +3069,8 @@ class App:
+@@ -2700,7 +3218,8 @@ class App:
      def _build_bisect_bar(self):
          """The bar under the toolbar while 원인 모드 찾기 runs: the step, starting the game, stopping."""
          px = self.theme.px
@@ -930,7 +1088,7 @@ index a3864cc..bc01c33 100644
          buttons = ttk.Frame(bar, style="Banner.TFrame")
          buttons.pack(side="right", padx=(px(12), 0))
          text = ttk.Frame(bar, style="Banner.TFrame")
-@@ -2725,7 +3095,7 @@ class App:
+@@ -2725,7 +3244,7 @@ class App:
  
      def _build_main(self):
          t, px = self.theme, self.theme.px
@@ -939,7 +1097,7 @@ index a3864cc..bc01c33 100644
          paned.pack(fill="both", expand=True, padx=px(20), pady=(px(10), px(12)))
  
          # ---- mod list card
-@@ -2834,7 +3204,7 @@ class App:
+@@ -2834,7 +3353,7 @@ class App:
          window = self.options_canvas.create_window((0, 0), window=self.options_inner, anchor="nw")
          self.options_inner.bind("<Configure>", lambda e: self.options_canvas.configure(
              scrollregion=self.options_canvas.bbox("all")))
@@ -948,7 +1106,7 @@ index a3864cc..bc01c33 100644
          self._option_vars: list[tuple[str, tk.BooleanVar]] = []
          self.notebook.add(self.options_tab, text="옵션", state="hidden")
  
-@@ -2857,8 +3227,6 @@ class App:
+@@ -2857,8 +3376,6 @@ class App:
          self.notebook.add(conflicts, text="충돌")
          self.conflicts_tab = conflicts
          paned.add(right, weight=2)
