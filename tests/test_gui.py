@@ -935,9 +935,9 @@ def test_gui_bisect_finds_the_mod_and_goes_back(root, manager, tmp_path, game_di
     app.show_bisect()  # ☰ → 원인 모드 찾기
     pump(root, lambda: app._bisect is not None and app.busy is None and not manager.dirty)
     assert any("켜져 있는 모드 4개 중" in t for t in seen["start"])
-    assert any("계속 켜 둘 모드: REFramework" in t for t in seen["start"])
+    assert any("다른 모드에 필요한 모드(그 모드를 켤 때 함께 켬): REFramework" in t for t in seen["start"])
     assert manager.profile == bisect.TEMP_PROFILE and app.bisect_bar.winfo_manager() == "pack"
-    assert app.bisect_title.cget("text").startswith("원인 찾기 1/")
+    assert app.bisect_title.cget("text") == "원인 찾기 · 1번째 실행"
     assert "적용했습니다" in app.bisect_text.cget("text")
     assert app.bisect_main.cget("text") == "▶  " + bisect.BUTTON_LAUNCH
     assert "원인 찾기 (임시)" in app.profile_button.cget("text")
@@ -953,6 +953,7 @@ def test_gui_bisect_finds_the_mod_and_goes_back(root, manager, tmp_path, game_di
 
     def result_show(self):
         seen["result"] = texts(self)
+        seen["steps"] = [dict(s) for s in self.session.steps]
         self.destroy()
         return "disable", self.mods
 
@@ -969,10 +970,15 @@ def test_gui_bisect_finds_the_mod_and_goes_back(root, manager, tmp_path, game_di
         assert app.bisect_text.cget("text") == gui.BISECT_PLAYING
         on = {m.id for m in manager.mods if m.enabled}
         assert (game_dir / "natives/STM/b.tex").exists() == (ids["Armor B"] in on)  # the step is in the game folder
-        pump(root, lambda: len(asked) > n and app.busy is None and not app._apply_pending)
+        # (the next launch is worked out on another thread, then applied)
+        pump(root, lambda: len(asked) > n and app.busy is None and not app._apply_pending
+             and (app._bisect is None or (app._bisect_ready() and not manager.dirty)))
     # only a crash the manager saw is the answer picked first (an exit with code 0 is not taken as fine)
     assert asked and all(default == ("crashed" if crash else None) for default, crash in asked)
-    assert any("원인으로 보이는 모드: Armor B" in t for t in seen["result"])
+    assert any("원인으로 의심되는 모드: Armor B" in t for t in seen["result"])
+    # what the manager saw of each step's game went with the answer: how long it ran, a detected crash
+    assert all(s["seconds"] is not None and s["seconds"] < 60 for s in seen["steps"])
+    assert all(s["auto"] == ("crash" if s["crashed"] else "") for s in seen["steps"])
     assert app._bisect is None and not app.bisect_bar.winfo_manager() and not bisect.active(manager.data_dir)
     pump(root, lambda: app.busy is None and not manager.dirty)
     assert manager.profile == "기본" and list(manager.profiles) == ["기본"]
@@ -1188,7 +1194,8 @@ def test_gui_bisect_asks_when_the_answer_can_be_taken(root, manager, tmp_path, g
     try:
         app2 = gui.App(root2, manager.__class__(manager.data_dir), queue.Queue())
         watch_fast(app2.watcher, game)
-        pump(root2, lambda: app2.watcher.pid == pid)  # opened again: it finds the game and waits for it
+        # opened again: it finds the game and waits for it (the search's next launch worked out again first)
+        pump(root2, lambda: app2.watcher.pid == pid and app2._bisect_ready())
         assert app2._bisect.awaiting_answer and app2.bisect_text.cget("text") == gui.BISECT_PLAYING and not asked
         # the game crashes while 모든 모드 재질 점검 runs: the question waits until the answer can be taken
         app2.busy = "matfix"
@@ -1203,7 +1210,8 @@ def test_gui_bisect_asks_when_the_answer_can_be_taken(root, manager, tmp_path, g
         pump(root2, lambda: bool(asked))
         default, shown = asked[0]
         assert default == "crashed" and any("비정상 종료를 확인했습니다 (0xC0000005)" in t for t in shown)
-        pump(root2, lambda: app2.busy is None and not app2._apply_pending and not app2.manager.dirty)
+        pump(root2, lambda: app2.busy is None and not app2._apply_pending and not app2.manager.dirty
+             and app2._bisect_ready())
         session = app2._bisect
         assert session.steps[0]["crashed"] and session.steps[0]["exit"]["code"] == 0xC0000005
         assert "적용했습니다" in app2.bisect_text.cget("text")
@@ -1333,6 +1341,315 @@ def test_gui_bisect_resumes_after_the_startup_checks(root, manager, tmp_path, ga
     # the folder was checked before the step's deploy started, not while it changed the folder
     assert state["verified"] == [False] and not asked
     assert app._bisect is not None and "적용했습니다" in app.bisect_text.cget("text")
+
+
+def v2_plan(evidence=None, **kw):
+    """A plan over REFramework and twelve plain mods (synthetic facts, no manager)."""
+    from mhwmm import bisect
+
+    from test_bisect import twelve
+
+    return bisect.make_plan(twelve(), profile="기본", evidence=evidence, **kw)
+
+
+def test_gui_bisect_start_window(root, monkeypatch, tmp_path):
+    from mhwmm import accessed, bisect, gui
+
+    from test_bisect import Ev
+
+    theme = gui.Theme(root, "dark")
+    # a crash in a mod's plugin: that mod first with its 근거, the rest summed up
+    ev = Ev(shares={"m7": 0.5}, reasons={"m7": ["튕긴 곳이 이 모드의 플러그인입니다 (m7.dll + 0x10)"]},
+            none_reasons=["Windows 시스템 파일에서 튕겼습니다"], minutes_hint=9.0, record_title="10월 21일 18:45 · 오류 코드",
+            equipment=[("armor:1", "레더 메일", ["m1", "m2"]), ("armor:2", "본 헬름", ["m3"])])
+    plan = v2_plan(ev)
+    offer = accessed.Offer(True, False, accessed.LOG_NOTE, {accessed.LOG_KEY: "true"}, "x/re2_fw_config.txt")
+    dialog = gui.BisectStartDialog(root, theme, plan, "", offer, log_files=True)
+    shown = texts(dialog)
+    assert "게임 튕김 기록: 10월 21일 18:45 · 오류 코드" in shown and plan.intro() in shown
+    assert bisect.RANKING_HEADING in shown and "'Mod 7'" in shown
+    assert any(t.startswith("약 ") and t.endswith("%") for t in shown)
+    assert "근거: 튕긴 곳이 이 모드의 플러그인입니다 (m7.dll + 0x10)" in shown
+    assert any(t.startswith("그 밖: 나머지 모드 ") and "모드 문제가 아닐 수 있는 근거: Windows 시스템 파일" in t for t in shown)
+    assert bisect.WHEN_TEXT["equip"] in shown and gui.BISECT_RECENT.format(m=9) in shown
+    assert dialog.when_var.get() == "same" and accessed.LOG_NOTE in shown
+    assert dialog.log_var.get() and "disabled" not in dialog.log_check.state()  # (the last choice)
+    assert dialog.choice() == {"when": "same", "minutes": None, "equip": None, "log": True}
+    dialog.when_var.set("time")
+    dialog.minutes_var.set("12")
+    dialog.log_var.set(False)
+    assert dialog.choice() == {"when": "time", "minutes": 12.0, "equip": None, "log": False}
+    dialog.equip_picker.current(1)
+    dialog.when_var.set("equip")
+    dialog.ok()
+    assert dialog.result == {"when": "equip", "minutes": None, "equip": "armor:2", "log": False}
+    # the box left at the record's minutes (rounded) is not a time the user typed: the record's crash times stay
+    timed = v2_plan(Ev(minutes_hint=16.7, when_hint="time", crash_times=[1000.0, 3010.0, 3600.0]))
+    dialog = gui.BisectStartDialog(root, theme, timed, "", offer)
+    assert dialog.minutes_var.get() == "17" and dialog.choice() == {"when": "time", "minutes": None, "equip": None,
+                                                                    "log": False}
+    choice = dialog.choice()
+    session = bisect.Session.new(tmp_path, timed, "기본", {}, "temp", when=choice["when"], minutes=choice["minutes"])
+    assert not session.data["minutes_typed"] and session.data["params"]["passive_times"]
+    assert session.data["crash_times"] == [1000.0, 3010.0, 3600.0]
+    dialog.minutes_var.set("30")  # (typed: it replaces them)
+    assert dialog.choice()["minutes"] == 30.0
+    dialog.destroy()
+
+    # no evidence at all: no rows, the same suspicion for every mod; the record cannot be turned on; no equipment
+    plain = v2_plan()
+    dialog = gui.BisectStartDialog(root, theme, plain, "", accessed.Offer(False, False, accessed.LOG_UNAVAILABLE_LOOSE),
+                                   log_files=True)
+    shown = texts(dialog)
+    assert bisect.NO_EVIDENCE in shown and "'Mod 7'" not in shown and bisect.WHEN_TEXT["equip"] not in shown
+    assert accessed.LOG_UNAVAILABLE_LOOSE in shown and not dialog.log_var.get()
+    assert "disabled" in dialog.log_check.state()
+    assert not any("그래픽" in t for t in shown)
+    dialog.destroy()
+    # already on (REFramework settings): ticked, nothing to change; a graphics device error says what to try first
+    device = v2_plan(Ev(device_error="DEVICE_HUNG", none_scale=4.0))
+    dialog = gui.BisectStartDialog(root, theme, device, "", accessed.Offer(True, True, accessed.LOG_ALREADY))
+    shown = texts(dialog)
+    assert dialog.log_var.get() and "disabled" in dialog.log_check.state() and accessed.LOG_ALREADY in shown
+    assert device.device_note() in shown and "그래픽카드가 응답하지 않는 오류(DEVICE_HUNG)" in device.device_note()
+    assert v2_plan(Ev(device_error="DEVICE_REMOVED")).device_note() == ""
+    dialog.destroy()
+    # a window taller than the screen scrolls (its buttons stay under it)
+    monkeypatch.setattr(gui.BisectStartDialog, "winfo_screenheight", lambda self: 500)
+    dialog = gui.BisectStartDialog(root, theme, plan, "", offer)
+    dialog.update_idletasks()
+    assert dialog.scroll.scrollbar.winfo_manager() == "pack" and dialog.scroll.canvas.winfo_reqheight() < 500
+    dialog.destroy()
+
+
+def test_gui_bisect_ask_window_notes(root):
+    from mhwmm import bisect, gamewatch, gui
+
+    theme = gui.Theme(root, "dark")
+    names = {"a": "Armor A", "b": "Armor B", "r": "REFramework"}
+    step = bisect.Step(3, 7, "off_some", ["r", "a"], ["b"], reason="split", focus=["b"],
+                       ranking=[bisect.Suspect("one", ("a",), 0.62)], suspects=2, p=0.62, remaining=(2, 4), minutes=22,
+                       crash_minutes=10.0, play="22분 넘게 해 보세요.")
+    now = time.time()
+    normal = gamewatch.Detection(False, "", gamewatch.GameExit(1, 0, now, now - 240))
+    run = {"seconds": 240.0, "log": True, "unexposed": ["a"], "tail": [], "record": "", "auto": "normal"}
+    dialog = gui.BisectAskDialog(root, theme, step, normal, names, run, retries=2)
+    shown = texts(dialog)
+    assert "3번째 실행 · 'Armor B'만 끄고 실행" in shown
+    assert bisect.run_note(step, 240.0) in shown and "4분만 실행했습니다" in bisect.run_note(step, 240.0)
+    assert bisect.exposure_note(step, ["a"], names) in shown and gui.BISECT_RETRY_HINT in shown
+    assert dialog.default is None
+    dialog.destroy()
+    # a crash: the mods whose files the game read right before it (play time is not the question then)
+    crash = gamewatch.Detection(True, "c0000005", gamewatch.GameExit(1, 0xC0000005, now, now - 900))
+    run = {"seconds": 900.0, "log": True, "unexposed": [], "tail": ["b", "a"], "record": "", "auto": "crash"}
+    dialog = gui.BisectAskDialog(root, theme, step, crash, names, run)
+    shown = texts(dialog)
+    assert gui.BISECT_TAIL.format(mods="'Armor B', 'Armor A'") in shown and dialog.default == "crashed"
+    assert not any("오래 했습니다" in t for t in shown) and gui.BISECT_RETRY_HINT not in shown
+    dialog.destroy()
+
+
+def test_gui_bisect_more_confirm_and_stopping(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import bisect, gui
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    ids = bisect_mods(manager, tmp_path)
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+    monkeypatch.setattr(gui.BisectStartDialog, "show", lambda self: (self.destroy(), {"when": "same"})[1])
+    app._open_bisect_start(bisect.prepare(manager), False, "")
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    session = app._bisect
+
+    # 그만두기 before a result says what is suspected most so far
+    asked = []
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: asked.append(a[1]) or False)
+    app.stop_bisect()
+    # (every mod as suspected as the others yet: none is named for its place in the list)
+    assert asked[0].endswith(" 아직 두드러지게 의심되는 모드는 없습니다(같은 정도 4개, 각각 약 20%).") and app._bisect is session
+
+    # while the next launch is worked out the bar says so and only 그만두기 is there
+    app._bisect_computing = True
+    app._show_bisect_bar()
+    assert app.bisect_title.cget("text") == "원인 찾기" and app.bisect_text.cget("text") == gui.BISECT_COMPUTING
+    assert not app.bisect_main.winfo_manager() and app.bisect_stop.winfo_manager() == "pack"
+    app.launch_game()  # (nothing starts meanwhile)
+    pump(root, lambda: app.status_var.get() == gui.BISECT_COMPUTING)
+    assert session.launched is None
+    app._bisect_computing = False
+    app._show_bisect_bar()
+    step = session.next()
+    assert app.bisect_text.cget("text").endswith(bisect.progress_text(step, session.names))
+    assert "의심되는 모드 " in app.bisect_text.cget("text") and app.bisect_main.winfo_manager() == "pack"
+
+    # answered like a user whose game crashes with Armor A: found, then 한 번 더 확인 goes on with three pairs
+    seen = []
+
+    def result_show(self):
+        seen.append((texts(self), self.more))
+        self.destroy()
+        return ("more",) if len(seen) == 1 else ("restore",)
+
+    monkeypatch.setattr(gui.BisectResultDialog, "show", result_show)
+    for _ in range(20):
+        nxt = session.next()
+        if not isinstance(nxt, bisect.Step) or seen:
+            break
+        session.mark_launched()
+        app._answer_bisect(ids["Armor A"] in nxt.on)
+        pump(root, lambda: app._bisect is None or (app._bisect_ready() and app.busy is None and not manager.dirty
+                                                   and not app._apply_pending))
+        if not seen:  # how the answer moved the top suspect stays in the bar (the deploy takes the status bar over)
+            change = session.last_change()
+            assert change.startswith("원인 찾기: ") and app.bisect_text.cget("text").endswith("\n" + change)
+    shown, more = seen[0]
+    assert more == bisect.RESULT_CONFIRM and bisect.RESULT_CONFIRM in shown and "근거" in shown
+    assert any("원인으로 의심되는 모드: Armor A (가능성 약 " in t for t in shown)
+    pump(root, lambda: app._bisect_ready() and app.busy is None and not manager.dirty)
+    assert session.strict and isinstance(session.next(), bisect.Step) and app._bisect is session
+    for _ in range(12):
+        nxt = session.next()
+        if not isinstance(nxt, bisect.Step):
+            break
+        session.mark_launched()
+        app._answer_bisect(ids["Armor A"] in nxt.on)
+        pump(root, lambda: app._bisect is None or (app._bisect_ready() and app.busy is None and not manager.dirty
+                                                   and not app._apply_pending))
+    pump(root, lambda: len(seen) == 2 and app._bisect is None and app.busy is None)
+    assert seen[1][1] == "" and manager.profile == "기본" and all(m.enabled for m in manager.mods)
+
+    # unsure: 계속 찾기 and turning the top suspect off only with its probability on the button
+    app._open_bisect_start(bisect.prepare(manager), False, "")
+    pump(root, lambda: app.busy is None and not manager.dirty and not app._apply_pending)
+    session = app._bisect
+    guess = session.interim()
+    session.data["result"] = bisect.Result("unsure", [ids["Armor B"]], 4, p=0.62, ranking=list(guess.ranking),
+                                           evidence=["'Armor B' 약 55%"], r_mean=0.9).to_dict()
+    session.save()
+    dialog = gui.BisectResultDialog(root, app.theme, manager, session, session.result)
+    shown = texts(dialog)
+    assert "아직 하나로 좁히지 못했습니다." in shown and bisect.RESULT_MORE in shown and dialog.more == bisect.RESULT_MORE
+    assert "'Armor B'(약 62%)을(를) 끄고 원래 프로필로" in shown and "지금까지 가장 의심되는 것" in shown
+    dialog.destroy()
+    weak = bisect.Result("unsure", [], 4, p=0.3, ranking=list(guess.ranking))
+    dialog = gui.BisectResultDialog(root, app.theme, manager, session, weak)
+    assert not any("끄고 원래 프로필로" in t and "약" in t for t in texts(dialog)) and dialog.mods == []
+    dialog.destroy()
+    monkeypatch.setattr(gui.BisectResultDialog, "show", lambda self: (self.destroy(), ("more",))[1])
+    app.show_bisect_result()
+    pump(root, lambda: app._bisect_ready() and app.busy is None and not manager.dirty)
+    assert session.extra == bisect.MORE_LAUNCHES and session.result is None and isinstance(session.next(), bisect.Step)
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: True)
+    app.stop_bisect()
+    pump(root, lambda: app._bisect is None and app.busy is None)
+    assert manager.profile == "기본" and not bisect.active(manager.data_dir)
+
+
+def test_gui_bisect_file_record_setting(root, manager, tmp_path, game_dir, monkeypatch):
+    from mhwmm import accessed, bisect, gui
+
+    from conftest import write
+
+    monkeypatch.setenv("APPDATA", "")
+    monkeypatch.setattr(gui, "is_game_running", lambda: False)
+    # REFramework and two PAK mods (natives\ has no files: loose loading may be switched on with the record)
+    ids = {}
+    for name, files in (("REFramework", {"dinput8.dll": "MZ"}), ("Pak A", {"a.pak": "A"}), ("Pak B", {"b.pak": "B"})):
+        with manager.prepare_install(make_zip(tmp_path / "zips" / f"{name}.zip", files)) as s:
+            ids[name] = manager.install_variant(s, s.variants[0]).id
+    manager.deploy()
+    config = write(game_dir / "re2_fw_config.txt", "FontSize=16\r\n")
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: app.busy is None)
+
+    seen = []
+
+    def start_show(self):
+        seen.append((texts(self), self.log_var.get(), str(self.log_check.state())))
+        self.log_var.set(True)
+        self.ok()
+        return self.result
+
+    monkeypatch.setattr(gui.BisectStartDialog, "show", start_show)
+    app.show_bisect()
+    pump(root, lambda: app._bisect is not None and app.busy is None and not manager.dirty)
+    shown, ticked, state = seen[0]
+    assert accessed.LOG_NOTE + accessed.LOG_NOTE_LOOSE in shown and not ticked and "disabled" not in state
+    assert b"LooseFileLoader_LogAccessedFiles=true" in config.read_bytes()
+    assert b"LooseFileLoader_Enabled=true" in config.read_bytes() and manager.settings.bisect_log_files
+    session = app._bisect
+    assert session.refw_restore["values"] == {accessed.LOOSE_KEY: None, accessed.LOG_KEY: None}
+
+    # back: the setting as it was (written "false", REFramework's default)
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: True)
+    app.stop_bisect()
+    pump(root, lambda: app._bisect is None and app.busy is None)
+    text = config.read_text()
+    assert "LooseFileLoader_LogAccessedFiles=false" in text and "LooseFileLoader_Enabled=false" in text
+    assert "FontSize=16" in text and not (manager.data_dir / accessed.RESTORE_FILE).exists()
+    assert app.status_var.get() == accessed.RESTORED  # (said after the deploy that follows, not replaced by "준비")
+
+    # the 게임 튕김 기록 window turns it on for good (no restore kept), and off again
+    write(manager.data_dir / accessed.RESTORE_FILE,
+          '{"format": 1, "time": 1, "restore": {"path": "", "values": {"LooseFileLoader_LogAccessedFiles": null}}}')
+    dialog = gui.CrashDialog(root, app.theme, manager, manager.crash_sessions())
+    assert "  " + accessed.CRASH_WINDOW_CHECKBOX in texts(dialog)
+    pump(root, lambda: dialog.access_offer is not None)
+    assert not dialog.access_var.get() and "disabled" not in dialog.access_check.state()
+    assert dialog.access_note.cget("text").startswith(gui.CRASH_ACCESS_OFF)
+    dialog.access_var.set(True)
+    dialog._toggle_access()
+    pump(root, lambda: dialog.access_offer is not None and dialog.access_offer.already)
+    text = config.read_text()
+    assert "LooseFileLoader_LogAccessedFiles=true" in text and "LooseFileLoader_Enabled=true" in text
+    assert not (manager.data_dir / accessed.RESTORE_FILE).exists()
+    # (what was just done stays said: the offer worked out again after it does not replace it)
+    assert dialog.access_var.get() and dialog.access_note.cget("text") == gui.CRASH_ACCESS_DONE
+    dialog.access_var.set(False)
+    dialog._toggle_access()
+    pump(root, lambda: not dialog.access_offer.already)
+    text = config.read_text()  # off: both settings it turned on as they were, as the window said
+    assert "LooseFileLoader_LogAccessedFiles=false" in text and "LooseFileLoader_Enabled=false" in text
+    assert not dialog.access_var.get() and dialog.access_note.cget("text") == gui.CRASH_ACCESS_OFF_DONE
+    assert not (manager.data_dir / accessed.KEPT_FILE).exists()
+    # on, then a mod with loose files installed: off keeps loose file loading on (else that mod would stop working)
+    dialog.access_var.set(True)
+    dialog._toggle_access()
+    pump(root, lambda: dialog.access_offer.already)
+    with manager.prepare_install(make_zip(tmp_path / "zips" / "Loose.zip", {"natives/STM/a.tex": "t"})) as s:
+        manager.install_variant(s, s.variants[0])
+    dialog.access_var.set(False)
+    dialog._toggle_access()
+    pump(root, lambda: not dialog.access_offer.already)
+    text = config.read_text()
+    assert "LooseFileLoader_LogAccessedFiles=false" in text and "LooseFileLoader_Enabled=true" in text
+    assert dialog.access_note.cget("text") == gui.CRASH_ACCESS_OFF_DONE + gui.CRASH_ACCESS_LOOSE_KEPT
+    dialog.destroy()
+    assert all(getattr(dialog, name) is None for name in ("session_var", "lua_var", "access_var", "dump_var"))
+    # on for a search that ended while the game ran (its restore waits for the game to close): not said to be on for
+    # good - ticked here, it is kept on (the restore dropped; turning it off here later puts it back)
+    write(config, "LooseFileLoader_Enabled=true\r\nLooseFileLoader_LogAccessedFiles=true\r\n")
+    write(manager.data_dir / accessed.RESTORE_FILE,
+          '{"format": 1, "time": 1, "restore": {"path": "", "values": {"LooseFileLoader_LogAccessedFiles": null}}}')
+    dialog = gui.CrashDialog(root, app.theme, manager, manager.crash_sessions())
+    pump(root, lambda: dialog.access_offer is not None)
+    assert dialog.access_offer.already and not dialog.access_var.get() and "disabled" not in dialog.access_check.state()
+    assert dialog.access_note.cget("text") == gui.CRASH_ACCESS_PENDING
+    dialog.access_var.set(True)
+    dialog._toggle_access()
+    pump(root, lambda: not (manager.data_dir / accessed.RESTORE_FILE).exists() and dialog.access_var.get()
+         and "disabled" not in dialog.access_check.state())
+    assert accessed.enabled_here(manager.data_dir)["values"] == {accessed.LOG_KEY: None}
+    assert dialog.access_note.cget("text") == gui.CRASH_ACCESS_DONE and "LogAccessedFiles=true" in config.read_text()
+    dialog.destroy()
+    # while a search runs it waits
+    dialog = gui.CrashDialog(root, app.theme, manager, manager.crash_sessions(), searching=True)
+    pump(root, lambda: dialog.access_offer is not None)
+    assert "disabled" in dialog.access_check.state() and dialog.access_note.cget("text") == gui.CRASH_ACCESS_SEARCHING
+    dialog.destroy()
+    assert ids and not bisect.active(manager.data_dir)
 
 
 # ---- 실행 전 점검 -----------------------------------------------------------------------------------

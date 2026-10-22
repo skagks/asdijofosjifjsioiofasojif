@@ -231,7 +231,7 @@ def test_requirements_as_mod_ids():
     assert "r" not in bisect.requirement_ids(mods)["app"]
 
 
-def test_the_plan_keeps_what_others_need_on():
+def test_the_plan_turns_what_others_need_on_with_them():
     mods = [
         facts(id="r", name="REFramework", refw=True),
         facts(id="lib", name="Lib", provides=frozenset({"lib"}), needs_refw=True),
@@ -239,13 +239,19 @@ def test_the_plan_keeps_what_others_need_on():
         facts(id="app", name="App", lua_requires=["lib"], needs_refw=True),
         facts(id="off", name="Off", enabled=False),
         facts(id="tex", name="Texture"),
+        facts(id="lost", name="Lost", hidden=True),
     ]
     plan = bisect.make_plan(mods, unmanaged=(["natives/STM/x.tex"], 1), profile="기본")
-    assert plan.base == ["r", "lib"] and plan.units == ["app", "tex"] and plan.excluded == ["opt"]
-    assert plan.core == ["r", "lib"] and plan.count == 4 and plan.split is None and plan.problem == ""
-    assert "켜져 있는 모드 4개" in plan.intro() and f"방식이라 약 {plan.runs}번 실행하면" in plan.intro()
+    # every mod that reaches the game is a suspect, REFramework and the library too
+    assert plan.units == ["r", "lib", "app", "tex"] and plan.base == ["r", "lib"] and plan.excluded == ["opt"]
+    assert plan.hidden == ["lost"] and plan.core == ["r", "lib"] and plan.count == 4 and plan.split is None
+    assert plan.problem == "" and plan.v2 and isinstance(plan.first, Step) and plan.first.number == 1
+    lo, hi = plan.estimate
+    assert 1 <= lo <= hi and plan.runs == hi and "켜져 있는 모드 4개" in plan.intro() and "예상: 게임을 약 " in plan.intro()
     lines = "\n".join(plan.lines())
-    assert "계속 켜 둘 모드: REFramework, Lib" in lines and "Options" in lines and "natives/STM/x.tex" in lines
+    assert "다른 모드에 필요한 모드(그 모드를 켤 때 함께 켬): REFramework, Lib" in lines and "Options" in lines
+    assert "natives/STM/x.tex" in lines and "파일이 모두 밀려 게임에 들어가지 않는 모드(빼고 찾음, 덮어쓰는 모드를 끌 때 함께 끔): Lost" in lines
+    assert "계속 켜 둘 모드" not in lines
     assert bisect.make_plan([facts(id="x", name="X", enabled=False)]).problem
 
 
@@ -267,10 +273,14 @@ def test_what_changed_since_the_last_normal_exit():
     text = changes.text({m.id: m.name for m in mods})
     assert "게임 업데이트" in text and "새로 켠 모드 1개(D)" in text and "업데이트한 모드 1개(B)" in text
     plan = bisect.make_plan(mods, last_good, "new")
-    assert plan.units == ["a", "b", "c", "d"] and plan.split == 1  # the unchanged one first
-    assert plan.runs_all >= plan.runs
-    first = bisect.next_step(plan.units, plan.base, plan.core, plan.requires, plan.split)
-    assert first.kind == "last_good" and set(first.on) == {"a", "r"}
+    assert plan.units == ["a", "b", "c", "d", "r"] and plan.split is None
+    # the last normal exit is an observation: unchanged mods on, changed ones unknown, a new one off; it says
+    # little after a game update
+    (good,) = [o for o in plan.passive if o.source == "last_good"]
+    assert good.on == {"a", "r"} and good.unknown == {"b", "c"} and not good.crashed and good.rho == 0.15
+    assert "바뀐 모드가 원인이면" not in plan.intro()
+    assert bisect.last_good_obs(last_good, mods, plan.units, "old").rho == 0.8
+    assert bisect.last_good_obs({"context": {"mods": []}}, mods, plan.units) is None
     assert bisect.changes_since(None, mods) is None
     same = {"context": {"mods": [{"id": m.id, "enabled": True, "stamp": m.stamp} for m in mods]}}
     assert bisect.changes_since(same, mods).text({}).endswith("바뀐 모드가 없습니다.")
@@ -401,7 +411,8 @@ def test_a_search_with_the_manager_leaves_the_user_s_profile_alone(manager, mods
     before = state(manager)
     original_snapshot = json.loads(json.dumps(manager.profiles["기본"]))
     plan = bisect.prepare(manager)
-    assert plan.base == [mods["refw"], mods["lib"]] and plan.units == [mods["app"], mods["a"], mods["b"]]
+    assert plan.base == [mods["refw"], mods["lib"]]
+    assert plan.units == [mods["refw"], mods["lib"], mods["app"], mods["a"], mods["b"]]
     assert plan.excluded == [mods["opts"]] and plan.profile == "기본" and plan.game_version
 
     session, step = bisect.start(manager, plan, record="20261016-153922")
@@ -412,10 +423,11 @@ def test_a_search_with_the_manager_leaves_the_user_s_profile_alone(manager, mods
         bisect.start(manager, plan)
 
     result = drive(manager, session, step, lambda on: mods["a"] in on)
-    assert result.kind == "found" and result.mods == [mods["a"]]
+    assert result.kind == "found" and result.mods == [mods["a"]] and result.p >= 0.95 and result.pivots >= 2
     assert manager.profiles["기본"] == original_snapshot  # still never touched
     lines = "\n".join(session.report_lines())
-    assert "결과: 원인으로 보이는 모드: Armor A" in lines and "튕김" in lines
+    assert "결과: 원인으로 의심되는 모드: Armor A (가능성 약 " in lines and "튕김" in lines
+    assert "이 모드를 끈 실행" in lines and "언제 튕기나요: 같은 장소·행동에서 매번" in lines
 
     bisect.finish(manager, session)
     assert state(manager) == before and manager.profile == "기본" and list(manager.profiles) == ["기본"]
@@ -437,15 +449,16 @@ def test_a_mod_with_its_library(manager, mods):
     session, step = bisect.start(manager, bisect.prepare(manager))
     result = drive(manager, session, step, lambda on: mods["app"] in on)
     assert result.kind == "found" and result.mods == [mods["app"]]
-    assert all(mods["lib"] in s["on"] for s in session.steps)  # the library stays on with the script
+    # the library is on whenever the script is, REFramework whenever anything that needs it is
+    assert all(mods["lib"] in s["on"] for s in session.steps if mods["app"] in s["on"])
+    assert all(mods["refw"] in s["on"] for s in session.steps if set(s["on"]) - {mods["refw"]})
     bisect.finish(manager, session)
 
     session, step = bisect.start(manager, bisect.prepare(manager))
     result = drive(manager, session, step, lambda on: mods["lib"] in on)
     assert result.kind == "core" and result.mods == [mods["lib"]]
-    assert any(s["on"] == [] for s in session.steps)  # tried with everything off
     lines = bisect.result_lines(result, session.names, mods["refw"], session.data["requires"])
-    assert "'App'도 동작하지 않습니다" in "\n".join(lines)
+    assert "'App'도 동작하지 않습니다" in "\n".join(lines) and "계속 켜 두었던" not in "\n".join(lines)
     bisect.finish(manager, session)
 
 
@@ -528,11 +541,20 @@ def test_the_last_normal_exit_speeds_the_search_up(manager, mods, tmp_path):
     new = install(manager, tmp_path, "New Armor", {"natives/STM/n.tex": "n"})
     plan = bisect.prepare(manager)
     assert plan.changes is not None and plan.changes.added == [new.id] and plan.units[-1] == new.id
-    assert plan.split == len(plan.units) - 1
+    (good,) = [o for o in plan.passive if o.source == "last_good"]
+    assert new.id not in good.on and good.on == set(plan.units) - {new.id} and good.seconds == 9000.0
+    assert plan.singles[0][0] == new.id  # the only mod not seen running fine
+    assert any("덜 의심합니다" in line for line in plan.lines())
     session, step = bisect.start(manager, plan)
-    assert step.kind == "last_good"
     result = drive(manager, session, step, lambda on: new.id in on)
-    assert result.mods == [new.id] and len(session.steps) <= 3
+    assert result.mods == [new.id] and len(session.steps) <= 4
+    bisect.finish(manager, session)
+    # without it the same search takes longer
+    gamewatch_file = manager.crash_dir / gamewatch.LAST_GOOD_FILE
+    gamewatch_file.unlink()
+    session, step = bisect.start(manager, bisect.prepare(manager))
+    drive(manager, session, step, lambda on: new.id in on)
+    assert len(session.steps) > 4
     bisect.finish(manager, session)
 
 
@@ -544,11 +566,12 @@ def test_the_search_from_the_command_line(manager, mods, game_dir, capsys, monke
     data = str(manager.data_dir)
     assert main(["--data-dir", data, "bisect"]) == 0
     out = capsys.readouterr().out
-    assert "진행 중인 원인 찾기가 없습니다" in out and "계속 켜 둘 모드: REFramework, _CatLib" in out
+    assert "진행 중인 원인 찾기가 없습니다" in out and "다른 모드에 필요한 모드(그 모드를 켤 때 함께 켬): REFramework, _CatLib" in out
+    assert "(바꾸려면: bisect start --when " in out  # (nothing runs yet: start takes them)
     assert main(["--data-dir", data, "bisect", "fine"]) == 1  # nothing to answer for
     assert main(["--data-dir", data, "bisect", "start"]) == 0
     out = capsys.readouterr().out
-    assert "켜져 있는 모드 5개 중" in out and "원인 찾기 1/" in out and "bisect crashed" in out
+    assert "켜져 있는 모드 5개 중" in out and "원인 찾기 1번째 실행: " in out and "bisect crashed" in out
     assert main(["--data-dir", data, "bisect", "start"]) == 1
 
     # while it runs, what would change the mods it turns on and off waits
@@ -565,11 +588,11 @@ def test_the_search_from_the_command_line(manager, mods, game_dir, capsys, monke
         assert (game_dir / "natives/STM/b.tex").exists() == (mods["b"] in on)
         assert main(["--data-dir", data, "bisect", "crashed" if mods["b"] in on else "fine"]) == 0
         out = capsys.readouterr().out
-        if "원인으로 보이는 모드" in out:
+        if "원인으로 의심되는 모드" in out:
             break
-    assert "원인으로 보이는 모드: Armor B" in out and "bisect stop --disable" in out
+    assert "원인으로 의심되는 모드: Armor B (가능성 약 " in out and "bisect stop --disable" in out
     assert main(["--data-dir", data, "bisect"]) == 0
-    assert "결과: 원인으로 보이는 모드: Armor B" in capsys.readouterr().out
+    assert "결과: 원인으로 의심되는 모드: Armor B" in capsys.readouterr().out
 
     assert main(["--data-dir", data, "bisect", "stop", "--disable"]) == 0
     assert "원래 프로필로 돌아왔습니다: 기본 (Armor B 끔)" in capsys.readouterr().out
@@ -587,7 +610,7 @@ def test_stopping_from_the_command_line_before_a_result(manager, mods, game_dir,
     data = str(manager.data_dir)
     assert main(["--data-dir", data, "bisect", "start"]) == 0
     assert main(["--data-dir", data, "bisect", "retry"]) == 0  # 잘 모르겠어요: the same step
-    assert "원인 찾기 1/" in capsys.readouterr().out
+    assert "원인 찾기 1번째 실행: " in capsys.readouterr().out
     assert main(["--data-dir", data, "bisect", "stop", "--disable"]) == 1  # nothing found to turn off yet
     assert main(["--data-dir", data, "bisect", "stop"]) == 0
     after = ModManager(manager.data_dir)
@@ -692,3 +715,724 @@ def test_settings_saved_in_the_game_folder_survive_a_search(manager, tmp_path, g
     bisect.finish(manager, session)
     manager.deploy()
     assert config.read_text() == '{"user": "my settings"}'
+
+
+# ---- v2: the plan, the session, format 1, texts ---------------------------------------------------------
+class Ev:
+    """A stand-in for evidence.Evidence: the plan reads its attributes with defaults."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def twelve():
+    us = [facts(id=f"m{i}", name=f"Mod {i}", needs_refw=True, kinds=frozenset({"loose"})) for i in range(12)]
+    return [facts(id="r", name="REFramework", refw=True, kinds=frozenset({"reframework"})), *us,
+            facts(id="h", name="Hidden", hidden=True, needs_refw=True)]
+
+
+def test_the_plan_with_and_without_evidence():
+    mods = twelve()
+    owners = {"natives/stm/a.tex": ["m1", "m2"], "natives/stm/b.tex": ["m3", "h", "m4"], "natives/stm/c.tex": ["m9"]}
+    plan = bisect.make_plan(mods, owners=owners, profile="기본")
+    assert plan.units == ["r", *[f"m{i}" for i in range(12)]] and plan.hidden == ["h"] and plan.base == ["r"]
+    assert plan.masking == {"m1": ["m2"], "m3": ["m4"]} and plan.content == [f"m{i}" for i in range(12)]
+    assert "덮이는 모드도 함께 끕니다 (2쌍)" in "\n".join(plan.lines())
+    assert all("m1" not in s.on or "m2" in s.on for s in [plan.first])
+    rows = plan.ranking_rows()
+    assert plan.uniform and len(rows) == 5 and max(p for _l, p, _r in rows) - min(p for _l, p, _r in rows) < 1e-9
+    assert plan.ranking_note() == bisect.NO_EVIDENCE and plan.dominant is None and plan.estimate_top is None
+    assert not plan.informative
+    kinds = bisect.make_plan(mods, evidence=Ev(weights={"m1": 2.0}, informative=False))  # (only the kind of mod)
+    assert not kinds.uniform and not kinds.informative and kinds.ranking_note() == bisect.NO_EVIDENCE_KINDS
+    assert bisect.Plan.uniform.__doc__
+    # a crash in a mod's plugin: that mod first, about 40-50%, and the first launch looks at it
+    ev = Ev(shares={"m7": 0.5}, weights={"m2": 3.0, "x": 9.0}, reasons={"m7": ["튕긴 곳이 이 모드의 플러그인입니다 (m7.dll+0x10)"]},
+            record_title="튕김 기록 10월 20일 21:43", notes=["이전 실행 기록 6개"])
+    plan = bisect.make_plan(mods, owners=owners, evidence=ev)
+    label, p, why = plan.ranking_rows()[0]
+    assert label == "'Mod 7'" and 0.35 <= p <= 0.5 and why == ["튕긴 곳이 이 모드의 플러그인입니다 (m7.dll+0x10)"]
+    assert not plan.uniform and plan.informative and plan.ranking_note().startswith("그 밖: 나머지 모드 ")
+    assert "모드 문제가 아님 약 " in plan.ranking_note()
+    assert plan.estimate_top == 3 and "가장 의심되는 모드가 원인이면 약 3번, 아니면 약 " in plan.intro()
+    assert plan.first.kind in ("off_some", "on_some") and plan.first.focus == ["m7"]
+    assert plan.ranking[0].mods == ("m7",) and plan.involvement["m7"] > 0.4 and plan.evidence is ev
+    # the answer to 언제 튕기나요 picks how reliable a crash is thought to be, and the first crash time
+    rare = bisect.make_plan(mods, owners=owners, evidence=ev, when="rare")
+    assert rare.data["params"]["r_prior"] == list(bisect.engine_mod.R_PRIORS["rare"]) and rare.when == "rare"
+    timed = bisect.make_plan(mods, evidence=Ev(when_hint="time", minutes_hint=12.0))
+    assert timed.when == "time" and timed.minutes == 12.0 and timed.crash_times == [720.0]
+    assert timed.first.minutes == 27 and timed.first.play.startswith("27분 넘게 해 보세요.")
+    assert "지난번에는" not in timed.first.play  # (a default from the answer, not a record)
+    report = {"source": "report", "on": [f"m{i}" for i in range(12)] + ["r", "h"], "crashed": True, "rho": 1.0,
+              "seconds": 600.0, "label": "튕김 기록"}
+    recorded = bisect.make_plan(mods, evidence=Ev(crash_times=[600.0], passive=[report], when_hint="time",
+                                                  minutes_hint=10.0))
+    assert recorded.crash_times == [] and recorded.passive[0].seconds == 600.0 and "h" not in recorded.passive[0].on
+    assert "(지난번에는 실행 후 약 10분 만에 튕겼습니다)" in recorded.first.play and recorded.first.minutes == 22
+    assert recorded.data["passive"][0]["label"] == "튕김 기록"
+    # at a place, an action or a piece of equipment the play time says nothing: no minutes asked for, none weighed
+    for when in ("same", "equip", "start"):
+        at = bisect.make_plan(mods, evidence=Ev(crash_times=[600.0], passive=[report]), when=when)
+        assert at.first.minutes == 0 and "지난번에는" not in at.first.play and not at.data["params"]["timed_fine"]
+    # a crash with a mod on that the search does not have now (removed, off): not a launch of today's mods
+    stale = bisect.make_plan(mods, evidence=Ev(passive=[dict(report, on=[*report["on"], "gone"]),
+                                                        {**report, "source": "history", "on": ["m1", "off"]},
+                                                        {**report, "source": "history", "on": ["m2", "h"]},
+                                                        {**report, "source": "history", "on": ["m3", "gone"],
+                                                         "crashed": False}]))
+    assert [(o.source, o.crashed, sorted(o.on)) for o in stale.passive] == \
+        [("report", True, sorted(plan.units)), ("history", False, ["m3"])]  # (the default report; a fine one is safe)
+
+
+@pytest.mark.parametrize("culprit", ["A", "B"])
+def test_a_patch_that_needs_its_base_and_covers_one_of_its_files(tmp_path, culprit):
+    # the usual patch: B needs A (its Nexus requirement) and overwrites one texture of A. A masking edge A -> B
+    # with the requirement B -> A would keep both always on together, and neither could ever be named
+    mods = [facts(id="refw", name="REFramework", refw=True, kinds=frozenset({"reframework"})),
+            facts(id="A", name="Armor X", nexus_id=100, needs_refw=True, kinds=frozenset({"loose"})),
+            facts(id="B", name="Armor X - Color Patch", needs_refw=True, kinds=frozenset({"loose"}),
+                  requirements=[{"name": "Armor X", "nexus_id": 100}]),
+            *[facts(id=i, name=f"Mod {i}", needs_refw=True, kinds=frozenset({"loose"})) for i in "CDE"]]
+    owners = {"natives/stm/armor/x/body_alb.tex": ["A", "B"], "natives/stm/c.tex": ["C", "D"]}
+    plan = bisect.make_plan(mods, owners=owners)
+    assert plan.requires["B"] == ["A", "refw"] and plan.masking == {"C": ["D"]}
+    assert bisect.masking(owners, plan.units) == {"A": ["B"], "C": ["D"]}  # (without the requirements)
+    session = bisect.Session.new(tmp_path, plan, "orig", {}, "temp")
+    nxt = session.next()
+    while isinstance(nxt, Step):
+        assert "A" in nxt.on or "B" not in nxt.on
+        nxt = session.record(culprit in nxt.on)
+    assert nxt.kind == ("core" if culprit == "A" else "found") and nxt.mods == [culprit]  # (A: B needs it)
+
+
+@pytest.mark.parametrize("culprit", ["New Armor", "Armor C"])
+def test_hidden_mods_never_reach_the_game(manager, tmp_path, game_dir, culprit):
+    # every file of Old Armor loses to New Armor: it is not a suspect, and it is on in a step only with New Armor
+    # (else its a.tex - a copy the user's own setup never loads - would reach the game)
+    install(manager, tmp_path, "REFramework", {"dinput8.dll": "MZ"})
+    lost = install(manager, tmp_path, "Old Armor", {"natives/STM/a.tex": "old"})
+    a = install(manager, tmp_path, "New Armor", {"natives/STM/a.tex": "new", "natives/STM/b.tex": "b"})
+    c = install(manager, tmp_path, "Armor C", {"natives/STM/c.tex": "c"})
+    manager.deploy()
+    plan = bisect.prepare(manager)
+    assert plan.hidden == [lost.id] and lost.id not in plan.units and plan.data["hidden_winners"] == {lost.id: [a.id]}
+    session, step = bisect.start(manager, plan)
+    cause = {"New Armor": a.id, "Armor C": c.id}[culprit]
+    seen = []
+    while isinstance(step, Step):
+        manager.deploy()
+        seen.append((a.id in step.on, manager.get(lost.id).enabled, (game_dir / "natives/STM/a.tex").read_text()
+                     if (game_dir / "natives/STM/a.tex").exists() else None))
+        session.mark_launched()
+        step = bisect.answer(manager, session, cause in step.on)
+    assert step.mods == [cause] and any(not new for new, _old, _tex in seen)
+    assert all(old == new and tex in (("new",) if new else (None,)) for new, old, tex in seen)
+    assert a.id in plan.units and lost.id not in session.mod_ids
+    bisect.finish(manager, session)
+    assert manager.get(lost.id).enabled  # (the user's profile: as it was)
+
+
+def test_a_mod_with_a_root_pak_is_never_hidden(manager, tmp_path, game_dir):
+    # Old Armor's loose texture loses to New Armor Tex, but its root .pak goes to pak_mods and is always loaded: it
+    # is a unit like any other (on its own when its pak is what crashes), never left out as 'hidden'
+    install(manager, tmp_path, "REFramework", {"dinput8.dll": "MZ"})
+    old = install(manager, tmp_path, "Old Armor", {"re_chunk_000.pak.patch_005.pak": "PAKDATA",
+                                                   "natives/STM/a.tex": "old"})
+    new = install(manager, tmp_path, "New Armor Tex", {"natives/STM/a.tex": "new"})
+    install(manager, tmp_path, "Armor C", {"natives/STM/c.tex": "c"})
+    install(manager, tmp_path, "Armor D", {"natives/STM/d.tex": "d"})
+    manager.deploy()
+    assert list((game_dir / "pak_mods").glob("*.pak")) and manager.hidden_mods() == []
+    plan = bisect.prepare(manager)
+    assert plan.hidden == [] and old.id in plan.units and plan.masking == {old.id: [new.id]}
+    session, step = bisect.start(manager, plan)
+    while isinstance(step, Step):
+        manager.deploy()
+        session.mark_launched()
+        step = bisect.answer(manager, session, any((game_dir / "pak_mods").glob("*.pak")))  # (the old pak crashes)
+    assert step.kind == "found" and step.mods == [old.id]
+    bisect.finish(manager, session)
+
+
+def test_a_session_goes_on_after_a_restart_and_in_a_worker(manager, mods, tmp_path):
+    import threading
+
+    from mhwmm.manager import ModManager
+
+    session, step = bisect.start(manager, bisect.prepare(manager))
+    assert not session.legacy and session.ready and step.engine and step.remaining[0] >= 1
+    assert session.data["format"] == 2 and session.data["engine"] == bisect.engine_mod.ENGINE_FORMAT
+    nxt = bisect.answer(manager, session, mods["b"] in step.on)
+    again = ModManager(manager.data_dir)
+    resumed = bisect.load(again.data_dir)
+    assert not resumed.ready and resumed.next() == nxt and resumed.ready  # the same step from the answers alone
+    # what the manager saw of the step's game is kept for a restart
+    resumed.mark_launched(1000.0)
+    resumed.note_run({"seconds": 300.0, "auto": "normal", "log": True, "unexposed": [mods["a"], "nope"], "tail": [],
+                      "record": ""})
+    third = bisect.load(again.data_dir)
+    assert third.current["run"]["seconds"] == 300.0 and third.current["run"]["unexposed"] == [mods["a"], "nope"]
+    crashed = mods["b"] in third.next().on
+    bisect.answer(again, third, crashed)
+    last = third.steps[-1]
+    assert last["seconds"] == 300.0 and last["auto"] == "normal" and last["log"] is True
+    assert last["unexposed"] == ([mods["a"]] if mods["a"] in last["on"] else [])
+    # an answer and what comes next from a worker give what record() gives
+    copies = []
+    for name in ("one", "two"):
+        folder = tmp_path / name
+        folder.mkdir()
+        copies.append(bisect.Session(folder / bisect.SESSION_FILE, json.loads(json.dumps(third.data))))
+    one, two = copies
+    got_one = one.record(True)
+    two.add_answer(True)
+    assert not two.ready and two.steps[-1]["crashed"]
+    box = []
+    worker = threading.Thread(target=lambda: box.append(two.settle()))
+    worker.start()
+    worker.join(30)
+    assert box == [got_one] and two.ready and two.last_change().startswith("원인 찾기: ")
+    assert [{k: v for k, v in s.items() if k != "time"} for s in one.steps] == \
+        [{k: v for k, v in s.items() if k != "time"} for s in two.steps]
+    bisect.finish(again, third)
+
+
+def v223_session(manager, mods, answers):
+    """bisect.json exactly as v2.2.3 wrote it (format 1), with ``answers`` given."""
+    units, base = [mods["app"], mods["a"], mods["b"]], [mods["refw"], mods["lib"]]
+    order = [*base, *units]
+    requires = {mods["refw"]: [], mods["lib"]: [mods["refw"]], mods["app"]: [mods["refw"], mods["lib"]],
+                mods["a"]: [mods["refw"]], mods["b"]: [mods["refw"]]}
+    manager.save()
+    snapshot = json.loads(json.dumps(manager.profiles["기본"]))
+    manager.create_profile(bisect.TEMP_PROFILE, copy_current=True)
+    steps = []
+    for number, crashed in enumerate(answers, 1):
+        nxt = bisect.next_step(units, base, base, requires, None, [(s["on"], s["crashed"]) for s in steps], order)
+        steps.append({"on": nxt.on, "crashed": crashed(set(nxt.on)), "kind": nxt.kind, "number": number,
+                      "time": 1760000000.0 + number, "launched": 1760000000.0, "exit": None, "detected": ""})
+    data = {"format": 1, "started": 1760000000.0, "original_profile": "기본", "original_snapshot": snapshot,
+            "temp_profile": bisect.TEMP_PROFILE, "game_version": manager.game_version(), "record": "",
+            "names": {m.id: m.name for m in manager.mods}, "order": order, "units": units, "base": base, "core": base,
+            "requires": requires, "split": None, "estimate": 4, "excluded": [mods["opts"]],
+            "unmanaged": {"total": 0, "paths": []}, "refw_backup": False, "changes": "", "steps": steps,
+            "current": None, "result": None}
+    write(manager.data_dir / bisect.SESSION_FILE, json.dumps(data, ensure_ascii=False))
+    return units, base, requires, order
+
+
+def test_a_search_started_by_v2_2_3_goes_on_as_it_started(manager, mods):
+    crash = lambda on: mods["b"] in on  # noqa: E731
+    units, base, requires, order = v223_session(manager, mods, [crash, crash])
+    assert bisect.active(manager.data_dir)
+    session = bisect.load(manager.data_dir)
+    assert session.legacy and session.ready and session.mod_ids == [*base, *units]
+    assert bisect.problem(manager, session) == ""
+    step = bisect.apply_step(manager, session)
+    while isinstance(step, Step):
+        want = bisect.next_step(units, base, base, requires, None, [(s["on"], s["crashed"]) for s in session.steps],
+                                order, 4)
+        assert step == want and not step.engine and "단계: " in session.banner(step)
+        step = bisect.answer(manager, session, crash(set(step.on)))
+    assert step.kind == "found" and step.mods == [mods["b"]] and step.p is None
+    assert bisect.result_title(step, session.names) == "원인으로 보이는 모드: Armor B"  # (the old texts)
+    assert session.step_lines()[0].startswith("1단계 · ") and "결과: 원인으로 보이는 모드: Armor B" in session.report_lines()
+    assert session.more() == step and session.interim().kind == "unsure"
+    bisect.finish(manager, session)
+    assert manager.profile == "기본" and list(manager.profiles) == ["기본"] and not bisect.active(manager.data_dir)
+
+
+def test_unsure_more_and_interim(manager, mods, capsys):
+    from mhwmm.cli import main
+
+    session, step = bisect.start(manager, bisect.prepare(manager))
+    session.data["params"]["max_launches"] = 3  # (a short budget)
+    session._next = None
+    step = bisect.apply_step(manager, session)
+    flip = iter([True, False, True, False, True, False])
+    while isinstance(step, Step):
+        step = bisect.answer(manager, session, next(flip))
+    assert step.kind == "unsure" and step.runs == 3 and step.ranking and step.r_mean is not None
+    assert sum(s.p for s in step.ranking) <= 1 + 1e-9 and step.evidence[0].endswith("%") or "미만" in step.evidence[0]
+    assert bisect.result_title(step, session.names) == "아직 하나로 좁히지 못했습니다."
+    lines = session.result_lines(step)
+    assert any("'계속 찾기'로 6번 더" in line for line in lines)
+    guess = session.interim()
+    assert guess.kind == "unsure" and guess.ranking and guess.p is not None and not session.data["result"] is None
+    nxt = session.more()  # 계속 찾기: six more launches
+    assert isinstance(nxt, Step) and session.extra == 6 and session.result is None and nxt.number == 4
+    assert bisect.load(manager.data_dir).extra == 6
+    # 그만두기 --disable: an unsure result names a mod only from 50%
+    session.data["result"] = Result("unsure", [], 3, p=0.3, ranking=list(guess.ranking)).to_dict()
+    session.save()
+    assert main(["--data-dir", str(manager.data_dir), "bisect", "stop", "--disable"]) == 1
+    session.data["result"] = Result("unsure", [mods["a"]], 3, p=0.62).to_dict()
+    session.save()
+    assert main(["--data-dir", str(manager.data_dir), "bisect", "stop", "--disable"]) == 0
+    assert "Armor A 끔" in capsys.readouterr().out
+
+
+def test_one_more_check_needs_a_third_pivot_pair(manager, mods):
+    session, step = bisect.start(manager, bisect.prepare(manager))
+    result = drive(manager, session, step, lambda on: mods["a"] in on)
+    assert result.kind == "found" and result.pivots == 2 and result.can_confirm
+    assert bisect.CONFIRM_NOTE in result.evidence
+    nxt = session.more()  # 한 번 더 확인
+    assert session.strict and isinstance(nxt, Step) and nxt.reason.startswith("confirm")
+    step = bisect.apply_step(manager, session)
+    again = drive(manager, session, step, lambda on: mods["a"] in on)
+    assert again.kind == "found" and again.mods == [mods["a"]] and again.pivots >= 3 and not again.can_confirm
+    bisect.finish(manager, session)
+
+
+def test_one_more_check_of_two_mods_that_each_crash(tmp_path):
+    # both mods broken ('each'): 한 번 더 확인 needs a crash with each one alone on and a fine run with it off - more
+    # launches than a single mod, all given, none of them repeated
+    mods = [ModFacts(f"m{i}", f"Mod {i}", True, kinds=frozenset({"loose"})) for i in range(2)]
+    session = bisect.Session.new(tmp_path, bisect.make_plan(mods), "orig", {}, "temp")
+    nxt = session.next()
+    while isinstance(nxt, Step):
+        nxt = session.record(bool(nxt.on))  # (either one on crashes)
+    assert nxt.kind == "each" and nxt.pivots == 2 and nxt.can_confirm
+    nxt = session.more()
+    seen = []
+    while isinstance(nxt, Step):
+        assert nxt.on not in seen and nxt.reason.startswith("confirm")
+        seen.append(nxt.on)
+        nxt = bisect.Session.load(tmp_path).record(bool(nxt.on))  # (from bisect.json each time: a restart)
+    assert nxt.kind == "each" and nxt.mods == ["m0", "m1"] and nxt.pivots >= 3 and seen
+
+
+@pytest.mark.parametrize("record", ["rare", "device"])
+def test_a_single_mod_that_crashes_now_and_then_is_named(tmp_path, record):
+    # one managed mod, crashes that come and go ('가끔', or a graphics device error record): no one launch adds the
+    # third pivot pair, the search makes the two that do instead of stopping unsure
+    mods = [ModFacts("x", "Only Mod", True, kinds=frozenset({"pak"}))]
+    ev = Ev(device_error="DEVICE_HUNG") if record == "device" else None
+    plan = bisect.make_plan(mods, evidence=ev, when="rare" if record == "rare" else "same")
+    session = bisect.Session.new(tmp_path, plan, "orig", {}, "temp")
+    nxt = session.next()
+    while isinstance(nxt, Step):
+        nxt = session.record("x" in nxt.on)
+    assert nxt.kind == "found" and nxt.mods == ["x"] and nxt.runs <= 5
+
+
+def test_suspects_as_likely_as_the_top_one_are_never_named_alone(tmp_path):
+    # every mod suspected the same (no evidence): the bar, the line after an answer and 그만두기 never name the first
+    # mod of the list as "the most suspected" - it would be blamed for its place in the load order
+    session = bisect.Session.new(tmp_path, bisect.make_plan(twelve()), "orig", {}, "temp")
+    step = session.next()
+    assert "아직 없음(같은 정도 5개 이상, 각각 약 " in bisect.progress_text(step, session.names)
+    note = session.interim_note()
+    assert note.startswith(" 아직 두드러지게 의심되는 모드는 없습니다(같은 정도 5개 이상, 각각 약 ") and "'" not in note
+    nxt = session.record("m5" in step.on)
+    tied = bisect.tied_top(nxt.ranking)
+    change = session.last_change()
+    if len(tied) > 3:
+        assert change.startswith("원인 찾기: 아직 두드러지게 의심되는 모드는 없습니다(같은 정도 ") and " → " in change
+        assert "'" not in change
+    else:
+        assert all(bisect.suspect_label(s, session.names) in change for s in tied)
+    # two as likely as each other: both, each with its own move
+    two = [bisect.Suspect("one", (i,), p) for i, p in (("m1", 0.37), ("m2", 0.37), ("m3", 0.07))]
+    session._answered, session._before = True, {}
+    session._engine = session._engine_now()
+    assert session._last_change(Step(2, 6, "split", [], [], ranking=two)) == \
+        "원인 찾기: 'Mod 1' 1% 미만 → 37% · 'Mod 2' 1% 미만 → 37%"
+    session.interim = lambda: Result("unsure", [], 1, p=0.37, ranking=two)
+    assert session.interim_note() == " 지금까지 가장 의심되는 것은 'Mod 1', 'Mod 2'(각각 약 37%)입니다."
+
+
+def engine_step(kind, on, off, **kw):
+    base = dict(reason="split", focus=[], ranking=[bisect.Suspect("one", ("a",), 0.45)], suspects=4, p=0.45,
+                remaining=(3, 5), minutes=0, crash_minutes=None, play=bisect.PLAY["same"])
+    base.update(kw)
+    return Step(2, 6, kind, on, off, **base)
+
+
+def test_v2_texts():
+    names = {"a": "A", "b": "B", "c": "C", "r": "REFramework"}
+    assert [bisect.percent(p) for p in (0.004, 0.01, 0.5, 0.994, 0.996)] == ["1% 미만", "1%", "50%", "99%", "99% 이상"]
+    assert bisect.launches_text(3, 5) == "약 3~5번" and bisect.launches_text(4, 4) == "약 4번"
+    S = bisect.Suspect
+    assert bisect.suspect_label(S("one", ("a",), 0.5), names) == "'A'"
+    assert bisect.suspect_label(S("and", ("a", "b"), 0.5), names) == "'A'+'B' (함께 켰을 때만)"
+    assert bisect.suspect_label(S("and3", ("a", "b", "c"), 0.5), names) == "'A'+'B'+'C' (함께 켰을 때만)"
+    assert bisect.suspect_label(S("or", ("a", "b"), 0.5), names) == "'A', 'B' (각각)"
+    assert bisect.suspect_label(S("none", (), 0.5), names).startswith("모드 문제가 아님")
+    assert bisect.suspect_label(S("rest", (), 0.5), names) == "그 밖의 경우"
+    play = " " + bisect.PLAY["same"]
+    texts = {
+        "everything_off": (engine_step("everything_off", [], ["r", "a", "b"]), "모든 모드를 끄고 적용했습니다."),
+        "full": (engine_step("full", ["r", "a", "b"], []), "처음처럼 모드 3개를 모두 켜고 적용했습니다."),
+        "base": (engine_step("base", ["r"], ["a", "b"]), "REFramework와 다른 모드에 필요한 모드 1개만 켜고 적용했습니다."),
+        "off_some": (engine_step("off_some", ["r", "b"], ["a", "c"], focus=["a"]),
+                     "'A'만 끄고 나머지는 그대로 적용했습니다. (그 모드가 필요한 모드 1개도 함께 껐습니다)"),
+        "on_some": (engine_step("on_some", ["r", "a"], ["b", "c"], focus=["a"]), "'A'만 켜고(필요한 모드 포함 2개) 적용했습니다."),
+        "split": (engine_step("split", ["r", "a"], ["b", "c"], off_suspects=2),
+                  "아직 의심되는 모드 4개 중 2개를 끄고(모드 2개 켬) 적용했습니다."),
+    }
+    for kind, (step, body) in texts.items():
+        assert bisect.step_text(step, names) == f"원인 찾기 2번째 실행: {body}{play}", kind
+        assert bisect.step_text(step, names, applied=False).endswith(bisect.UNAPPLIED + play)
+    assert "꺼 두었습니다" in bisect.step_text(texts["off_some"][0], names, applied=False)
+    assert "직접 넣어 두었던 dinput8.dll" in bisect.step_text(texts["everything_off"][0], names, refw_backup=True)
+    others = engine_step("split", ["r", "b"], ["a", "c"], reason="others", found=["a"], off_suspects=1)
+    assert bisect.step_text(others, names).startswith("원인 찾기 2번째 실행: 'A'을(를) 끈 채로 다른 원인이 있는지 확인합니다. ")
+    kind = engine_step("on_some", ["r", "a"], ["b"], reason="kind", focus=["a"])
+    assert "한 모드만의 문제인지, 함께 켰을 때만인지 확인합니다. 'A'만 켜고" in bisect.step_text(kind, names)
+    assert [bisect.step_summary(texts[k][0], names) for k in ("everything_off", "full", "off_some", "on_some", "split")] == \
+        ["모든 모드를 끄고 실행", "처음처럼 모두 켜고 실행", "'A'만 끄고 실행", "'A'만 켜고 실행", "모드 2개를 켜고 실행"]
+    assert bisect.progress_text(texts["split"][0], names) == "의심되는 모드 4개 · 가장 의심: 'A' 약 45% · 앞으로 약 3~5번"
+    tie = engine_step("split", ["r"], ["a", "b"], ranking=[bisect.Suspect("one", ("r",), 0.2), bisect.Suspect("one", ("a",), 0.2)])
+    assert "가장 의심: 아직 없음(같은 정도 2개, 각각 약 20%)" in bisect.progress_text(tie, names)
+    five = engine_step("split", ["r"], ["a", "b"], ranking=[bisect.Suspect("one", (i,), 0.1) for i in "rabcd"])
+    assert "가장 의심: 아직 없음(같은 정도 5개 이상, 각각 약 10%)" in bisect.progress_text(five, names)
+    timed = engine_step("split", ["r", "a"], ["b"], minutes=22, crash_minutes=10.0)
+    assert bisect.run_note(timed, 240) == "이번에는 4분만 실행했습니다. 튕기던 상황까지 가지 못했다면 '잘 모르겠어요'를 고르세요."
+    assert bisect.run_note(timed, 900) == "이번 실행 15분 · 지난번 튕긴 시점(약 10분)보다 오래 했습니다."
+    assert bisect.run_note(timed, None) == "" and bisect.run_note(engine_step("full", ["a"], []), 30) == ""
+    assert "가장 의심되는 'A'의 파일을 한 번도 읽지 않았습니다" in bisect.exposure_note(texts["on_some"][0], ["a"], names)
+    assert bisect.exposure_note(texts["on_some"][0], ["b"], names) == ""
+    # results
+    R = Result
+    assert bisect.result_title(R("found", ["a"], p=0.97), names) == "원인으로 의심되는 모드: A (가능성 약 97%)"
+    assert bisect.result_title(R("together", ["a", "b"], p=0.96), names) == \
+        "함께 켜면 튕기는 것으로 의심되는 모드: A, B (가능성 약 96%)"
+    assert bisect.result_title(R("each", ["a", "b"], p=0.95), names) == "각각 튕기게 하는 것으로 의심되는 모드: A, B (가능성 약 95%)"
+    assert bisect.result_title(R("core", ["r"], p=0.999), names) == "원인으로 의심되는 모드: REFramework (가능성 약 99% 이상)"
+    assert bisect.result_title(R("not_mods", p=0.96), names) == \
+        "모드 문제가 아닐 가능성이 높습니다 (약 96%). 모든 모드를 꺼도 튕겼습니다."
+    assert bisect.result_title(R("unsure", p=0.4), names) == "아직 하나로 좁히지 못했습니다."
+    assert bisect.result_title(R("no_repro", p=0.1), names) == bisect.result_title(R("no_repro"), names)
+    assert bisect.disable_unsure_text(R("unsure", ["a"], p=0.62), names) == "'A'(약 62%)을(를) 끄고 원래 프로필로"
+    assert bisect.result_lines(R("each", ["a", "b"], p=0.95), names) == ["두 모드를 모두 끄거나 업데이트해 보세요."]
+    noisy = bisect.result_lines(R("unsure", runs=9, p=0.3, r_mean=0.6), names)
+    assert "튕기기도 하고 괜찮기도 했습니다" in noisy[0] and "'계속 찾기'로 6번 더" in noisy[1]
+    assert bisect.result_lines(R("unsure", runs=9, p=0.3, r_mean=0.9), names)[0] == \
+        "게임을 9번 실행했지만 아직 하나로 좁히지 못했습니다."
+    assert R("unsure", ["a"], p=0.62).can_disable and not R("unsure", [], p=0.3).can_disable and R("each", ["a"]).can_disable
+    full = R("found", ["a"], 7, "", 0.97, 2, True, [bisect.Suspect("one", ("a",), 0.97)], ["근거"], 0.93)
+    assert R.from_dict(json.loads(json.dumps(full.to_dict()))) == full
+    assert R.from_dict({"kind": "found", "mods": ["a"], "p": "x", "ranking": [{"family": "bad"}], "pivots": True}) == \
+        R("found", ["a"])
+
+
+def test_the_evidence_lines_of_a_result(manager, mods):
+    session, step = bisect.start(manager, bisect.prepare(manager, evidence=Ev(
+        reasons={mods["b"]: ["튕긴 곳이 이 모드가 넣은 파일 'b.tex'입니다"]})))
+    result = drive(manager, session, step, lambda on: mods["b"] in on)
+    lines = result.evidence
+    assert result.kind == "found" and lines[0].startswith("원인 찾기에서 이 모드를 켠 실행 ") and "번 튕겼습니다." in lines[0]
+    assert any(line.startswith("원인 찾기에서 이 모드를 끈 실행 ") and "모두 괜찮았습니다" in line for line in lines)
+    assert "기록: 튕긴 곳이 이 모드가 넣은 파일 'b.tex'입니다" in lines
+    assert any(line.startswith("다른 가능성: ") for line in lines)
+    assert session.step_lines()[0].startswith("1번째 · ") and " → " in session.step_lines()[0]
+    report = "\n".join(session.report_lines())
+    assert "시작할 때 의심한 정도:" in report and "근거: 튕긴 곳이" in report and "1번째 (" in report
+    bisect.finish(manager, session)
+
+
+def older_launches(mods, x):
+    """Earlier sessions (launches.json) with and without ``x``: they all point at it."""
+    others = [mods["refw"], mods["lib"], mods["app"], *(m for m in (mods["a"], mods["b"]) if m != x)]
+    passive = []
+    for crashed, on in ((True, [mods["refw"], x]), (False, others), (True, [mods["refw"], *others[3:], x]),
+                        (False, others), (True, [*others, x]), (False, others), (False, [mods["lib"], mods["refw"]]),
+                        (False, [mods["refw"]]), (False, [])):
+        passive.append({"source": "history", "on": on, "crashed": crashed, "rho": 1.0 if crashed else 0.6,
+                        "seconds": 600.0 if crashed else 3600.0, "unknown": [], "unexposed": [], "e": 0.02,
+                        "label": "이전 실행"})
+    return passive
+
+
+def test_older_launches_speed_the_search_up_but_never_name_a_mod(manager, mods):
+    # earlier sessions may never have reached what triggers the crash (a user who never goes there never does), and
+    # a crash kept for looking like the record's says little: a mod is named only on the search's own launches
+    plan = bisect.prepare(manager, evidence=Ev(passive=older_launches(mods, mods["a"])))
+    assert isinstance(plan.first, Step) and plan.singles[0][0] == mods["a"] and plan.singles[0][1] > 0.5
+    session, step = bisect.start(manager, plan)
+    result = drive(manager, session, step, lambda on: mods["a"] in on)
+    assert result.kind == "found" and result.mods == [mods["a"]] and 2 <= result.runs <= 3
+    assert any(line.startswith("원인 찾기 전의 기록(튕김 기록·이전 실행): 이 모드를 켜고 튕김 ") for line in result.evidence)
+    bisect.finish(manager, session)
+    # they point at A, B is the culprit, and the user gives one wrong answer anywhere: A is never named
+    for flip in range(8):
+        session, step = bisect.start(manager, bisect.prepare(manager, evidence=Ev(passive=older_launches(mods, mods["a"]))))
+        k = 0
+        while isinstance(step, Step):
+            manager.deploy()
+            crashed = (mods["b"] in step.on) != (k == flip)
+            session.mark_launched()
+            step = bisect.answer(manager, session, crashed)
+            k += 1
+        assert mods["a"] not in step.mods, (flip, step)
+        bisect.finish(manager, session)
+
+
+def test_odd_evidence_is_read_safely():
+    mods = twelve()
+    nan = float("nan")
+    ev = Ev(weights={"m1": nan, "m2": "x", 3: 2.0}, shares="no", pairs=[("m1", "m2", 10.0), ("m1",), "x"],
+            none_scale=nan, or_scale=-1, passive=[{"source": "report", "on": "x"}, 7, {"source": "other", "on": [],
+                                                                                       "crashed": True}],
+            crash_times=[nan, -5, 30.0], reasons={"m1": "not a list", "m2": ["a", "b", "c", "d"]}, when_hint="later",
+            minutes_hint=-3, equipment=[("k", "투구", ["m1", 5]), ("bad",)], notes=None)
+    plan = bisect.make_plan(mods, evidence=ev)
+    assert plan.when == "same" and plan.minutes is None and plan.prior.none_scale == 1.0 and plan.prior.or_scale == 1.0
+    assert [o.source for o in plan.passive] == ["report"] and plan.passive[0].on == frozenset(plan.units)
+    assert plan.data["equipment"] == [["k", "투구", ["m1"]]] and plan.data["reasons"] == {"m2": ["a", "b", "c"]}
+    assert plan.data["evidence_times"] == [30.0] and json.loads(json.dumps(plan.data)) == plan.data
+    assert isinstance(plan.first, Step)
+
+
+def answer_session(tmp_path, plan, crash, name):
+    """A v2 session (no manager) answered by ``crash(on)``: the result and its steps."""
+    folder = tmp_path / name
+    folder.mkdir()
+    session = bisect.Session.new(folder, plan, "기본", {}, bisect.TEMP_PROFILE)
+    nxt = session.next()
+    while isinstance(nxt, Step):
+        session.mark_applied(nxt)
+        nxt = session.record(crash(set(nxt.on)))
+    return nxt, session
+
+
+def test_refw_a_library_and_not_the_mods(tmp_path):
+    mods = [facts(id="r", name="REFramework", refw=True), facts(id="lib", name="Lib", provides=frozenset({"lib"}),
+                                                                 needs_refw=True),
+            facts(id="app", name="App", lua_requires=["lib"], needs_refw=True),
+            *[facts(id=f"m{i}", name=f"Mod {i}", needs_refw=True) for i in range(4)]]
+    plan = bisect.make_plan(mods)
+    result, session = answer_session(tmp_path, plan, lambda on: "r" in on, "refw")
+    assert result.kind == "core" and result.mods == ["r"] and result.p >= 0.95
+    assert "REFramework를 켰을 때 튕겼습니다" in session.result_lines(result, "r")[0]
+    assert all("r" in s["on"] for s in session.steps if set(s["on"]) - {"r"})
+    result, _session = answer_session(tmp_path, plan, lambda on: "lib" in on, "lib")
+    assert result.kind == "core" and result.mods == ["lib"]
+    result, session = answer_session(tmp_path, plan, lambda on: True, "none")
+    assert result.kind == "not_mods" and result.p >= 0.95 and sum(1 for s in session.steps if not s["on"]) >= 2
+    assert result.evidence[0].startswith("모든 모드를 끈 실행 ") and "모두 튕겼습니다" in result.evidence[0]
+    result, session = answer_session(tmp_path, plan, lambda on: False, "never")
+    assert result.kind == "no_repro" and not result.mods and len(session.steps) <= 6
+    assert bisect.result_title(result, plan.names) == "처음처럼 모든 모드를 켜도 튕기지 않아 원인을 좁히지 못했습니다."
+    result, session = answer_session(tmp_path, plan, lambda on: {"m1", "m2"} <= on, "pair")
+    assert result.kind == "together" and result.mods == ["m1", "m2"]
+    assert "하나씩 켰을 때는 괜찮았고 함께 켰을 때만 튕겼습니다." in result.evidence
+    result, session = answer_session(tmp_path, plan, lambda on: bool({"m1", "m3"} & on), "each")
+    assert result.kind == "each" and result.mods == ["m1", "m3"] and "한쪽만 켜도 튕겼습니다." in result.evidence
+    assert result.can_disable and session.result_lines(result) == ["두 모드를 모두 끄거나 업데이트해 보세요."]
+
+
+def test_the_command_line_with_v2_options(manager, mods, game_dir, capsys, monkeypatch):
+    from mhwmm import accessed
+    from mhwmm.cli import main
+
+    monkeypatch.setenv("APPDATA", "")
+    data = str(manager.data_dir)
+    # the file record cannot be turned on: loose loading is off and natives\ has files (the armors)
+    config = write(game_dir / "re2_fw_config.txt", "FontSize=16\r\n")
+    assert main(["--data-dir", data, "bisect", "start", "--log-files"]) == 1
+    assert accessed.LOG_UNAVAILABLE_LOOSE in capsys.readouterr().err and not bisect.active(manager.data_dir)
+    # with loose loading on it only turns the record on, and puts it back at the end
+    write(config, "FontSize=16\r\nLooseFileLoader_Enabled=true\r\n")
+    assert main(["--data-dir", data, "bisect", "start", "--when", "rare", "--log-files"]) == 0
+    out = capsys.readouterr().out
+    assert "게임이 읽는 파일 기록을 켰습니다" in out and bisect.RANKING_HEADING in out and "원인 찾기 1번째 실행: " in out
+    assert "의심되는 모드 " in out and "(바꾸려면: bisect stop 후 bisect start --when " in out  # (it runs already)
+    assert config.read_bytes() == b"FontSize=16\r\nLooseFileLoader_Enabled=true\r\nLooseFileLoader_LogAccessedFiles=true\r\n"
+    session = bisect.load(manager.data_dir)
+    assert session.when == "rare" and session.data["params"]["r_prior"] == list(bisect.engine_mod.R_PRIORS["rare"])
+    assert session.refw_restore["values"] == {accessed.LOG_KEY: None}
+    assert main(["--data-dir", data, "bisect"]) == 0
+    assert "의심 순위 (기록과 지금까지의 답으로 매긴 것이고" in capsys.readouterr().out
+
+    # an answer without the game watched: the play time given counts as the run's length
+    assert main(["--data-dir", data, "bisect", "fine", "--minutes", "3"]) == 0
+    out = capsys.readouterr().out
+    session = bisect.load(manager.data_dir)
+    assert session.steps[0]["seconds"] == 180.0 and not session.steps[0]["crashed"] and "원인 찾기: " in out
+    assert main(["--data-dir", data, "bisect", "more"]) == 1  # (nothing to go on with yet)
+    assert "지금은 더 찾을 것이 없습니다" in capsys.readouterr().err
+
+    # 아직 좁히지 못함: 계속 찾기 gives six more launches; 그만두기 --disable only from 50%
+    guess = session.interim()
+    session.data["result"] = Result("unsure", [], 1, p=0.3, ranking=list(guess.ranking)).to_dict()
+    session.save()
+    assert main(["--data-dir", data, "bisect"]) == 0
+    assert "bisect more (6번 더)" in capsys.readouterr().out
+    assert main(["--data-dir", data, "bisect", "stop", "--disable"]) == 1
+    assert "50% 이상일 때만" in capsys.readouterr().err
+    assert main(["--data-dir", data, "bisect", "more"]) == 0
+    out = capsys.readouterr().out
+    session = bisect.load(manager.data_dir)
+    assert "계속 찾기: 원인 찾기를 이어 갑니다." in out and session.extra == 6 and session.result is None
+    assert "원인 찾기 2번째 실행: " in out
+
+    # stopping before a result says what is suspected most, and puts the setting back
+    assert main(["--data-dir", data, "bisect", "stop"]) == 0
+    out = capsys.readouterr().out
+    assert "원래 프로필로 돌아왔습니다: 기본" in out and "지금까지 가장 의심되는 것은 '_CatLib', 'App'(각각 약 " in out
+    assert accessed.RESTORED in out
+    assert config.read_bytes() == b"FontSize=16\r\nLooseFileLoader_Enabled=true\r\nLooseFileLoader_LogAccessedFiles=false\r\n"
+    assert not bisect.active(manager.data_dir)
+
+
+def test_a_fine_run_shorter_than_the_crash_took_counts_weakly(tmp_path):
+    mods = twelve()
+    on = [f"m{i}" for i in range(12)] + ["r"]
+    plan = bisect.make_plan(mods, evidence=Ev(crash_times=[600.0], when_hint="time", minutes_hint=10.0, passive=[
+        {"source": "report", "on": on, "crashed": True, "rho": 1.0, "seconds": 600.0, "label": "튕김 기록"}]))
+    for seconds, weak in ((120.0, True), (1500.0, False)):
+        folder = tmp_path / f"s{int(seconds)}"
+        folder.mkdir()
+        session = bisect.Session.new(folder, plan, "기본", {}, bisect.TEMP_PROFILE)
+        step = session.next()
+        session.mark_applied(step)
+        assert step.minutes == 22 and "(지난번에는 실행 후 약 10분 만에 튕겼습니다)" in step.play
+        assert ("분만 실행했습니다" in bisect.run_note(step, seconds)) == weak
+        assert ("지난번 튕긴 시점(약 10분)보다 오래 했습니다" in bisect.run_note(step, seconds)) == (not weak)
+        session.record(False, run={"seconds": seconds, "auto": "normal"})
+        change = session.last_change()
+        assert change.startswith("원인 찾기: ") and " → " in change and (bisect.WEAK_ANSWER in change) == weak
+
+
+def involvement_after(tmp_path, plan, name, answers):
+    """A v2 session answered with ``answers`` [(crashed, seconds)]: P(part of the cause) of every unit after them."""
+    folder = tmp_path / name
+    folder.mkdir()
+    session = bisect.Session.new(folder, plan, "기본", {}, bisect.TEMP_PROFILE)
+    for crashed, seconds in answers:
+        session.mark_applied(session.next())
+        session.record(crashed, run={"seconds": seconds})
+    return session, session._engine_now().summary().involvement
+
+
+def test_the_play_time_of_a_fine_run_is_weighed_by_the_engine(tmp_path):
+    # a 2-minute fine run against a 10-minute crash says little; a 25-minute one clears the mods that were on
+    mods = twelve()
+    on = [f"m{i}" for i in range(12)] + ["r"]
+    plan = bisect.make_plan(mods, when="time", evidence=Ev(crash_times=[600.0], passive=[
+        {"source": "report", "on": on, "crashed": True, "rho": 1.0, "seconds": 600.0}]))
+    short, inv_short = involvement_after(tmp_path, plan, "short", [(False, 120.0)])
+    long_, inv_long = involvement_after(tmp_path, plan, "long", [(False, 1500.0)])
+    assert short._engine_now().obs[-1].g < 0.5 < long_._engine_now().obs[-1].g
+    ms = [u for u in plan.units if u != "r"]
+    assert max(inv_short[u] for u in ms) - min(inv_short[u] for u in ms) < 0.01  # (barely moved)
+    assert all(inv_long[u] < 0.7 * inv_short[u] for u in plan.first.on)
+
+
+def test_quick_reproductions_count_at_a_place_or_action(tmp_path):
+    # 같은 장소·행동: the user walks straight to the spot (a crash 3 minutes in, fine runs of 4 minutes) although the
+    # record crashed 9 minutes into a normal session - the culprit is found within the usual launches
+    mods = twelve()
+    on = [f"m{i}" for i in range(12)] + ["r"]
+    plan = bisect.make_plan(mods, when="same", evidence=Ev(crash_times=[540.0], passive=[
+        {"source": "report", "on": on, "crashed": True, "rho": 1.0, "seconds": 540.0}]))
+    for culprit in ("m0", "m5", "m11"):
+        folder = tmp_path / culprit
+        folder.mkdir()
+        session = bisect.Session.new(folder, plan, "기본", {}, bisect.TEMP_PROFILE)
+        nxt = session.next()
+        while isinstance(nxt, Step):
+            assert nxt.minutes == 0 and "지난번에는" not in nxt.play
+            session.mark_applied(nxt)
+            crashed = culprit in nxt.on
+            assert bisect.run_note(nxt, 240.0) == ""
+            nxt = session.record(crashed, run={"seconds": 180.0 if crashed else 240.0})
+            assert bisect.WEAK_ANSWER not in session.last_change()
+        assert nxt.kind == "found" and nxt.mods == [culprit] and nxt.runs <= math.ceil(math.log2(14)) + 4
+
+
+def test_minutes_typed_in_the_start_window_win_over_the_record(tmp_path):
+    # the record crashed 45 minutes in; the user says "about 10 minutes": the bar asks for 22, not 100
+    mods = twelve()
+    on = [f"m{i}" for i in range(12)] + ["r"]
+    plan = bisect.make_plan(mods, evidence=Ev(crash_times=[2700.0], when_hint="time", minutes_hint=45.0, passive=[
+        {"source": "report", "on": on, "crashed": True, "rho": 1.0, "seconds": 2700.0}]))
+    assert plan.first.minutes == 99 and "약 45분 만에" in plan.first.play
+    session = bisect.Session.new(tmp_path, plan, "기본", {}, bisect.TEMP_PROFILE, when="time", minutes=10)
+    step = session.next()
+    assert step.minutes == 22 and step.play.startswith("22분 넘게 해 보세요.") and "45분" not in step.play
+    assert session.data["minutes_typed"] and not session.data["params"]["passive_times"]
+    session.mark_applied(step)
+    assert "분만 실행했습니다" not in bisect.run_note(step, 12 * 60)
+    session.record(False, run={"seconds": 12 * 60})
+    assert session._engine_now().obs[-1].g > 0.5 and bisect.WEAK_ANSWER not in session.last_change()
+    # the same minutes as the record's: the record's time stays
+    same = bisect.Session.new(tmp_path / "same", plan, "기본", {}, bisect.TEMP_PROFILE, when="time", minutes=45.0)
+    assert same.next().minutes == 99 and same.data["params"]["passive_times"]
+
+
+def test_the_last_crash_time_is_the_latest_one(tmp_path):
+    # the record crashed 9 minutes in, then the search's first launch 2 minutes in: "지난번에는 약 2분"
+    mods = twelve()
+    on = [f"m{i}" for i in range(12)] + ["r"]
+    plan = bisect.make_plan(mods, evidence=Ev(crash_times=[540.0], when_hint="time", minutes_hint=9.0, passive=[
+        {"source": "report", "on": on, "crashed": True, "rho": 1.0, "seconds": 540.0}]))
+    assert "(지난번에는 실행 후 약 9분 만에 튕겼습니다)" in plan.first.play
+    session = bisect.Session.new(tmp_path, plan, "기본", {}, bisect.TEMP_PROFILE)
+    session.mark_applied(session.next())
+    step = session.record(True, run={"seconds": 400.0})
+    assert isinstance(step, Step) and step.crash_minutes == pytest.approx(400 / 60)
+    assert "(지난번에는 실행 후 약 7분 만에 튕겼습니다)" in step.play
+
+
+def test_an_unsure_result_names_a_mod_only_from_50_percent(tmp_path):
+    # made by the engine (not by hand): a short budget and m4 crashing, with a quarter of the answers wrong
+    mods = twelve()
+    plan = bisect.make_plan(mods)
+    named = []
+    for seed in (0, 1):
+        folder = tmp_path / f"s{seed}"
+        folder.mkdir()
+        session = bisect.Session.new(folder, plan, "기본", {}, bisect.TEMP_PROFILE)
+        session.data["params"]["max_launches"] = 4
+        session._next = None
+        nxt = session.next()
+        rnd = random.Random(seed)
+        while isinstance(nxt, Step):
+            session.mark_applied(nxt)
+            nxt = session.record(("m4" in nxt.on) != (rnd.random() < 0.25))
+        assert nxt.kind == "unsure"
+        top = session._engine_now().summary()
+        assert bool(nxt.mods) == (top.sure >= 0.5) and nxt.can_disable == bool(nxt.mods)
+        if nxt.mods:
+            assert nxt.p == pytest.approx(top.sure) and nxt.p >= 0.5
+            assert bisect.disable_unsure_text(nxt, session.names) == f"'Mod 4'(약 {bisect.percent(nxt.p)})을(를) 끄고 원래 프로필로"
+        named.append(bool(nxt.mods))
+    assert named == [True, False]  # (both sides of the 50% rule)
+
+
+def test_the_command_line_notes_and_a_pending_setting(manager, mods, game_dir, capsys, monkeypatch):
+    import mhwmm.manager
+    from mhwmm import accessed
+    from mhwmm.cli import main
+
+    monkeypatch.setenv("APPDATA", "")
+    data = str(manager.data_dir)
+    config = write(game_dir / "re2_fw_config.txt", "FontSize=16\r\nLooseFileLoader_Enabled=true\r\n")
+    assert main(["--data-dir", data, "bisect", "start", "--when", "time", "--minutes", "10", "--log-files"]) == 0
+    assert "22분 넘게 해 보세요." in capsys.readouterr().out
+    # a crash 2 minutes in: no advice to play longer (the answer is taken at once)
+    assert main(["--data-dir", data, "bisect", "crashed", "--minutes", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "분만 실행했습니다" not in out and "원인 찾기: " in out
+    # a short fine run: what to use next time instead, and the answer weighed weakly
+    step = bisect.load(manager.data_dir).next()
+    assert step.minutes >= 10
+    assert main(["--data-dir", data, "bisect", "fine", "--minutes", "1"]) == 0
+    out = capsys.readouterr().out
+    assert f"이번에는 1분만 실행했습니다. 튕기던 상황까지 가지 못했다면 {bisect.CLI_RETRY}." in out
+    assert bisect.WEAK_ANSWER in out
+    # stopped while the game runs: the setting is put back by the next command once the game is closed
+    monkeypatch.setattr(mhwmm.manager, "is_game_running", lambda: True)
+    assert main(["--data-dir", data, "bisect", "stop"]) == 0
+    assert accessed.RESTORE_PENDING in capsys.readouterr().out and "LogAccessedFiles=true" in config.read_text()
+    assert main(["--data-dir", data, "list"]) == 0  # (still running: kept)
+    assert accessed.RESTORED not in capsys.readouterr().out and accessed.pending(manager.data_dir)
+    monkeypatch.setattr(mhwmm.manager, "is_game_running", lambda: False)
+    assert main(["--data-dir", data, "list"]) == 0
+    assert accessed.RESTORED in capsys.readouterr().out and accessed.pending(manager.data_dir) is None
+    assert config.read_bytes() == b"FontSize=16\r\nLooseFileLoader_Enabled=true\r\nLooseFileLoader_LogAccessedFiles=false\r\n"

@@ -321,7 +321,16 @@ class Theme:
             s.layout(style, [("Checkbutton.padding", {"sticky": "nswe", "children": [
                 ("Checkbutton.label", {"sticky": "nswe"})]})])
 
-        for style in ("TEntry", "TCombobox"):
+        # radio buttons (원인 모드 찾기: 언제 튕기나요?)
+        s.configure("TRadiobutton", background=p["bg"], foreground=p["text"], indicatorbackground=p["field"],
+                    indicatorforeground=p["on_accent"], upperbordercolor=p["subtle"], lowerbordercolor=p["subtle"],
+                    focuscolor=p["bg"], padding=(px(2), px(3)), indicatormargin=(0, 0, px(8), 0))
+        s.map("TRadiobutton", background=[("active", p["bg"])],
+              indicatorbackground=[("selected", p["accent"]), ("active", p["hover"])],
+              upperbordercolor=[("selected", p["accent"])], lowerbordercolor=[("selected", p["accent"])],
+              foreground=[("disabled", p["subtle"])])
+
+        for style in ("TEntry", "TCombobox", "TSpinbox"):
             s.configure(style, fieldbackground=p["field"], foreground=p["text"], background=p["field"],
                         bordercolor=p["border"], lightcolor=p["field"], darkcolor=p["field"],
                         insertcolor=p["text"], arrowcolor=p["muted"], padding=(px(9), px(6)),

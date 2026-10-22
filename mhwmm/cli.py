@@ -587,44 +587,114 @@ def cmd_crash(manager: ModManager, args) -> int:
     return 0
 
 
-def _print_plan(plan) -> None:
-    print(plan.problem or plan.intro())
+def _print_plan(plan, when: str | None = None, minutes: float | None = None, started: bool = False) -> None:
+    """The start window as text: the device error advice, the introduction, the suspects with their 근거, details
+    (``when``/``minutes``: 언제 튕기나요 as given, else the plan's; ``started``: the search runs already, so it is
+    changed by stopping it first)."""
+    if plan.problem:
+        print(plan.problem)
+        return
+    device = plan.device_note()
+    if device:
+        print(f"주의: {device}")
+        print()
+    print(plan.intro())
+    if plan.v2:
+        print()
+        print(bisect.RANKING_HEADING)
+        for label, p, why in [] if plan.uniform else plan.ranking_rows():
+            print(f"  {'약 ' + bisect.percent(p):<9}{label}")
+            for line in why:
+                print(f"           근거: {line}")
+        note = plan.ranking_note()
+        if note:
+            print(f"  {note}")
+        when = when or plan.when
+        minutes = minutes if minutes is not None else plan.minutes
+        print(f"언제 튕기나요: {bisect.WHEN_TEXT.get(when, when)}"
+              + (f" · 약 {round(minutes)}분" if when == "time" and minutes else "")
+              + f" (바꾸려면: {'bisect stop 후 ' if started else ''}bisect start --when start|same|time|rare [--minutes N])")
     for line in plan.lines():
         print(f"  • {line}")
 
 
+def _print_ranking(step, names: dict) -> None:
+    """The suspects of a step, most likely first (what the records and the answers so far give)."""
+    rows = [s for s in step.ranking if s.p >= 0.01][:5]
+    if not rows:
+        return
+    print("의심 순위 (기록과 지금까지의 답으로 매긴 것이고, 확실하다는 뜻은 아닙니다):")
+    for s in rows:
+        print(f"  {'약 ' + bisect.percent(s.p):<9}{bisect.suspect_label(s, names)}")
+
+
 def _print_bisect(manager: ModManager, session, nxt) -> None:
-    """Where a search is: the step to play, or its result and the way back."""
+    """Where a search is: the step to play, or its result (with its 근거) and the way back."""
     if isinstance(nxt, bisect.Step):
         print(session.banner(nxt, applied=not manager.dirty))
+        if nxt.engine:
+            print(bisect.progress_text(nxt, session.names))
         print("게임을 실행해 본 뒤 알려 주세요: bisect crashed (튕겼어요) · bisect fine (괜찮았어요) · "
-              "bisect retry (잘 모르겠어요, 이 단계 다시)")
+              "bisect retry (잘 모르겠어요, 같은 구성으로 다시)"
+              + (" · 게임을 지켜보지 못했다면 --minutes N으로 플레이한 시간(분)을 알려 주세요" if nxt.engine else ""))
         return
     print(bisect.result_title(nxt, session.names))
+    if nxt.evidence:
+        print("지금까지 가장 의심되는 것:" if nxt.kind == "unsure" else "근거:")
+        for line in nxt.evidence:
+            print(f"  - {line}")
     refw = manager.refw_mod()
     for line in session.result_lines(nxt, refw.id if refw else None):
         print(f"  • {line}")
+    more = ""
+    if nxt.kind == "unsure":
+        more = f"{bisect.RESULT_MORE}: bisect more ({bisect.MORE_LAUNCHES}번 더)"
+    elif nxt.can_confirm and nxt.kind in bisect.NAMED:
+        more = f"{bisect.RESULT_CONFIRM}: bisect more"
+    if more:
+        print(more)
     back = "원래 프로필로 돌아가려면: bisect stop"
     if nxt.can_disable:
-        back += "  (찾은 모드를 끄고 돌아가려면: bisect stop --disable)"
+        what = "가장 의심되는 모드" if nxt.kind == "unsure" else "찾은 모드"
+        back += f"  ({what}를 끄고 돌아가려면: bisect stop --disable)"
     print(back)
 
 
+def _bisect_evidence(manager: ModManager, record_id: str, owners: dict):
+    """The evidence a search starts from (evidence.build: the crash record, older launches, materials ...), with
+    REFramework's records copied first (as the GUI does at startup)."""
+    from . import evidence
+
+    try:
+        manager.collect_crash_evidence()
+    except Exception as exc:  # then the records kept so far
+        logging.getLogger(__name__).warning("게임 기록을 모으지 못했습니다: %s", exc)
+    inputs = evidence.gather(manager, record_id, owners)
+    units = [m.id for m in manager.mods if m.enabled]
+    return evidence.build(inputs, evidence.equipment_choices(manager, units))
+
+
 def cmd_bisect(manager: ModManager, args) -> int:
-    """원인 모드 찾기: start a search, answer for a step (the next one is applied), see where it is, stop."""
-    from . import crashes, gamewatch
+    """원인 모드 찾기: start a search, answer for a step (the next one is applied), see where it is, go on
+    (계속 찾기 / 한 번 더 확인), stop."""
+    from . import accessed, crashes, gamewatch
     from .manager import is_game_running
 
     session = bisect.load(manager.data_dir)
+    names = session.names if session is not None else {m.id: m.name for m in manager.mods}
     if args.action == "status":
         if session is not None:
             for line in session.report_lines():
                 print(line)
             print()
-            _print_bisect(manager, session, session.next())
+            nxt = session.next()
+            if isinstance(nxt, bisect.Step) and nxt.engine:
+                _print_ranking(nxt, names)
+            _print_bisect(manager, session, nxt)
             return 0
         print("진행 중인 원인 찾기가 없습니다. 'bisect start'로 시작하면:")
-        _print_plan(bisect.prepare(manager))
+        owners = bisect.conflict_owners(manager)
+        _print_plan(bisect.prepare(manager, evidence=_bisect_evidence(manager, "", owners), owners=owners))
         return 0
     if args.action == "start":
         if session is not None:
@@ -639,23 +709,50 @@ def cmd_bisect(manager: ModManager, args) -> int:
         record = crashes.find_session(manager.crash_dir, args.record) if args.record else None
         if args.record and record is None:
             raise SystemExit(f"기록을 찾을 수 없습니다: {args.record} (crash list로 번호를 확인하세요)")
+        if args.minutes is not None and args.minutes <= 0:
+            raise SystemExit("--minutes는 0보다 커야 합니다.")
         if manager.outdated_paks():  # moving them later would read as a game update: first
             print("예전 방식(패치 번호)으로 넣은 PAK을 먼저 pak_mods 폴더로 옮깁니다.")
             report = manager.deploy()
             _print_report(report)
             if report.errors:
                 return 1
-        plan = bisect.prepare(manager)
+        offer = None
+        if args.log_files:  # (checked before anything changes)
+            offer = accessed.manager_offer(manager, running=False)
+            if not offer.available:
+                print(f"오류: {offer.text}", file=sys.stderr)
+                return 1
+        owners = bisect.conflict_owners(manager)
+        ev = _bisect_evidence(manager, record.id if record else "", owners)
+        plan = bisect.prepare(manager, evidence=ev, owners=owners)
         if plan.problem:
             print(f"오류: {plan.problem}", file=sys.stderr)
             return 1
-        _print_plan(plan)
-        print()
+        when = args.when or plan.when
+        minutes = args.minutes if args.minutes is not None else (plan.minutes if when == "time" else None)
+        if when == "time" and minutes is None:
+            minutes = 10.0
+        restore = None
+        if offer is not None and not offer.already:
+            try:
+                restore = accessed.enable_logging(manager.set_refw_option, offer)
+            except (DeployError, ValueError, OSError) as exc:
+                print(f"오류: 게임이 읽는 파일 기록을 켜지 못했습니다: {exc}", file=sys.stderr)
+                return 1
+            print("게임이 읽는 파일 기록을 켰습니다 (원인 찾기를 마치면 원래대로 되돌립니다).")
+        elif offer is not None:
+            print(f"게임이 읽는 파일 기록: {offer.text}")
         try:
-            session, nxt = bisect.start(manager, plan, record.id if record else "")
+            session, nxt = bisect.start(manager, plan, record.id if record else str(ev.record or ""),
+                                        when=when, minutes=minutes, refw_restore=restore)
         except bisect.BisectError as exc:
+            if restore:
+                accessed.restore_logging(manager.set_refw_option, restore)
             print(f"오류: {exc}", file=sys.stderr)
             return 1
+        _print_plan(plan, when, minutes, started=True)
+        print()
         code = _maybe_deploy(manager, args)
         _print_bisect(manager, session, nxt)
         return code
@@ -667,13 +764,39 @@ def cmd_bisect(manager: ModManager, args) -> int:
         disable = []
         if args.disable:
             if not isinstance(nxt, bisect.Result) or not nxt.can_disable:
-                print("아직 끌 모드를 찾지 못했습니다. 'bisect stop'으로 그냥 돌아갈 수 있습니다.", file=sys.stderr)
+                why = ("아직 하나로 좁히지 못해 끌 모드가 없습니다 (가장 의심되는 모드가 50% 이상일 때만 끕니다)."
+                       if isinstance(nxt, bisect.Result) and nxt.kind == "unsure" else "아직 끌 모드를 찾지 못했습니다.")
+                print(f"{why} 'bisect stop'으로 그냥 돌아갈 수 있습니다.", file=sys.stderr)
                 return 1
             disable = nxt.mods
+        note = session.interim_note() if isinstance(nxt, bisect.Step) else ""
+        restore = session.refw_restore
         bisect.finish(manager, session, disable)
         off = f" ({', '.join(session.name(i) for i in disable)} 끔)" if disable else ""
         print(f"원래 프로필로 돌아왔습니다: {session.original_profile}{off}")
+        if note:
+            print(note.strip())
+        restored = accessed.finish_restore(manager, restore)
+        if restored:
+            print(restored)
         return _maybe_deploy(manager, args)
+    if args.action == "more":
+        if not isinstance(nxt, bisect.Result) or session.legacy or not (
+                nxt.kind == "unsure" or (nxt.can_confirm and nxt.kind in bisect.NAMED)):
+            print("지금은 더 찾을 것이 없습니다. 'bisect more'는 결과가 '아직 하나로 좁히지 못했습니다'일 때(계속 찾기)나 "
+                  "한 번 더 확인할 수 있는 결과일 때 씁니다.", file=sys.stderr)
+            return 1
+        reason = bisect.problem(manager, session)
+        if reason:
+            _print_bisect(manager, session, session.abort(reason))
+            return 1
+        print(f"{bisect.RESULT_MORE if nxt.kind == 'unsure' else bisect.RESULT_CONFIRM}: 원인 찾기를 이어 갑니다.")
+        nxt = session.more()
+        if isinstance(nxt, bisect.Step):
+            nxt = bisect.apply_step(manager, session)
+        code = _maybe_deploy(manager, args) if isinstance(nxt, bisect.Step) else 0
+        _print_bisect(manager, session, nxt)
+        return code
     if isinstance(nxt, bisect.Result):  # nothing more to answer
         _print_bisect(manager, session, nxt)
         return 0
@@ -681,15 +804,28 @@ def cmd_bisect(manager: ModManager, args) -> int:
     if reason:
         _print_bisect(manager, session, session.abort(reason))
         return 1
-    detected = ""
+    detected, run = "", None
     if args.action != "retry":  # the crashed game's records are copied before the next launch overwrites them
-        since = (session.current or {}).get("applied")
+        since = (session.current or {}).get("launched") or (session.current or {}).get("applied")
         detection = gamewatch.detect(manager.crash_dir, since if isinstance(since, (int, float)) else None,
                                      game_dir=manager.game_dir, context=manager.crash_context())
         detected = detection.label
         if detected:
             print(f"게임 기록: {detected}")
-    nxt = bisect.answer(manager, session, {"crashed": True, "fine": False}.get(args.action), detected)
+        if not session.legacy:
+            run = accessed.step_run(detection, nxt.on, manager.crash_index(), session.content,
+                                    accessed.PakNames(manager.data_dir / "cache"))
+            if run.get("seconds") is None and args.minutes is not None and args.minutes >= 0:
+                run["seconds"] = 60.0 * args.minutes  # (the game was not watched: the play time the user gave)
+            if args.action == "fine":  # (the answer is taken at once: what to do next time, not now)
+                for note in (bisect.run_note(nxt, run.get("seconds"), bisect.CLI_RETRY),
+                             bisect.exposure_note(nxt, run["unexposed"], names, bisect.CLI_RETRY)):
+                    if note:
+                        print(note)
+    nxt = bisect.answer(manager, session, {"crashed": True, "fine": False}.get(args.action), detected, run)
+    change = session.last_change()
+    if change:
+        print(change)
     code = _maybe_deploy(manager, args) if isinstance(nxt, bisect.Step) else 0
     _print_bisect(manager, session, nxt)
     return code
@@ -842,13 +978,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", metavar="파일", help="show: 게임 오류 창이나 이벤트 뷰어에서 복사한 문구 파일도 분석 "
                                                 "('-'는 표준 입력)")
 
-    p = sub.add_parser("bisect", help="원인 모드 찾기: 모드를 절반씩 끄고 실행해 보며 게임을 튕기게 하는 모드 찾기")
+    p = sub.add_parser("bisect", help="원인 모드 찾기: 기록으로 의심되는 정도를 매긴 뒤 모드를 켜고 끄며 실행해 보고 게임을 "
+                                      "튕기게 하는 모드 찾기")
     p.add_argument("action", nargs="?", default="status",
-                   choices=("status", "start", "crashed", "fine", "retry", "stop"),
-                   help="status: 진행 상황 (기본값) · start: 시작 (임시 프로필에서) · crashed: 튕겼어요 · fine: 괜찮았어요 · "
-                        "retry: 잘 모르겠어요 (이 단계 다시) · stop: 원래 프로필로")
+                   choices=("status", "start", "crashed", "fine", "retry", "more", "stop"),
+                   help="status: 진행 상황 · 의심 순위(%%)와 다음 구성 (기본값) · start: 시작 (임시 프로필에서) · "
+                        "crashed: 튕겼어요 · fine: 괜찮았어요 · retry: 잘 모르겠어요 (같은 구성으로 다시) · "
+                        "more: 아직 좁히지 못함이면 6번 더(계속 찾기), 결과가 나왔으면 한 번 더 확인 · stop: 원래 프로필로")
     p.add_argument("--record", metavar="번호", help="start: 원인을 찾을 게임 튕김 기록 (crash list의 번호)")
-    p.add_argument("--disable", action="store_true", help="stop: 찾은 모드를 원래 프로필에서 끄기")
+    p.add_argument("--when", choices=("start", "same", "time", "rare"),
+                   help="start: 언제 튕기나요 · start: 켜거나 불러오는 중 · same: 같은 장소·행동에서 매번 · "
+                        "time: 한동안 하다 보면 (--minutes) · rare: 가끔")
+    p.add_argument("--minutes", type=float, metavar="N",
+                   help="start --when time: 몇 분쯤 하면 튕기는지 · crashed/fine: 이번에 플레이한 분 "
+                        "(게임을 지켜보지 못했을 때)")
+    p.add_argument("--log-files", action="store_true",
+                   help="start: 게임이 읽는 파일을 기록해 더 정확하게 찾기 (REFramework 설정, 마치면 되돌림)")
+    p.add_argument("--disable", action="store_true",
+                   help="stop: 찾은 모드를 원래 프로필에서 끄기 (아직 좁히지 못함이면 50%% 이상일 때만)")
 
     p = sub.add_parser("check", help="실행 전 점검: 게임이 튕기거나 모드가 작동하지 않는 흔한 원인 찾기 "
                                      "(높음·보통 항목이 있으면 종료 코드 1)")
@@ -916,6 +1063,8 @@ def main(argv=None) -> int:
         return 2
     setup_logging(manager.data_dir)
     logging.getLogger().addHandler(_stderr_handler())
+    if lock is not None:  # (a REFramework setting 원인 모드 찾기 left to put back once the game is closed)
+        _apply_pending_restore(manager)
     try:
         if changes_mods(args) and bisect.active(manager.data_dir):
             print(f"오류: {bisect.BLOCKED} (bisect로 확인, bisect stop으로 그만두기)", file=sys.stderr)
@@ -931,6 +1080,19 @@ def main(argv=None) -> int:
     finally:
         if lock is not None:
             lock.close()
+
+
+def _apply_pending_restore(manager: ModManager) -> None:
+    """accessed.apply_pending for the command line (the window does it at startup and after each game exit)."""
+    from . import accessed
+
+    try:
+        message = accessed.apply_pending(manager, searching=bisect.active(manager.data_dir))
+    except Exception as exc:  # only a help: the next start tries again
+        logging.getLogger(__name__).warning("REFramework 설정을 되돌리지 못했습니다: %s", exc)
+        return
+    if message:
+        print(message)
 
 
 def _stderr_handler() -> logging.Handler:

@@ -6,6 +6,8 @@ before it starts the game - into ``<data>/crashes/<YYYYMMDD-HHMMSS>/``, one fold
 
 - ``re2_framework_log.txt`` (from the log or the .prev log), ``reframework_faulty_files.txt``,
   ``reframework_crash.dmp`` (matched to the session by its time) and ``re2_fw_config.txt``;
+- ``reframework_accessed_files.txt.gz``: REFramework's record of every file the game asked for, when
+  LooseFileLoader_LogAccessedFiles is on (compressed; see accessed.py);
 - ``session.json``: where they came from, a short summary, and the manager's state (profile, mods)
   at the launch the session came from (or when it was collected).
 
@@ -19,6 +21,7 @@ state.json, which holds the Nexus API key).
 
 from __future__ import annotations
 
+import gzip
 import logging
 import os
 import re
@@ -26,7 +29,8 @@ import struct
 import threading
 import time
 import zipfile
-from collections import Counter
+import zlib
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +49,9 @@ SESSION_FILE = "session.json"
 LAUNCH_FILE = "launch.json"
 NOTICE_FILE = "notice.json"
 PRUNED_FILE = "pruned.json"  # records already let go, so they are not copied again while still in the game folder
+ACCESSED_COPY = crashlog.ACCESSED_FILE + ".gz"  # REFramework's record of the files the game read, compressed
+ACCESSED_TAIL = "reframework_accessed_files_tail.txt"  # its last lines in the support zip
+REPORT_ACCESSED_LINES = 300
 SESSION_FORMAT = 1
 KEEP_SESSIONS = 10
 KEEP_RECENT = 3  # the newest ones are kept even without a problem
@@ -203,6 +210,11 @@ def _epoch(stamp: str) -> float | None:
     return t.timestamp() if t else None
 
 
+def epoch(stamp: str) -> float | None:
+    """A log time stamp (local time, as REFramework writes it) as epoch seconds (None if it is not one)."""
+    return _epoch(stamp)
+
+
 class Session:
     """One game session the manager keeps the records of (a folder in crashes\\)."""
 
@@ -211,6 +223,7 @@ class Session:
         self.info = info
         self._log: LogInfo | None = None
         self._faulty: list[FaultyFile] | None = None
+        self._accessed = None  # accessed.AccessLog, read once
 
     def __repr__(self) -> str:
         return f"Session({self.id!r})"
@@ -287,6 +300,35 @@ class Session:
             except OSError:
                 self._faulty = []
         return self._faulty
+
+    def accessed(self):
+        """REFramework's record of the files the game asked for in this session (accessed.AccessLog, from its
+        copy; None without one). Reads the whole record: off the GUI thread."""
+        if self._accessed is None:
+            path = self.file(ACCESSED_COPY)
+            if path is None:
+                return None
+            from . import accessed
+
+            found = accessed.read(path)
+            record = self.info["files"].get(ACCESSED_COPY)
+            record = record if isinstance(record, dict) else {}
+            found.truncated = found.truncated or bool(record.get("truncated"))
+            # copied while the game still ran, and the game was started again (from Steam) before the manager
+            # could copy the rest: the session ended (or crashed) after its copy was made
+            copied = record.get("copied")
+            crashed = self.summary.get("crash_time")
+            crashed = float(crashed) if isinstance(crashed, (int, float)) and not isinstance(crashed, bool) and crashed \
+                else None
+            ends = [t for t in (self.end_time, crashed) if t]
+            if isinstance(copied, (int, float)) and ends and max(ends) > copied + accessed.COPY_SLACK:
+                found.partial = True
+            # (or, whatever the clock said: nothing new asked for in the minutes before a crash - the game asks for
+            # files all the time while it runs - the end is missing)
+            if crashed is not None and found.last_time is not None and crashed - found.last_time > accessed.PARTIAL_GAP:
+                found.partial = True
+            self._accessed = found
+        return self._accessed
 
     @property
     def crash(self) -> Crash | None:
@@ -393,10 +435,43 @@ def last_fatal(crash_dir) -> Session | None:
     return next((s for s in sessions(crash_dir) if s.problem() in ("crash", "dump")), None)
 
 
-def crashed_since(crash_dir, since: float) -> Session | None:
-    """A crash recorded after ``since`` (epoch seconds), e.g. a launch: run :func:`collect` first."""
-    return next((s for s in sessions(crash_dir) if s.problem() in ("crash", "dump")
-                 and max(s.end_time, float(s.summary.get("crash_time") or 0)) >= since), None)
+def crash_where(session: Session | None) -> str:
+    """Where a session crashed, as exactly as its records say (to tell one crash from another of the same code):
+    "<module>+0x<offset>" from REFramework's handler, else the module's file name (the game's own report, or a
+    handler that wrote no address), lower case; "" when not known (or code in no module)."""
+    if session is None:
+        return ""
+    info = session.log()
+    crash = info.crash if info is not None else None
+    if crash is not None:
+        name = module_name(crash.place).lower() if crash.place else ""
+        if not name:
+            return ""
+        try:
+            offset = int(crash.rip, 16) - int(crash.module_base, 16) if crash.rip and crash.module_base else None
+        except ValueError:
+            offset = None
+        return f"{name}+0x{offset:x}" if offset is not None and offset >= 0 else name
+    name = str(session.summary.get("module_name") or "")
+    return name.lower()
+
+
+def crashed_since(crash_dir, since: float, first: bool = False, until: float | None = None) -> Session | None:
+    """A crash recorded after ``since`` (epoch seconds), e.g. a launch: the newest (``first``: the oldest - the
+    launch's own run when the game may have been started again since; ``until``: of a run that began before the
+    game ended then). Run :func:`collect` first."""
+    found = [s for s in sessions(crash_dir) if s.problem() in ("crash", "dump")
+             and max(s.end_time, float(s.summary.get("crash_time") or 0)) >= since
+             and (until is None or s.time <= until + 5)]
+    return (found[-1] if first else found[0]) if found else None
+
+
+def session_since(crash_dir, since: float, until: float | None = None, first: bool = False) -> Session | None:
+    """The record of a game run that started at ``since`` (epoch; e.g. a launch), crash or not: the newest
+    session starting after it (and, with ``until``, not after the run ended; ``first``: the oldest - the run the
+    launch started, when the game may have been started again since). Run :func:`collect` first."""
+    found = [s for s in sessions(crash_dir) if s.time >= since - 5 and (until is None or s.time <= until + 5)]
+    return (found[-1] if first else found[0]) if found else None
 
 
 # ---- collecting ------------------------------------------------------------------------------------
@@ -488,6 +563,53 @@ def _copy_log(src: Path, dst: Path, start: str) -> bool:
     return True
 
 
+def _accessed_owner(path: Path, candidates: Iterable[Session]) -> tuple[Session | None, bytes]:
+    """The kept session a record of the files the game read was written in, and the record's first line (None:
+    no such session, or the record holds no path: logging was off)."""
+    from . import accessed
+
+    head = accessed.read_head(path)
+    if head is None or not head[1].logging:
+        return None, b""
+    found = [s for s in candidates if s.started and accessed.belongs(head[1], s.time)]
+    return max(found, key=lambda s: s.time, default=None), head[0]
+
+
+def _copy_accessed(src: Path, dst: Path, first_line: bytes) -> tuple[int | None, bool]:
+    """Copy the record gzip-compressed: (lines, whether only its first line and its last MAX_LOG_COPY bytes were
+    kept); (None, False) when the game started a new record meanwhile (its first line is not ``first_line``)."""
+    size = src.stat().st_size
+    truncated = size > MAX_LOG_COPY
+    tmp = dst.with_name(dst.name + fsutil.PART_SUFFIX)
+
+    def first_of(f) -> bytes:
+        return f.readline(64 * 1024).rstrip(b"\r\n")
+
+    same, lines = False, 0
+    try:
+        with open(src, "rb") as f, gzip.open(tmp, "wb", compresslevel=6) as out:
+            first = first_of(f)
+            if first == first_line:
+                out.write(first + b"\n")
+                lines = 1
+                if truncated:
+                    f.seek(size - MAX_LOG_COPY)
+                    f.readline()  # (a cut line)
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    out.write(chunk)
+                    lines += chunk.count(b"\n")
+                with open(src, "rb") as again:  # (a new start truncates the file and begins it again)
+                    same = first_of(again) == first_line
+        if not same:
+            fsutil.remove_file(tmp)
+            return None, False
+        os.replace(tmp, dst)
+    except BaseException:
+        fsutil.remove_file(tmp)
+        raise
+    return lines, truncated
+
+
 def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]:
     dirs = evidence_dirs(game_dir, appdata)
     if not dirs:
@@ -565,6 +687,30 @@ def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]
         s._faulty = None
         changed[s.id] = s
 
+    # REFramework's record of the files the game asked for (LooseFileLoader_LogAccessedFiles): truncated at
+    # every start, it belongs to the session REFramework began just before writing its first line; kept
+    # compressed, and only when it holds paths (with logging off it has the first line alone)
+    for d in dirs:
+        path = d / crashlog.ACCESSED_FILE
+        st = _stat(path)
+        if st is None or any(_same(x.info["files"].get(ACCESSED_COPY), st) for x in everything.values()):
+            continue
+        s, first_line = _accessed_owner(path, everything.values())
+        if s is None:
+            continue
+        try:
+            lines, truncated = _copy_accessed(path, s.folder / ACCESSED_COPY, first_line)
+        except OSError as exc:
+            log.warning("게임이 읽은 파일 기록을 복사하지 못했습니다 (%s): %s", path, exc)
+            continue
+        if lines is None:
+            log.info("게임이 새 파일 기록을 시작해 다음에 다시 모읍니다: %s", path)
+            continue
+        s.info["files"][ACCESSED_COPY] = {"from": str(path), "size": st.st_size, "mtime": st.st_mtime_ns,
+                                          "lines": lines, "truncated": truncated, "copied": time.time()}
+        s._accessed = None
+        changed[s.id] = s
+
     # the crash dump goes with the session whose crash it records; a dump left alone (the log of its
     # session was overwritten by a later start) gets a session of its own
     for d in dirs:
@@ -605,7 +751,7 @@ def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]
         if st.st_mtime < min(cutoff, oldest):  # older than any kept session and too old for one of its own
             continue
         try:
-            text, written, started = _read_game_report(path, st)
+            text, written, started, time_from = _read_game_report(path, st)
         except Exception as exc:  # one report never stops the others (nor the records above) being kept
             log.info("게임 오류 보고서를 읽지 못했습니다 (%s): %s", path, exc)
             continue
@@ -638,7 +784,7 @@ def _collect(crash_dir: Path, game_dir, context: dict, appdata) -> list[Session]
             _claim_launch(crash_dir, launch, s.id)
         everything[s.id] = s
         s.info["files"][GAME_REPORT_FILE] = {"from": str(path), "size": st.st_size, "mtime": st.st_mtime_ns,
-                                             "time": written, "key": key}
+                                             "time": written, "time_from": time_from, "key": key}
         changed[s.id] = s
 
     # REFramework's settings as they are now (Lua error logging, loose files, pak_mods): those of the folder
@@ -723,10 +869,11 @@ def _report_record_key(s: Session) -> str:
     return record.get("key", "") if isinstance(record, dict) else ""
 
 
-def _read_game_report(path: Path, st) -> tuple[str | None, float, float | None]:
-    """(CrashReport.txt's text, when the game crashed, when its process started) of a report zip or folder;
-    (None, 0, None) if unreadable (any error: a damaged zip also raises zlib.error, EOFError ...). The crash
-    time is the minidump's (written at the crash), else the text's, else the name's, else the file's."""
+def _read_game_report(path: Path, st) -> tuple[str | None, float, float | None, str]:
+    """(CrashReport.txt's text, when the game crashed, when its process started, where that time came from) of a
+    report zip or folder; (None, 0, None, "") if unreadable (any error: a damaged zip also raises zlib.error,
+    EOFError ...). The crash time is the minidump's ("dump": written at the crash, in whole seconds), else the
+    text's ("zip": its entry's time, 2 s), else the name's ("name": only the minute), else the file's ("mtime")."""
     head, stamp = b"", None
     try:
         if path.name != crashlog.GAME_REPORT_TEXT:
@@ -734,7 +881,7 @@ def _read_game_report(path: Path, st) -> tuple[str | None, float, float | None]:
                 by_name = {i.filename.replace("\\", "/").rsplit("/", 1)[-1].casefold(): i for i in zf.infolist()}
                 info = by_name.get(crashlog.GAME_REPORT_TEXT.casefold())
                 if info is None or info.file_size > MAX_GAME_REPORT_TEXT:
-                    return None, 0, None
+                    return None, 0, None, ""
                 data = zf.read(info)
                 dump = next((i for n, i in by_name.items() if n.endswith(".dmp")), None)
                 if dump is not None:
@@ -750,7 +897,7 @@ def _read_game_report(path: Path, st) -> tuple[str | None, float, float | None]:
             name = path.name
         else:
             if st.st_size > MAX_GAME_REPORT_TEXT:
-                return None, 0, None
+                return None, 0, None, ""
             data = path.read_bytes()
             dumps = sorted(path.parent.glob("*.dmp"))
             if dumps:
@@ -762,13 +909,15 @@ def _read_game_report(path: Path, st) -> tuple[str | None, float, float | None]:
             name = path.parent.name
     except Exception as exc:
         log.info("게임 오류 보고서를 읽지 못했습니다 (%s): %s", path, exc)
-        return None, 0, None
+        return None, 0, None, ""
     text = data.decode("utf-8", errors="replace")
     if crashlog.parse_game_report(text) is None:
-        return None, 0, None
+        return None, 0, None, ""
     crashed, started = _dump_times(head)
-    written = crashed or _plausible(stamp) or _plausible(report_name_time(name)) or st.st_mtime
-    return text, float(written), started
+    written, source = next(((t, source) for t, source in ((crashed, "dump"), (_plausible(stamp), "zip"),
+                                                         (_plausible(report_name_time(name)), "name")) if t),
+                           (st.st_mtime, "mtime"))
+    return text, float(written), started, source
 
 
 def _plausible(t: float | None) -> float | None:
@@ -885,7 +1034,9 @@ def _summarize(s: Session) -> None:
         if not summary.get("crash"):
             top = report.modules[0] if report.modules else ""
             summary.update({"crash": report.code, "crash_from": "report",
-                            "crash_time": float(record.get("time") or s.end_time), "module": top, "module_name": module_name(top) if top else "",
+                            "crash_time": float(record.get("time") or s.end_time),
+                            "crash_time_from": str(record.get("time_from") or ""), "module": top,
+                            "module_name": module_name(top) if top else "",
                             "category": "gpu" if report.device_error else module_place(top, [s.info.get("source", "")])[0]
                             if top else ""})
     s.info["summary"] = summary
@@ -1039,6 +1190,7 @@ class ModIndex:
         self._placed: dict[str, str] | None = None
         self._keys: dict[str, set[str]] = {}
         self._loose: dict[str, list[str]] | None = None
+        self._exact: dict[str, list[str]] | None = None
         self._paks: list[tuple[str, str]] | None = None
         self._pak_tables: dict[str, object] = {}
         self._listings: dict[Path, dict[str, str]] = {}
@@ -1158,6 +1310,46 @@ class ModIndex:
                 index = {key: [max(ids, key=lambda i: rank.get(i, -1))] for key, ids in index.items()}
             self._loose = index
         return self._loose
+
+    def loose_owner(self, key: str) -> str:
+        """The mod whose loose file the game reads for a resource (crashlog.resource_key): the one the manager
+        placed, else the last in load order of the mods that were on ("" for none)."""
+        owners = self._loose_index().get(key)
+        return owners[-1] if owners else ""
+
+    def loose_path_owner(self, path: str) -> str:
+        """The mod whose loose file is at exactly this game path (natives\\..., with its folder - streaming\\ or
+        not - and version suffix: REFramework's loose file loader serves only a file that is there), as
+        loose_owner picks it ("" for none)."""
+        if self._exact is None:
+            index: dict[str, list[str]] = {}
+            for key, mod in self.placed().items():
+                if key.startswith("natives/"):
+                    index.setdefault(key, []).append(mod)
+            placed = set(index)
+            for m in self.mods.values():
+                if self.was_on(m):
+                    for rel in m.files:
+                        key = norm_path(rel)
+                        if key.startswith("natives/") and (key not in placed or self.order is not None) \
+                                and m.id not in index.get(key, []):
+                            index.setdefault(key, []).append(m.id)
+            if self.order is not None:
+                rank = {mod_id: n for n, mod_id in enumerate(self.order)}
+                index = {key: [max(ids, key=lambda i: rank.get(i, -1))] for key, ids in index.items()}
+            self._exact = index
+        owners = self._exact.get(norm_path(path))
+        return owners[-1] if owners else ""
+
+    def pak_paths(self) -> list[tuple[str, str, int]]:
+        """(mod id or "" for a pak no mod placed, game path, patch number REFramework gives it: the highest
+        wins) of the paks in pak_mods the game read."""
+        ranks = self._pak_ranks()
+        return [(mod_id, rel, ranks.get(rel, -1)) for mod_id, rel in self._pak_list()]
+
+    def pak_file(self, rel: str):
+        """The entry table of a pak in the game folder (matfix.pak.PakFile; None if it cannot be read)."""
+        return self._pak_table(rel)
 
     def later_gone(self, mod_id: str) -> bool:
         """For a session: a mod that was on in it after this one in load order is no longer installed
@@ -1358,6 +1550,7 @@ class Finding:
 
 
 KINDS = ("plugin", "reframework", "game", "gpu", "root_dll", "system", "other", "unknown", "stack", "suspicious",
+         "accessed", "accessed_some",
          "script", "lua", "plugin_load", "pak_failed", "pak_slot", "pak_none", "pak_disabled", "loose_failed",
          "init", "hooks", "present", "faulty", "faulty_loose", "faulty_pak", "faulty_game", "faulty_more",
          "faulty_unread", "material", "stuck", "no_crash", "running", "no_record", "dump_only", "corrupted_pak", "d3d",
@@ -1626,6 +1819,30 @@ def _material_findings(index: ModIndex) -> list[Finding]:
     return out
 
 
+def _accessed_findings(session: Session | None, index: ModIndex) -> list[Finding]:
+    """The mods whose files the game asked for in the last seconds before the crash (REFramework's record of
+    the files the game read; only mods with game files - natives\\ or PAKs - show in it)."""
+    from . import accessed
+
+    when = accessed.crash_time(session)
+    found = accessed.session_exposure(session, index, (), tail_only=True) if when is not None else None
+    if found is None or not found.tail:
+        return []
+    shown = list(found.tail)[:4]
+    evidence = [f"튕기기 {secs:.1f}초 전: {path}" for secs, path, mod in found.tail_files[:3]]
+    if found.exclusive:
+        k = found.tail[found.exclusive]
+        return [Finding("accessed", f"튕기기 직전 {accessed.TAIL_SECONDS:.0f}초 동안 게임이 읽은 모드 파일 {k}개가 모두 "
+                        f"{index.label(found.exclusive)}의 것입니다" + _suspect(index, [found.exclusive]), evidence,
+                        [found.exclusive], "high")]
+    if len(found.tail) == 1:
+        return [Finding("accessed_some", f"튕기기 직전 {accessed.TAIL_SECONDS:.0f}초 동안 게임이 "
+                        f"{index.label(shown[0])}의 파일 1개를 읽었습니다", evidence, shown, "low")]
+    return [Finding("accessed_some", f"튕기기 직전 {accessed.TAIL_SECONDS:.0f}초 동안 게임이 여러 모드의 파일을 읽었습니다: "
+                    + _mods_text(index, shown) + (f" 외 {len(found.tail) - len(shown)}개" if len(found.tail) > 4 else ""),
+                    evidence, shown, "low")]
+
+
 def _bases(index: ModIndex, info: LogInfo | None, session: Session | None) -> list[str]:
     bases = [info.game_path if info else "", str(index.game_dir) if index.game_dir else "",
              session.info.get("source", "") if session else ""]
@@ -1665,6 +1882,7 @@ def explain(session: Session | None, index: ModIndex, builds=None, now: float | 
     faulty = session.faulty() if session is not None else []
     if faulty:
         findings += _faulty_findings(index.match_faulty(faulty, session_loose(session)), index)
+    findings += _accessed_findings(session, index)
     if session is None:
         lead.append(Finding("no_record", NO_RECORD))
     elif session.dump_only and report is None:
@@ -1856,6 +2074,21 @@ def _masked(path: Path, max_bytes: int = MAX_LOG_COPY) -> str:
     return mask_user(crashlog.read_text(path, max_bytes))
 
 
+def _accessed_tail(s: Session, lines: int = REPORT_ACCESSED_LINES) -> str:
+    """The last lines of a session's record of the files the game read ("" without one)."""
+    path = s.file(ACCESSED_COPY)
+    if path is None:
+        return ""
+    kept: deque = deque(maxlen=lines)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                kept.append(line.rstrip("\r\n"))
+    except (OSError, EOFError, zlib.error) as exc:
+        log.info("게임이 읽은 파일 기록을 읽지 못했습니다 (%s): %s", s.id, exc)
+    return "\n".join(kept) + "\n" if kept else ""
+
+
 def write_report(target, text: str, records: Sequence[Session] = (), *, manager_log=None,
                  deployed: dict | None = None, names: dict[str, str] | None = None, include_dump: bool = False) -> Path:
     """The support zip: report.txt, each session's copied records (``<id>/``; the dump only with
@@ -1873,6 +2106,9 @@ def write_report(target, text: str, records: Sequence[Session] = (), *, manager_
                         zf.writestr(f"{s.id}/{name}", _masked(path))
                 if include_dump and s.dump_path is not None:
                     zf.write(s.dump_path, f"{s.id}/{DUMP_FILE}")
+                tail = _accessed_tail(s)
+                if tail:
+                    zf.writestr(f"{s.id}/{ACCESSED_TAIL}", mask_user(tail))
             if manager_log and Path(manager_log).is_file():
                 tail = Path(manager_log).read_text(encoding="utf-8", errors="replace").splitlines()[-REPORT_LOG_LINES:]
                 zf.writestr("manager.log", mask_user("\n".join(tail) + "\n"))

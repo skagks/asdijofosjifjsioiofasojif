@@ -289,6 +289,7 @@ class Settings:
     log_visible: bool = True
     check_materials: bool = True  # look for outdated materials at startup and after installs
     archive_dirs: list = field(default_factory=list)  # folders mods were installed from, the latest first
+    bisect_log_files: bool = False  # 원인 모드 찾기: the last choice of "게임이 읽는 파일을 기록해 더 정확하게 찾기"
 
 
 @dataclass
@@ -829,14 +830,16 @@ class ModManager:
         return Conflicts(multi, {k: paths[k] for k in multi})
 
     def hidden_mods(self, conflicts: Conflicts | None = None) -> list[Mod]:
-        """Enabled mods whose files all lose to other mods, so nothing of them reaches the game."""
+        """Enabled mods whose files all lose to other mods, so nothing of them reaches the game (never a mod with
+        a root .pak: that goes to pak_mods and is always loaded)."""
         conflicts = conflicts or self.conflicts()
         hidden = []
         for m in self.mods:
             if not m.enabled:
                 continue
             wins, losses = conflicts.counts(m.id)
-            if losses and not wins and losses == sum(1 for f in self.mod_files(m.id) if not is_root_pak(f)):
+            files = self.mod_files(m.id)
+            if losses and not wins and not any(is_root_pak(f) for f in files) and losses == len(files):
                 hidden.append(m)
         return hidden
 

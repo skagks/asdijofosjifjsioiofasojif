@@ -13,6 +13,8 @@ or into %APPDATA%\\REFramework\\MonsterHunterWilds\\ when the game folder is not
   line per resource the game could not load.
 - ``re2_fw_config.txt``: ``key=value`` lines, read once at start and rewritten by REFramework while
   the game runs (so it is only changed while the game is closed).
+- ``reframework_accessed_files.txt`` (LooseFileLoader_LogAccessedFiles): every file the game asked for,
+  read by accessed.py.
 
 Builds differ (no .prev.txt, no faulty list, no RIP line in older ones), so everything here is
 tolerant: a line that is not understood is skipped, never an error.
@@ -31,6 +33,7 @@ PREV_LOG_FILE = "re2_framework_log.prev.txt"
 DUMP_FILE = "reframework_crash.dmp"
 FAULTY_FILE = "reframework_faulty_files.txt"
 CONFIG_FILE = "re2_fw_config.txt"
+ACCESSED_FILE = "reframework_accessed_files.txt"  # LooseFileLoader_LogAccessedFiles: every file the game asked for
 APPDATA_SUBDIR = ("REFramework", "MonsterHunterWilds")  # under %APPDATA%: the exe name without .exe
 
 LUA_LOG_KEY = "ScriptRunner_LogToDisk"  # Lua errors reach the log only when this is true
@@ -42,6 +45,7 @@ TIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 _HEAD = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d{1,6})?)\] \[([^\]]*)\] "
                    r"\[(trace|debug|info|warn|warning|err|error|critical)\] ?"
                    r"(?:\[([\w.]+\.(?:cpp|hpp|cc|c|h):\d+)\] )?(.*)$")
+HEAD = _HEAD  # spdlog's default line head (REFramework's other logs use it too: accessed.py)
 _HEADER = {"Commit hash": "commit", "Tag": "tag", "Commits past tag": "commits_past", "Branch": "branch",
            "Total commits": "total_commits", "Build date": "build_date", "Build time": "build_time",
            "Game name": "game_name", "Current game path": "game_path"}
@@ -280,6 +284,15 @@ def parse_frames(lines: list[str]) -> list[Frame]:
         else:
             symbol = line.strip()
     return frames
+
+
+def plugin_error(message: str) -> PluginError | None:
+    """A plugin loader error line (PluginError), or None for another line."""
+    for rx, reason in _PLUGIN_ERRORS:
+        m = rx.match(message)
+        if m:
+            return PluginError(m.group(1).strip(), reason, message)
+    return None
 
 
 def crashed_frames(frames: list[Frame]) -> list[Frame]:

@@ -327,6 +327,49 @@ def test_a_crash_record_since_the_launch(game, tmp_path):
     assert d.crashed is False and d.record is None and d.normal and d.label == ""
 
 
+def test_a_launch_not_watched_is_the_first_run_after_it(game, tmp_path):
+    # the launch crashed while the manager was closed, then the game was started again from Steam (REFramework moved
+    # the crash's log to .prev and began its record of the files read anew): without the exit, the launch's run is the
+    # first one after it, and the later run's record of the files read says nothing of that crash
+    from mhwmm import accessed
+    from mhwmm.crashes import ModIndex, ModRef
+
+    crash_dir = tmp_path / "data" / "crashes"
+    launched = datetime(2026, 10, 16, 15, 39, 0).timestamp()
+    later = launched + 900
+    write(game / "re2_framework_log.prev.txt", crash_log(game, launched + 20, launched + 600))
+    write(game / "re2_framework_log.txt", normal_log(game, later, later + 1500))
+    tex = "natives/STM/art/armor0.tex.241106027"
+    write(game / tex, "t")
+    write(game / accessed.ACCESSED_FILE, "\n".join(f"[{stamp(t)}] [LooseFileLoader] [info] {msg}" for t, msg in (
+        (later + 3, accessed.CONSTRUCTED), (later + 70, tex), (later + 1400, "natives/STM/gui/ui.tex.241106027"))))
+    d = gamewatch.detect(crash_dir, launched, None, game, {"mods": []}, appdata="")
+    assert d.crashed and d.record is not None and d.session.id == d.record.id
+    assert d.session.started == stamp(launched + 20) and len(crashes.sessions(crash_dir)) == 2
+    index = ModIndex(game, {tex.lower(): {"path": tex, "mod": "a"}},
+                     [ModRef("a", "Armor 0", files=[tex]), ModRef("b", "Armor 1", files=["natives/STM/art/b.tex.1"])])
+    run = accessed.step_run(d, ["a", "b"], index, ["a", "b"])
+    assert run["auto"] == "crash" and run["record"] == d.record.id and not run["log"] and run["unexposed"] == []
+    # the crash record and the run's record disagree (another run crashed): nothing is read from the record
+    other = gamewatch.Detection(True, "c0000005", None, d.record, crashes.sessions(crash_dir)[0])
+    assert other.session.id != other.record.id
+    run = accessed.step_run(other, ["a", "b"], index, ["a", "b"])
+    assert run["auto"] == "crash" and not run["log"] and run["unexposed"] == [] and run["tail"] == []
+
+
+def test_a_later_run_s_crash_is_not_the_watched_run_s(game, tmp_path):
+    # a search resumed with the step's exit already known; the game was started again from Steam since and crashed
+    crash_dir = tmp_path / "data" / "crashes"
+    launched = datetime(2026, 10, 16, 15, 39, 0).timestamp()
+    later = launched + 2000
+    write(game / "re2_framework_log.prev.txt", normal_log(game, launched + 20, launched + 1500))
+    write(game / "re2_framework_log.txt", crash_log(game, later, later + 600))
+    d = gamewatch.detect(crash_dir, launched, GameExit(1, 0, launched + 1510, started=launched + 5), game, {"mods": []},
+                         appdata="")
+    assert d.record is None and d.crashed is False
+    assert crashes.crashed_since(crash_dir, launched) is not None  # (the later run's crash is kept)
+
+
 def test_exits_without_a_record():
     assert gamewatch.judge(GameExit(1, 0xC0000409, 100.0, started=90.0)).crashed  # fail-fast: no REFramework record
     assert gamewatch.judge(GameExit(1, 0xC0000409, 100.0)).label == "비정상 종료를 확인했습니다 (0xC0000409)"
@@ -368,6 +411,77 @@ def test_the_launch_a_process_came_from(tmp_path):
     assert gamewatch.launch_context(crash_dir, 1000.0 + 16 * 60) is None
     assert gamewatch.launch_context(crash_dir, None) is None
     assert gamewatch.launch_context(tmp_path / "none", 1030.0) is None
+
+
+# ---- every run (launches.json) -------------------------------------------------------------------------------
+def normal_log(game: Path, start: float, end: float) -> str:
+    def rec(t, msg):
+        return f"[{stamp(t)}] [REFramework] [info] {msg}"
+
+    return "\r\n".join([rec(start, "REFramework entry"), rec(start, f"Current game path: {game}"),
+                        rec(end, "Hooked DirectX 12")]) + "\r\n"
+
+
+MODS = {"game_version": "v1", "mods": [{"id": "a", "name": "A", "enabled": True, "stamp": "1|", "options": ["빨강"]},
+                                       {"id": "b", "name": "B", "enabled": True, "stamp": "2|", "options": []},
+                                       {"id": "c", "name": "C", "enabled": False, "stamp": "3|"},
+                                       {"id": "d", "name": "D", "enabled": True, "stamp": "4|"}],
+        "placed": ["a", "b"]}
+
+
+def test_every_watched_run_is_kept(game, tmp_path):
+    crash_dir = tmp_path / "data" / "crashes"
+    launched = datetime(2026, 10, 16, 15, 39, 0).timestamp()
+    crashes.note_launch(crash_dir, MODS, now=launched)
+    write(game / "re2_framework_log.txt", normal_log(game, launched + 20, launched + 1100))
+    normal = GameExit(42, 0, launched + 1200, started=launched + 15)
+    d = gamewatch.after_exit(crash_dir, normal, launched, game, {"mods": []}, appdata="")
+    assert d.session is not None and d.session.started == stamp(launched + 20) and d.record is None
+    (row,) = gamewatch.load_launches(crash_dir, now=launched + 1300)
+    assert row == {"time": launched + 1200, "started": launched + 15, "seconds": 1185.0, "outcome": "normal",
+                   "code": "00000000", "category": "", "game_version": "v1", "bisect": False, "record": d.session.id,
+                   "where": "", "mods": [["a", "1|", gamewatch.options_digest(["빨강"])], ["b", "2|", ""]]}  # (on and applied)
+    # the same exit again (the manager was restarted meanwhile): one row
+    gamewatch.after_exit(crash_dir, normal, launched, game, {"mods": []}, appdata="")
+    assert len(gamewatch.load_launches(crash_dir, now=launched + 1300)) == 1
+    # a crash during 원인 모드 찾기 (a step: not the user's own setup)
+    later = launched + 5000
+    crashes.note_launch(crash_dir, {**MODS, "bisect": True}, now=later)
+    write(game / "re2_framework_log.txt", crash_log(game, later + 20, later + 300))
+    d = gamewatch.after_exit(crash_dir, GameExit(43, 0xC0000005, later + 301, started=later + 10), later, game,
+                             {"mods": []}, keep_good=False, appdata="")
+    rows = gamewatch.load_launches(crash_dir, now=later + 400)
+    assert [r["outcome"] for r in rows] == ["crash", "normal"]  # the newest first
+    assert rows[0]["bisect"] and rows[0]["code"] == "c0000005" and rows[0]["category"] == "game"
+    assert rows[0]["record"] == d.record.id == d.session.id and rows[0]["seconds"] == 291.0
+    assert rows[0]["where"] == "monsterhunterwilds.exe"  # (where it crashed: tells one crash from another later)
+    # killed (an unknown code), not watched, or not knowing the mods: no row, or "unknown"
+    gamewatch.after_exit(crash_dir, GameExit(44, 1, later + 9000, started=later + 8000), None, None,
+                         {"mods": [{"id": "x", "enabled": True}]})
+    assert gamewatch.load_launches(crash_dir, now=later + 9100)[0]["outcome"] == "unknown"
+    assert not gamewatch.record_launch(crash_dir, gamewatch.judge(None))
+    assert not gamewatch.record_launch(crash_dir, gamewatch.judge(GameExit(45, 0, later + 99_000, started=later + 90_000)), {})
+    assert len(gamewatch.load_launches(crash_dir, now=later + 9100)) == 3
+    assert gamewatch.load_launches(crash_dir, "v1", now=later + 9100)[0]["outcome"] == "crash"  # (by game version)
+
+
+def test_the_launch_history_keeps_the_last_runs(tmp_path, monkeypatch):
+    crash_dir = tmp_path / "crashes"
+    monkeypatch.setattr(gamewatch, "MAX_LAUNCHES", 5)
+    start = datetime(2026, 7, 1, 12, 0, 0).timestamp()
+    context = {"game_version": "v1", "mods": [{"id": "a", "enabled": True}]}
+    for i in range(8):
+        t = start + i * 86400
+        gamewatch.record_launch(crash_dir, gamewatch.judge(GameExit(i, 0, t, started=t - 600)), context, now=t)
+    rows = gamewatch.load_launches(crash_dir, now=start + 8 * 86400)
+    assert [r["time"] for r in rows] == [start + i * 86400 for i in (7, 6, 5, 4, 3)]
+    assert gamewatch.load_launches(crash_dir, now=start + 7 * 86400 + 91 * 86400) == []  # older than LAUNCH_DAYS
+    write(crash_dir / gamewatch.LAUNCHES_FILE, '{"format": 1, "rows": [{"time": "x"}, 5, {"time": 1.0}]}')
+    assert gamewatch.load_launches(crash_dir, now=2.0) == []
+    write(crash_dir / gamewatch.LAUNCHES_FILE, "not json")
+    assert gamewatch.load_launches(crash_dir) == []
+    assert gamewatch.record_launch(crash_dir, gamewatch.judge(GameExit(9, 0, start, started=start - 600)), context,
+                                   now=start)  # (a damaged file is started again)
 
 
 # ---- a real process (Windows only) ---------------------------------------------------------------------
@@ -445,6 +559,45 @@ def test_a_crash_the_game_reported_itself_is_never_a_normal_exit(game, tmp_path)
     later = launched + 7200
     d = gamewatch.detect(crash_dir, later, GameExit(43, 0, later + 900, started=later + 5), game, {}, appdata="")
     assert d.crashed is False and d.normal
+
+
+def test_a_run_whose_crash_report_came_later_is_a_crash_in_the_launch_history(game, tmp_path):
+    """The game ended with exit code 0 before CrashReport.exe put its zip there (it takes minutes): launches.json
+    said "normal" - read with the records kept now, the run crashed (never a fine run of its mods)."""
+    import zipfile
+
+    crash_dir = tmp_path / "data" / "crashes"
+    launched = datetime(2026, 10, 16, 15, 39, 0).timestamp()
+    mods = {"game_version": "v1", "mods": [{"id": "a", "name": "A", "enabled": True, "stamp": "1|"}]}
+    crashes.note_launch(crash_dir, mods, now=launched)
+    write(game / "re2_framework_log.txt", normal_log(game, launched + 20, launched + 1100))
+    d = gamewatch.after_exit(crash_dir, GameExit(42, 0, launched + 1205, started=launched + 15), launched, game, mods,
+                             appdata="")
+    assert d.normal
+    (row,) = gamewatch.load_launches(crash_dir, now=launched + 1300)
+    assert row["outcome"] == "normal" and row["record"] == d.session.id
+    zipped = game / "CrashReport" / "2026_1016_1559.zip"
+    zipped.parent.mkdir()
+    with zipfile.ZipFile(zipped, "w") as zf:
+        written = zipfile.ZipInfo("CrashReport.txt", date_time=datetime.fromtimestamp(launched + 1200).timetuple()[:6])
+        zf.writestr(written, "\tExceptionCode   : C0000005(EXCEPTION_ACCESS_VIOLATION)\r\nMessage : Fatal D3D "
+                    "error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0006)\r\n")
+    os.utime(zipped, (launched + 1360, launched + 1360))
+    crashes.collect(crash_dir, game, mods, appdata="")
+    kept = next(s for s in crashes.sessions(crash_dir) if s.problem() == "crash")
+    (row,) = gamewatch.load_launches(crash_dir, now=launched + 1400)
+    assert row["outcome"] == "crash" and row["code"] == "c0000005" and row["record"] == kept.id
+    assert row["category"] == str(kept.summary.get("category") or "") and row["seconds"] == 1190.0
+    # a crash the game reported (its zip still being written at the exit) has no code of its own, never exit code 0's
+    later = launched + 7200
+    crashes.note_launch(crash_dir, mods, now=later)
+    write(game / "re2_framework_log.txt", normal_log(game, later + 20, later + 1100))
+    (game / "CrashReport" / "2026_1016_1759.zip.tmp").write_bytes(b"")
+    d = gamewatch.after_exit(crash_dir, GameExit(43, 0, later + 1205, started=later + 15), later, game, mods,
+                             appdata="")
+    assert d.crashed and d.code == ""
+    row = gamewatch.load_launches(crash_dir, now=later + 1300)[0]
+    assert row["outcome"] == "crash" and row["code"] == "" and row["time"] == later + 1205
 
 
 def test_an_earlier_report_unpacked_during_a_run_is_not_this_run_s_crash(game, tmp_path):

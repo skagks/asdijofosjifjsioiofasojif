@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import queue
@@ -16,8 +17,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import (__version__, bisect, crashes, crashlog, fsutil, gamewatch, matfix, nexus, precheck, refw, steam,
-               updater)
+from . import (__version__, accessed, bisect, crashes, crashlog, evidence, fsutil, gamewatch, matfix, nexus, precheck,
+               refw, steam, updater)
 from .analyzer import classify, package_name
 from .archive import ARCHIVE_EXTS, ArchiveError
 from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MODS_DIR, REFRAMEWORK_URL,
@@ -291,6 +292,20 @@ class Dialog(tk.Toplevel):
     def cancel(self):
         self.result = None
         self.destroy()
+
+    def destroy(self):
+        super().destroy()
+        self._release_variables(*vars(self))
+
+    def _release_variables(self, *names: str):
+        """Drop the dialog's Tk variables (alone, or a list or dict of them) once it is destroyed - every dialog's,
+        on the GUI thread: a dialog and its widgets refer to each other, so left to the garbage collector they
+        could be freed on another thread, which Tk does not allow (Python 3.10 may even crash)."""
+        for name in names:
+            value = getattr(self, name, None)
+            items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else None
+            if isinstance(value, tk.Variable) or (items and all(isinstance(v, tk.Variable) for v in items)):
+                setattr(self, name, None)
 
 
 class ImageDialog(Dialog):
@@ -844,7 +859,15 @@ class SettingsDialog(Dialog):
 
 
 FINDING_COLORS = {"high": "danger", "medium": "warn", "low": "subtle", "info": "info"}  # the dot before a finding
-BISECT_TIP = "모드를 절반씩 끄고 실행해 보며 게임을 튕기게 하는 모드를 찾습니다 (기록만으로 모드를 알 수 없을 때)"
+BISECT_TIP = "모드를 켜고 끄며 실행해 보고 게임을 튕기게 하는 모드를 찾습니다 (기록만으로 모드를 알 수 없을 때)"
+CRASH_ACCESS_OFF = ("켜면 REFramework 설정(LooseFileLoader_LogAccessedFiles)을 바꿔, 튕긴 기록에 튕기기 직전 게임이 읽은 모드 "
+                    "파일이 함께 남습니다. 원인 모드 찾기를 할 때만 켜려면 그 창에서 고르세요.")
+CRASH_ACCESS_ON = "켜져 있습니다. 게임을 실행할 때마다 게임이 읽는 파일이 기록됩니다. 끄면 REFramework의 기본 설정으로 돌아갑니다."
+CRASH_ACCESS_DONE = "켰습니다. 다음에 게임을 실행할 때부터 게임이 읽는 파일이 기록됩니다."
+CRASH_ACCESS_SEARCHING = "원인 모드 찾기 중에는 바꿀 수 없습니다. 원인 찾기를 마친 뒤 바꾸세요."
+CRASH_ACCESS_PENDING = "원인 모드 찾기 때 켠 기록이라 게임을 끄면 원래대로 되돌립니다. 계속 켜 두려면 체크하세요."
+CRASH_ACCESS_OFF_DONE = "껐습니다. REFramework의 기본 설정입니다."
+CRASH_ACCESS_LOOSE_KEPT = " 루스 파일 읽기(LooseFileLoader)는 루스 파일을 읽는 모드가 있어 켠 채로 둡니다."
 PASTE_HINT = "게임 오류 창(RE ENGINE - Aborted, Fatal D3D error 등)이나 Windows 이벤트 뷰어의 문구를 붙여 넣으면 분석합니다."
 
 
@@ -898,7 +921,7 @@ class CrashDialog(Dialog):
     ("refw",) or None."""
 
     def __init__(self, parent, theme: Theme, manager: ModManager, sessions: list, selected=None,
-                 builds: list | None = None, refw_text: str = "", live: str = ""):
+                 builds: list | None = None, refw_text: str = "", live: str = "", searching: bool = False):
         super().__init__(parent, theme, crashes.TITLE)
         px, f, p = theme.px, theme.fonts, theme.p
         self.manager = manager
@@ -986,6 +1009,23 @@ class CrashDialog(Dialog):
         if not refw_ready:
             self.lua_check.state(["disabled"])
             self._lua_note("REFramework가 설치되어 있지 않습니다.")
+        # REFramework's record of the files the game reads (LooseFileLoader_LogAccessedFiles), for good: the
+        # records then show which mods' files the game read right before a crash (원인 모드 찾기 turns it on
+        # for its launches only, with its own box)
+        self.searching = searching
+        self.access_offer = None
+        self._access_kept = ""  # the note of a change just made (the offer worked out again after it keeps it)
+        self.access_var = tk.BooleanVar(self, value=False)
+        self.access_check = theme.checkbutton(self.body, accessed.CRASH_WINDOW_CHECKBOX, self.access_var,
+                                              command=self._toggle_access)
+        self.access_check.pack(anchor="w", pady=(px(6), 0))
+        self.access_note = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                                     justify="left")
+        self.access_check.state(["disabled"])
+        if refw_ready:
+            self._offer()
+        else:
+            self._access_note(accessed.LOG_NO_REFW)
 
         ttk.Separator(self.body).pack(fill="x", pady=(px(14), px(10)))
         ttk.Label(self.body, text=crashes.REPORT_NOTE, style="Muted.TLabel", font=f["small"], wraplength=wrap,
@@ -1037,7 +1077,7 @@ class CrashDialog(Dialog):
         if self._poll_id is not None:
             self.after_cancel(self._poll_id)
             self._poll_id = None
-        super().destroy()
+        super().destroy()  # (Dialog drops its Tk variables)
 
     def _done(self, kind: str, result):
         if kind == "explain":
@@ -1048,6 +1088,10 @@ class CrashDialog(Dialog):
             self._render()
         elif kind == "lua":
             self._lua_done(*(result if isinstance(result, tuple) else (self.lua_var.get(), result)))
+        elif kind == "offer":
+            self._offer_done(result)
+        elif kind == "access":
+            self._access_done(*(result if isinstance(result, tuple) else (self.access_var.get(), result)))
         elif kind == "report":
             self._saving = False
             self.save_button.configure(text="진단 파일 저장")
@@ -1167,6 +1211,7 @@ class CrashDialog(Dialog):
         t.configure(state="disabled")
         heading = t.tag_ranges("heading")
         if self._show_paste and self.pasted is not None and heading:  # below the session's findings: show it
+            self.update_idletasks()  # (scrolled by the text's size as shown: other parts of the window may move)
             t.see("end")
             t.see(heading[0])
         self._fill_actions()
@@ -1242,6 +1287,93 @@ class CrashDialog(Dialog):
         self._lua_note("켰습니다. 다음에 게임을 실행할 때부터 Lua 스크립트 오류가 REFramework 기록에 남습니다." if want
                        else "껐습니다. REFramework의 기본 설정입니다.")
 
+    # ---- REFramework's record of the files the game reads
+    def _access_note(self, text: str):
+        self.access_note.configure(text=text)
+        if not self.access_note.winfo_manager():
+            self.access_note.pack(anchor="w", padx=(self.theme.px(30), 0), after=self.access_check)
+
+    def _loose_mods(self) -> bool:
+        """A mod with loose (natives) files is on (GUI thread)."""
+        return any("loose" in self.manager.mod_kinds(m.id) for m in self.manager.mods if m.enabled)
+
+    def _offer(self):
+        """Work out (again) whether the record can be turned on or off now, and whether a search's restore waits
+        for the game to close (off the GUI thread: reads a few files)."""
+        manager, loose = self.manager, self._loose_mods()
+        self._run("offer", lambda: (accessed.manager_offer(manager, is_game_running(), loose=loose),
+                                    accessed.pending(manager.data_dir)))
+
+    def _offer_done(self, result):
+        """Whether the record can be turned on or off now ((accessed.Offer, the pending restore), or the error
+        looking at it)."""
+        offer, pending = result if isinstance(result, tuple) else (result, None)
+        kept, self._access_kept = self._access_kept, ""
+        if not isinstance(offer, accessed.Offer):
+            self.access_offer = None
+            self._access_note(f"REFramework 설정을 확인하지 못했습니다: {offer}")
+            return
+        self.access_offer = offer
+        self.access_var.set(offer.already)
+        if self.searching:
+            self._access_note(CRASH_ACCESS_SEARCHING)
+        elif offer.already and pending is not None:
+            # (on for a search that ended while the game ran: off again once the game is closed, unless kept here)
+            self.access_var.set(False)
+            self.access_check.state(["!disabled"])
+            self._access_note(kept or CRASH_ACCESS_PENDING)
+        elif offer.already:
+            self.access_check.state(["!disabled"])
+            self._access_note(kept or CRASH_ACCESS_ON)
+        elif offer.available:
+            self.access_check.state(["!disabled"])
+            self._access_note(kept or CRASH_ACCESS_OFF + (accessed.LOG_NOTE_LOOSE if accessed.LOOSE_KEY in offer.changes
+                                                          else ""))
+        else:
+            self._access_note(offer.text)
+
+    def _toggle_access(self):
+        """Turn the record on for good (no restore after a search: the user chose it here; what it changed is kept
+        to put back when it is turned off here), or off again; only while the game is closed
+        (ModManager.set_refw_option refuses otherwise - keeping a search's pending restore from undoing it works
+        any time)."""
+        want, offer = self.access_var.get(), self.access_offer
+        if offer is None:
+            self.access_var.set(not want)
+            return
+        self.access_check.state(["disabled"])
+        self._access_note("REFramework 설정을 바꾸는 중...")
+        manager, loose_mods = self.manager, self._loose_mods()
+
+        def work():
+            stays = False
+            try:
+                if want:
+                    restore = accessed.enable_logging(manager.set_refw_option, offer)
+                    # (an earlier search's restore must not undo this: taken over, to put back when turned off here)
+                    accessed.keep_enabled(manager.data_dir, restore, accessed.pending(manager.data_dir))
+                    accessed.drop_pending(manager.data_dir)
+                else:
+                    stays = accessed.disable_logging(manager.set_refw_option, manager.data_dir, offer.path or None,
+                                                     loose_mods, manager.game_dir)
+            except (DeployError, ValueError, OSError) as exc:
+                return want, exc, False
+            return want, None, stays
+
+        self._run("access", work)
+
+    def _access_done(self, want: bool, error, stays: bool = False):
+        if error is not None:
+            self.access_var.set(not want)
+            self.access_check.state(["!disabled"])
+            self._access_note(f"바꾸지 못했습니다: {error}")
+            return
+        log.info("REFramework 설정: 게임이 읽는 파일 기록 %s (%s)", "켬" if want else "끔", accessed.LOG_KEY)
+        self._access_kept = CRASH_ACCESS_DONE if want else CRASH_ACCESS_OFF_DONE + (CRASH_ACCESS_LOOSE_KEPT if stays
+                                                                                     else "")
+        self._access_note(self._access_kept)
+        self._offer()
+
     # ---- the support zip
     def save_report(self):
         session = self._session()
@@ -1267,12 +1399,18 @@ class CrashDialog(Dialog):
 
 # ---- 원인 모드 찾기 -------------------------------------------------------------------------------------
 BISECT_HOW = (
-    "목록 위 안내 줄의 '게임 실행'으로 게임을 켜고, 튕기던 상황(같은 지역 · 같은 행동)을 다시 해 봅니다.",
-    "게임이 끝나면 '또 튕겼나요?'에 답합니다. 그러면 다음 단계의 모드를 켜고 적용합니다.",
-    "원인이 나오면 그 모드를 끄고 원래 프로필로 돌아가거나, 그대로 원래 프로필로 돌아갑니다.",
+    "목록 위 안내 줄의 '게임 실행'으로 게임을 켜고, 안내 줄에 나온 대로 해 봅니다(튕기던 상황 · 플레이 시간).",
+    "게임이 끝나면 '또 튕겼나요?'에 답합니다. 매니저가 확인한 종료 코드와 기록을 먼저 골라 두지만 직접 본 것이 우선합니다.",
+    "근거가 충분히 모이면 결과를 가능성(%)과 근거로 보여 줍니다. 그 모드를 끄고 원래 프로필로 돌아갈지는 직접 고릅니다.",
 )
+BISECT_WHEN = "언제 튕기나요?"
+BISECT_WHEN_CHOICES = ("start", "same", "equip", "time", "rare")
+BISECT_RECENT = "최근 기록: 실행 후 약 {m}분에 튕겼습니다"
 BISECT_ASK_NOTE = ("튕기던 상황을 다시 해 봤을 때 또 튕겼는지 알려 주세요. 매니저가 확인한 것보다 직접 본 것이 우선합니다. "
                    "그 상황까지 가 보지 못했다면 '잘 모르겠어요'를 고르세요.")
+BISECT_RETRY_HINT = ("튕기는 상황을 만들기 어렵다면 목록 위 '그만두기'로 그만둘 수 있습니다. 그때 지금까지 가장 의심되는 모드를 "
+                     "알려 드립니다.")
+BISECT_TAIL = "튕기기 직전 10초 동안 게임이 읽은 모드 파일: {mods}"
 BISECT_PLAYING = "게임을 실행했습니다. 튕기던 상황을 다시 해 보세요. 게임이 끝나면 또 튕겼는지 묻습니다."
 BISECT_PLAYING_MANUAL = "게임을 실행했습니다. 튕기던 상황을 다시 해 본 뒤 게임을 끄고 '결과 알리기'를 누르세요."
 BISECT_ANSWER = "결과 알리기"
@@ -1280,8 +1418,8 @@ BISECT_STILL_RUNNING = ("게임이 아직 실행 중입니다. 게임을 끈 뒤
                         "또 튕겼는지 묻습니다.")
 BISECT_REFW = "REFramework 업데이트"
 BISECT_SHOW_RESULT = "결과 보기"
-BISECT_STEP_KINDS = {"last_good": "마지막 정상 구성", "base": "필요한 모드만", "confirm": "확인", "partner": "함께 튕기는 모드",
-                     "again": "다시 확인", "full": "처음처럼 모두", "everything_off": "모두 끔", "core": "필요한 모드 안에서"}
+BISECT_COMPUTING = "다음 실행을 고르는 중..."
+BISECT_PREPARING = "원인 찾기 준비 중... (기록 살펴보는 중)"
 
 
 def run_time(seconds: float) -> str:
@@ -1321,71 +1459,236 @@ def exit_summary(detection) -> tuple[str, str, str]:
     return "", "게임이 끝났지만 튕겼는지는 확인하지 못했습니다.", detail
 
 
-def bisect_step_lines(session) -> list[str]:
-    """The answered launches of a search, a line each (result window)."""
-    out = []
-    for s in session.steps:
-        on = s.get("on") if isinstance(s.get("on"), list) else []
-        kind = BISECT_STEP_KINDS.get(s.get("kind"), "")
-        code = ""
-        if isinstance(s.get("exit"), dict) and isinstance(s["exit"].get("code"), int) \
-                and gamewatch.is_crash_code(s["exit"]["code"]):
-            code = f" ({gamewatch.code_text(s['exit']['code'])})"
-        out.append(f"{s.get('number', '?')}단계{f' · {kind}' if kind else ''} · 모드 {len(on)}개 켬  →  "
-                   f"{'튕김' if s.get('crashed') else '괜찮음'}{code}")
-    return out
+class _ScrollBody:
+    """A dialog's content that scrolls when it is taller than ``share`` of the screen (the buttons stay
+    under it). Build into ``inner``, then call ``fit()``."""
+
+    def __init__(self, dialog: Dialog, share: float = 0.85):
+        # (no reference to the dialog: a cycle would leave its Tk variables to the garbage collector, which may run
+        # on another thread)
+        self.share, self.px = share, dialog.theme.px
+        theme = dialog.theme
+        self.frame = ttk.Frame(dialog.body)
+        self.frame.pack(fill="both", expand=True)
+        self.canvas = theme.mark(tk.Canvas(self.frame), "canvas_bg")
+        self.scrollbar = ttk.Scrollbar(self.frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=autohide(self.scrollbar, side="right", fill="y", padx=(theme.px(8), 0)))
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = ttk.Frame(self.canvas)
+        self.window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+    def fit(self, below: int = 0) -> bool:
+        """Size the canvas to the content (at most ``share`` of the screen less ``below`` pixels for what
+        comes under it). Returns whether it scrolls."""
+        self.inner.update_idletasks()
+        width, height = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+        least = self.px(240)
+        limit = max(least, int(self.frame.winfo_toplevel().winfo_screenheight() * self.share) - below - self.px(60))
+        tall = height > limit
+        self.canvas.configure(width=width, height=min(height, limit))
+        if tall:
+            self._bind_wheel(self.inner)
+        return tall
+
+    def _bind_wheel(self, widget):
+        def wheel(event):
+            delta = -1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4) else 1
+            self.canvas.yview_scroll(delta, "units")
+
+        for w in (widget, self.canvas):
+            w.bind("<MouseWheel>", wheel, add="+")
+            w.bind("<Button-4>", wheel, add="+")
+            w.bind("<Button-5>", wheel, add="+")
+        for child in widget.winfo_children():
+            self._bind_wheel(child)
 
 
 class BisectStartDialog(Dialog):
-    """원인 모드 찾기 before it starts: how it goes, what stays on and what it cannot turn off. Result: True."""
+    """원인 모드 찾기 before it starts: the suspects with their 근거 (bisect.Plan), 언제 튕기나요?, the record
+    of the files the game reads (accessed.Offer) and how it goes. Result: {"when", "minutes", "equip", "log"}
+    or None. ``log_files``: the box's default (Settings.bisect_log_files, the last choice)."""
 
-    def __init__(self, parent, theme: Theme, plan, record_title: str = ""):
+    def __init__(self, parent, theme: Theme, plan, record_title: str = "", offer=None, log_files: bool = False):
         super().__init__(parent, theme, bisect.TITLE)
         px, f = theme.px, theme.fonts
-        wrap = px(580)
+        wrap = px(600)
+        self.plan, self.offer = plan, offer
         self.problem = plan.problem
-        ttk.Label(self.body, text=bisect.TITLE, style="DialogTitle.TLabel").pack(anchor="w")
+        scroll = self.scroll = _ScrollBody(self)
+        body = scroll.inner
+        names = plan.names
+        ttk.Label(body, text=bisect.TITLE, style="DialogTitle.TLabel").pack(anchor="w")
+        record_title = record_title or str(plan.data.get("record_title") or "")
         if record_title:
-            ttk.Label(self.body, text=f"게임 튕김 기록: {record_title}", style="Muted.TLabel", font=f["small"],
+            ttk.Label(body, text=f"게임 튕김 기록: {record_title}", style="Muted.TLabel", font=f["small"],
                       wraplength=wrap, justify="left").pack(anchor="w", pady=(px(2), 0))
-        ttk.Label(self.body, text=self.problem or plan.intro(), wraplength=wrap, justify="left").pack(
+        device = plan.device_note() if not self.problem else ""
+        if device:  # (a graphics device error: the driver and settings first; the search can still start)
+            box = ttk.Frame(body, style="Callout.TFrame", padding=(px(14), px(10)))
+            box.pack(fill="x", pady=(px(10), 0))
+            ttk.Label(box, text="⚠  먼저 그래픽 설정과 드라이버를 확인해 보세요", style="CalloutTitle.TLabel").pack(anchor="w")
+            ttk.Label(box, text=device, style="Callout.TLabel", font=f["small"], wraplength=wrap - px(28),
+                      justify="left").pack(anchor="w", pady=(px(2), 0))
+        ttk.Label(body, text=self.problem or plan.intro(), wraplength=wrap, justify="left").pack(
             anchor="w", pady=(px(10), 0))
+        self.when_var = tk.StringVar(self, value=plan.when if plan.when in BISECT_WHEN_CHOICES else "same")
+        # (the box shows the record's minutes rounded: left as it is, they are not the user's - Session.new keeps them)
+        self._minutes_shown = str(int(round(plan.minutes or 10)))
+        self.minutes_var = tk.StringVar(self, value=self._minutes_shown)
+        self.equip_var = tk.StringVar(self)
+        self.log_var = tk.BooleanVar(self, value=False)
+        self.equipment = [e for e in plan.data.get("equipment") or [] if isinstance(e, list) and len(e) == 3]
+        self.equip_picker = self.minutes_box = self.log_check = None
         if not self.problem:
-            ttk.Label(self.body, text="진행 방법", style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+            self._when(body, wrap)
+            self._ranking(body, wrap, names)
+            self._log(body, wrap, log_files)
+            ttk.Label(body, text="진행 방법", style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(2)))
             for n, line in enumerate(BISECT_HOW, 1):
-                row = ttk.Frame(self.body)
+                row = ttk.Frame(body)
                 row.pack(fill="x", pady=(px(2), 0))
                 ttk.Label(row, text=f"{n}.", style="Muted.TLabel", width=3).pack(side="left", anchor="n")
                 ttk.Label(row, text=line, wraplength=wrap - px(28), justify="left").pack(side="left", anchor="w")
             details = plan.lines()
             if details:
-                ttk.Label(self.body, text="이번 찾기에서는", style="DialogSection.TLabel").pack(
+                ttk.Label(body, text="이번 찾기에서는", style="DialogSection.TLabel").pack(
                     anchor="w", pady=(px(14), px(2)))
                 for line in details:
-                    ttk.Label(self.body, text="• " + line, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                    ttk.Label(body, text="• " + line, style="Muted.TLabel", font=f["small"], wraplength=wrap,
                               justify="left").pack(anchor="w", pady=(px(2), 0))
         row = self.buttons("시작", self.ok)
         if self.problem:
             row.winfo_children()[-1].state(["disabled"])
+        row.update_idletasks()
+        scroll.fit(below=row.winfo_reqheight())
+
+    def _when(self, body, wrap: int):
+        """언제 튕기나요?: the r prior and the play line of the steps (bisect.WHEN)."""
+        px, f = self.theme.px, self.theme.fonts
+        ttk.Label(body, text=BISECT_WHEN, style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+        for key in BISECT_WHEN_CHOICES:
+            if key == "equip" and not self.equipment:
+                continue  # (only with the equipment window's kept results)
+            row = ttk.Frame(body)
+            row.pack(fill="x")
+            ttk.Radiobutton(row, text=bisect.WHEN_TEXT[key], value=key, variable=self.when_var).pack(side="left")
+            if key == "equip":
+                labels = [e[1] for e in self.equipment]
+                self.equip_picker = ttk.Combobox(row, textvariable=self.equip_var, values=labels, state="readonly",
+                                                 width=34)
+                self.equip_picker.pack(side="left", padx=(px(10), 0))
+                self.equip_picker.current(0)
+                self.equip_picker.bind("<<ComboboxSelected>>", lambda e: (self.equip_picker.selection_clear(),
+                                                                          self.when_var.set("equip")))
+            elif key == "time":
+                self.minutes_box = ttk.Spinbox(row, from_=1, to=240, increment=1, textvariable=self.minutes_var,
+                                               width=5, command=lambda: self.when_var.set("time"))
+                self.minutes_box.pack(side="left", padx=(px(10), px(4)))
+                ttk.Label(row, text="분쯤").pack(side="left")
+        hint = getattr(self.plan.evidence, "minutes_hint", None)
+        if isinstance(hint, (int, float)) and hint > 0:
+            ttk.Label(body, text=BISECT_RECENT.format(m=max(1, round(hint))), style="Muted.TLabel", font=f["small"],
+                      wraplength=wrap, justify="left").pack(anchor="w", pady=(px(4), 0))
+
+    def _ranking(self, body, wrap: int, names: dict):
+        """The most suspected mods (%, name, 근거), then the rest summed up."""
+        px, f = self.theme.px, self.theme.fonts
+        ttk.Label(body, text=bisect.RANKING_HEADING, style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(4)))
+        plan = self.plan
+        rows = [] if plan.uniform else plan.ranking_rows(names)  # (no evidence: every mod the same)
+        note = plan.ranking_note(names)
+        singles = plan.singles
+        if rows and len(singles) > 1 and singles[0][1] - singles[-1][1] < 0.005 and not any(why for _l, _p, why in rows):
+            # (only "not the mods" or the pairs moved: rows of the same % say nothing)
+            fam = plan.families
+            rows, note = [], (f"모드 {len(singles)}개를 모두 같은 정도(각각 약 {bisect.percent(singles[0][1])})로 의심합니다. "
+                              f"그 밖: 두 모드 이상이 함께 원인 약 "
+                              f"{bisect.percent(fam.get('and', 0) + fam.get('and3', 0) + fam.get('or', 0))} · "
+                              f"모드 문제가 아님 약 {bisect.percent(fam.get('none', 0))}")
+        if rows:
+            card = self.theme.mark(tk.Frame(body), "card")
+            card.pack(fill="x")
+            inner = ttk.Frame(card, style="Card.TFrame", padding=(px(14), px(8), px(14), px(10)))
+            inner.pack(fill="x")
+            inner.columnconfigure(1, weight=1)
+            for n, (label, p, why) in enumerate(rows):
+                top = px(6) if n else 0
+                ttk.Label(inner, text=f"약 {bisect.percent(p)}", style="Card.TLabel", font=f["bold"],
+                          width=9).grid(row=2 * n, column=0, sticky="nw", pady=(top, 0))
+                ttk.Label(inner, text=label, style="Card.TLabel", wraplength=wrap - px(120), justify="left").grid(
+                    row=2 * n, column=1, sticky="w", pady=(top, 0))
+                if why:
+                    ttk.Label(inner, text="\n".join(f"근거: {w}" for w in why), style="CardMuted.TLabel",
+                              font=f["small"], wraplength=wrap - px(120), justify="left").grid(
+                        row=2 * n + 1, column=1, sticky="w")
+        none = [str(x) for x in plan.data.get("none_reasons") or []][:2]
+        if none and not plan.uniform:
+            note += "\n모드 문제가 아닐 수 있는 근거: " + " · ".join(none)
+        if note:
+            ttk.Label(body, text=note, style="Muted.TLabel", font=f["small"], wraplength=wrap, justify="left").pack(
+                anchor="w", pady=(px(6), 0))
+
+    def _log(self, body, wrap: int, default: bool):
+        """게임이 읽는 파일을 기록해 더 정확하게 찾기 (REFramework's LooseFileLoader_LogAccessedFiles)."""
+        offer = self.offer
+        if offer is None:
+            return
+        from . import accessed
+
+        px, f = self.theme.px, self.theme.fonts
+        self.log_var.set(bool(offer.already or (offer.available and default)))
+        self.log_check = self.theme.checkbutton(body, accessed.LOG_CHECKBOX, self.log_var)
+        self.log_check.pack(anchor="w", pady=(px(14), 0))
+        if offer.already or not offer.available:
+            self.log_check.state(["disabled"])
+        ttk.Label(body, text=offer.text, style="Muted.TLabel", font=f["small"], wraplength=wrap - px(30),
+                  justify="left").pack(anchor="w", padx=(px(30), 0))
+
+    def choice(self) -> dict:
+        """What the window says now: {"when", "minutes", "equip", "log"}."""
+        when = self.when_var.get() if self.when_var.get() in BISECT_WHEN_CHOICES else "same"
+        minutes = None
+        if when == "time" and not (self.plan.minutes and self.minutes_var.get().strip() == self._minutes_shown):
+            try:
+                minutes = float(self.minutes_var.get())
+            except ValueError:
+                minutes = None
+            minutes = minutes if minutes is not None and 0 < minutes <= 24 * 60 else None
+        equip = None
+        if when == "equip" and self.equip_picker is not None:
+            index = self.equip_picker.current()
+            equip = self.equipment[index][0] if 0 <= index < len(self.equipment) else None
+            if equip is None:
+                when = "same"
+        return {"when": when, "minutes": minutes, "equip": equip, "log": bool(self.log_var.get())}
 
     def ok(self):
         if self.problem:
             return
-        self.result = True
+        self.result = self.choice()
         self.destroy()
 
 
 class BisectAskDialog(Dialog):
     """또 튕겼나요? after the game of a step. Result: "crashed", "fine", "retry" (잘 모르겠어요: the same
-    step again) or None (answered later). What the manager detected is the default answer."""
+    step again) or None (answered later). What the manager detected is the default answer. ``run``: what
+    accessed.step_run found of the launch (play time, files never requested, the last seconds before the
+    crash); ``retries``: how often 잘 모르겠어요 was answered for this step."""
 
-    def __init__(self, parent, theme: Theme, step, detection=None):
+    def __init__(self, parent, theme: Theme, step, detection=None, names: dict | None = None, run: dict | None = None,
+                 retries: int = 0):
         super().__init__(parent, theme, bisect.TITLE)
         px, f = theme.px, theme.fonts
-        wrap = px(500)
+        wrap = px(520)
+        names = names or {}
         ttk.Label(self.body, text=bisect.ASK, style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.body, text=f"원인 찾기 {step.number}/{step.total}단계 · 모드 {len(step.on)}개를 켜고 실행했습니다.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(px(4), px(12)))
+        if step.engine:
+            sub = f"{step.number}번째 실행 · {bisect.step_summary(step, names)}"
+        else:
+            sub = f"원인 찾기 {step.number}/{step.total}단계 · 모드 {len(step.on)}개를 켜고 실행했습니다."
+        ttk.Label(self.body, text=sub, style="Muted.TLabel", wraplength=wrap, justify="left").pack(
+            anchor="w", pady=(px(4), px(12)))
         style, head, detail = exit_summary(detection)
         box = ttk.Frame(self.body, style=f"{style}.TFrame" if style else "TFrame",
                         padding=(px(14), px(10)) if style else 0)
@@ -1397,8 +1700,28 @@ class BisectAskDialog(Dialog):
         if detail:
             ttk.Label(box, text=detail, style=detail_style, font=f["small"], wraplength=inner,
                       justify="left").pack(anchor="w", pady=(px(2), 0))
+        notes = []
+        if step.engine:
+            run = run if isinstance(run, dict) else {}
+            seconds = run.get("seconds")
+            if seconds is None and detection is not None and detection.exit is not None:
+                seconds = detection.exit.seconds
+            crashed = detection is not None and detection.crashed
+            notes = [bisect.run_note(step, seconds) if not crashed else "",
+                     bisect.exposure_note(step, run.get("unexposed") or [], names)]
+            tail = [i for i in run.get("tail") or [] if isinstance(i, str)]
+            if tail:
+                notes.append(BISECT_TAIL.format(mods=", ".join(f"'{names.get(i, i)}'" for i in tail[:4])
+                                                + (f" 외 {len(tail) - 4}개" if len(tail) > 4 else "")))
+        self.notes = [n for n in notes if n]
+        for note in self.notes:
+            ttk.Label(self.body, text=note, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                      justify="left").pack(anchor="w", pady=(px(8), 0))
         ttk.Label(self.body, text=BISECT_ASK_NOTE, style="Muted.TLabel", font=f["small"], wraplength=wrap,
                   justify="left").pack(anchor="w", pady=(px(12), 0))
+        if retries >= 2:
+            ttk.Label(self.body, text=BISECT_RETRY_HINT, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                      justify="left").pack(anchor="w", pady=(px(6), 0))
         # only a detected crash is picked first (the exit code of a normal quit is not known for sure)
         self.default = "crashed" if detection is not None and detection.crashed else None
         row = ttk.Frame(self.body)
@@ -1420,9 +1743,10 @@ class BisectAskDialog(Dialog):
 
 
 class BisectResultDialog(Dialog):
-    """The end of 원인 모드 찾기: what it found and the way back to the user's profile. Result:
-    ("disable", [mod ids]), ("restore",), ("refw",) (back, then the REFramework window) or None
-    (decide later). 진단 파일 저장 works inside the window."""
+    """The end of 원인 모드 찾기: what it found (a suspicion with its probability and 근거) and the way back to
+    the user's profile. Result: ("disable", [mod ids]), ("restore",), ("refw",) (back, then the REFramework
+    window), ("more",) (계속 찾기, or 한 번 더 확인 for a named result) or None (decide later). 진단 파일 저장
+    works inside the window."""
 
     def __init__(self, parent, theme: Theme, manager: ModManager, session, result, refw_text: str = ""):
         super().__init__(parent, theme, bisect.TITLE)
@@ -1431,28 +1755,40 @@ class BisectResultDialog(Dialog):
         self.mods = list(result.mods) if result.can_disable else []
         self._jobs: queue.Queue = queue.Queue()
         self._poll_id = None
-        wrap = px(560)
+        wrap = px(580)
         names = session.names
         aborted = result.kind == "aborted"
-        ttk.Label(self.body, text="원인 찾기를 그만두었습니다" if aborted else "원인 찾기 결과",
+        unsure = result.kind == "unsure"
+        scroll = self.scroll = _ScrollBody(self)
+        body = scroll.inner
+        ttk.Label(body, text="원인 찾기를 그만두었습니다" if aborted else "원인 찾기 결과",
                   style="DialogSection.TLabel").pack(anchor="w")
-        ttk.Label(self.body, text=bisect.result_title(result, names), style="DialogTitle.TLabel", wraplength=wrap,
+        ttk.Label(body, text=bisect.result_title(result, names), style="DialogTitle.TLabel", wraplength=wrap,
                   justify="left").pack(anchor="w", pady=(px(4), 0))
-        if result.runs:
+        if result.runs and not unsure:  # (an unsure result says how often in its lines)
             done = f"게임을 {result.runs}번 실행해 찾았습니다." if result.can_disable else f"게임을 {result.runs}번 실행했습니다."
-            ttk.Label(self.body, text=done, style="Muted.TLabel").pack(anchor="w", pady=(px(4), 0))
+            ttk.Label(body, text=done, style="Muted.TLabel").pack(anchor="w", pady=(px(4), 0))
+        if result.evidence:
+            ttk.Label(body, text="지금까지 가장 의심되는 것" if unsure else "근거", style="DialogSection.TLabel").pack(
+                anchor="w", pady=(px(12), px(2)))
+            for line in result.evidence:
+                ttk.Label(body, text="• " + line, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+                          justify="left").pack(anchor="w", pady=(px(2), 0))
         refw_mod = manager.refw_mod()
         refw_id = refw_mod.id if refw_mod is not None else None
         # REFramework itself: updating it is the advice; turning it off stops every mod that needs it
-        self.refw_hit = refw_id is not None and refw_id in self.mods
-        for line in session.result_lines(result, refw_id):
-            ttk.Label(self.body, text="• " + line, wraplength=wrap, justify="left").pack(anchor="w", pady=(px(8), 0))
-        steps = bisect_step_lines(session)
+        self.refw_hit = refw_id is not None and refw_id in self.mods and not unsure
+        advice = session.result_lines(result, refw_id)
+        if advice:
+            ttk.Label(body, text="해 볼 것", style="DialogSection.TLabel").pack(anchor="w", pady=(px(12), px(0)))
+        for line in advice:
+            ttk.Label(body, text="• " + line, wraplength=wrap, justify="left").pack(anchor="w", pady=(px(6), 0))
+        steps = session.step_lines()
         if steps:
-            ttk.Label(self.body, text="실행한 단계", style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(4)))
-            card = theme.mark(tk.Frame(self.body), "card")
+            ttk.Label(body, text="실행한 구성", style="DialogSection.TLabel").pack(anchor="w", pady=(px(14), px(4)))
+            card = theme.mark(tk.Frame(body), "card")
             card.pack(fill="both", expand=True)
-            text = theme.mark(tk.Text(card, wrap="none", width=70, height=min(len(steps), 6), font=f["small"],
+            text = theme.mark(tk.Text(card, wrap="none", width=74, height=min(len(steps), 6), font=f["small"],
                                       padx=px(12), pady=px(6), cursor="arrow"), "text")
             sb = ttk.Scrollbar(card, orient="vertical", command=text.yview)
             text.configure(yscrollcommand=autohide(sb, side="right", fill="y"))
@@ -1462,25 +1798,39 @@ class BisectResultDialog(Dialog):
         back = f"원래 프로필 '{session.original_profile}'(으)로 돌아가면 임시 프로필 '{session.temp_profile}'은(는) 지웁니다."
         if self.mods:
             back += " 끈 모드는 나중에 원래 프로필에서 다시 켤 수 있습니다."
+            if unsure:
+                back += " 끄기 버튼의 %는 그 모드가 원인에 들어 있을 가능성입니다(혼자, 또는 다른 모드와 함께)."
         if self.refw_hit:
             back += f" '{BISECT_REFW}'를 누르면 원래 프로필로 돌아간 뒤 REFramework 창을 엽니다."
-        ttk.Label(self.body, text=back, style="Muted.TLabel", font=f["small"], wraplength=wrap,
+        ttk.Label(body, text=back, style="Muted.TLabel", font=f["small"], wraplength=wrap,
                   justify="left").pack(anchor="w", pady=(px(12), 0))
         row = ttk.Frame(self.body)
         row.pack(fill="x", pady=(px(16), 0))
         self.report_button = ttk.Button(row, text=bisect.RESULT_REPORT, command=self.save_report)
         self.report_button.pack(side="left")
-        disable_first = bool(self.mods) and not self.refw_hit
+        disable_first = bool(self.mods) and not self.refw_hit and not unsure
         restore = ttk.Button(row, text=bisect.RESULT_RESTORE, style="TButton" if disable_first else "Accent.TButton",
                              command=lambda: self.finish(("restore",)))
         restore.pack(side="right")
         if self.mods:
-            label = bisect.RESULT_DISABLE if len(self.mods) == 1 else bisect.RESULT_DISABLE_MANY
+            if unsure:
+                label = bisect.disable_unsure_text(result, names)
+            else:
+                label = bisect.RESULT_DISABLE if len(self.mods) == 1 else bisect.RESULT_DISABLE_MANY
             ttk.Button(row, text=label, style="Accent.TButton" if disable_first else "TButton",
                        command=lambda: self.finish(("disable", self.mods))).pack(side="right", padx=(0, px(8)))
+        self.more = ""
+        if unsure:
+            self.more = bisect.RESULT_MORE
+        elif result.can_confirm and result.kind in bisect.NAMED:
+            self.more = bisect.RESULT_CONFIRM
+        if self.more:
+            ttk.Button(row, text=self.more, command=lambda: self.finish(("more",))).pack(side="right", padx=(0, px(8)))
         if self.refw_hit:
             ttk.Button(row, text=BISECT_REFW, command=lambda: self.finish(("refw",))).pack(
                 side="right", padx=(0, px(8)))
+        row.update_idletasks()
+        scroll.fit(below=row.winfo_reqheight())
 
     def finish(self, result):
         self.result = result
@@ -1806,6 +2156,7 @@ class App:
         self._install_queue: list[str] = []
         self._installing = False
         self._close_after_task = False
+        self._status_after_task = ""  # a line for the status bar once the running task is done (it says "준비")
         self._closed = False
         self._drag: dict | None = None
         self._preview = None
@@ -1849,8 +2200,10 @@ class App:
         self._precheck_menu = False
         # 원인 모드 찾기 (bisect.json): the search in progress, its 또 튕겼나요? window, how the step's game ended
         self._bisect = bisect.load(manager.data_dir)
+        self._bisect_resume = self._bisect is not None  # picked up again by _startup (not one started since)
         self._bisect_preparing = False
         self._bisect_asking = False
+        self._bisect_computing = False  # its next launch is being worked out on another thread
         self._bisect_detection: tuple | None = None  # (launch time of the step, gamewatch.Detection)
         # the game process: how it ends (exit code) after a launch from here or when it runs at startup
         self.watcher = gamewatch.GameWatcher(self._on_game_exit, events=events, game_dir=manager.game_dir,
@@ -3584,14 +3937,16 @@ class App:
                     self.status_var.set(msg if len(msg) < 90 else "…" + msg[-88:])
                 elif kind == "done":
                     self._finish_task()
-                    self.status_var.set("준비")
+                    self.status_var.set(self._status_after_task or "준비")
+                    self._status_after_task = ""
                     if event[1]:
                         event[1](event[2])
                     self._after_task()
                 elif kind == "error":
                     _, handler, exc, tb = event
                     self._finish_task()
-                    self.status_var.set("오류가 발생했습니다")
+                    self.status_var.set(" · ".join(filter(None, ("오류가 발생했습니다", self._status_after_task))))
+                    self._status_after_task = ""
                     if not isinstance(exc, EXPECTED_ERRORS):
                         log.error("예상하지 못한 오류:\n%s", tb)
                     if handler:
@@ -3623,7 +3978,10 @@ class App:
     # ------------------------------------------------------------------ startup
     def _startup(self):
         m = self.manager
-        self._resume_bisect()
+        if self._bisect_resume:  # (the search kept in bisect.json; one started meanwhile needs nothing of this)
+            self._bisect_resume = False
+            self._resume_bisect()
+        self._apply_pending_restore()  # (a search ended while the game ran: REFramework's setting back)
         if not m.game_dir:
             found = m.detect_game_dir()
             if found:
@@ -4020,6 +4378,9 @@ class App:
             self._update_header()
         session = self._bisect
         if session is not None:
+            if not self._bisect_ready():  # (its next launch is being worked out)
+                self.status_var.set(BISECT_COMPUTING)
+                return
             reason = bisect.problem(m, session)
             if reason:
                 self._abort_bisect(reason)
@@ -4062,7 +4423,7 @@ class App:
                 self.show_error("게임 실행", "Steam을 실행할 수 없습니다.")
                 return
         session = self._bisect
-        if session is not None and isinstance(session.next(), bisect.Step):
+        if session is not None and self._bisect_ready() and isinstance(session.next(), bisect.Step):
             session.mark_launched(launched)
             self._bisect_detection = None
             self._show_bisect_bar()
@@ -4614,7 +4975,8 @@ class App:
         status = self._refw_status
         dialog = CrashDialog(self.root, self.theme, self.manager, sessions, selected,
                              builds=status.builds if status else None,
-                             refw_text=refw.describe_installed(status) if status else "", live=self._live_record)
+                             refw_text=refw.describe_installed(status) if status else "", live=self._live_record,
+                             searching=self._bisect is not None)
         result = dialog.show()
         if not result:
             return
@@ -4965,6 +5327,7 @@ class App:
             log.warning("모드 상태를 읽지 못했습니다: %s", exc)
             context = None
         crash_dir, game_dir, keep_good = m.crash_dir, m.game_dir, session is None
+        run_args = self._step_run_args(session) if step is not None else None
 
         def worker():
             try:
@@ -4973,18 +5336,23 @@ class App:
             except Exception as exc:  # never in the user's way
                 log.warning("게임이 어떻게 끝났는지 확인하지 못했습니다: %s", exc)
                 detection = gamewatch.judge(game_exit)
-            self.events.put(("call", self._game_ended, detection, step))
+            # what the record of the files the game read says of the step's mods (play time, never requested)
+            run = accessed.step_run(detection, *run_args) if run_args is not None else None
+            self.events.put(("call", self._game_ended, detection, step, run))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _game_ended(self, detection, step: float | None):
+    def _game_ended(self, detection, step: float | None, run: dict | None = None):
         if self._closed:
             return
+        self._apply_pending_restore()  # (a search that ended while the game ran: its REFramework setting back)
         session = self._bisect
         if session is not None:
             if detection.record is not None:  # a crash in a step: the search asks about it itself
                 crashes.mark_notified(self.manager.crash_dir, detection.record)
             if step is not None and session.awaiting_answer and session.launched == step:
+                if run is not None:
+                    session.note_run(run)
                 self._bisect_detection = (step, detection)
                 self.root.after_idle(lambda: self.ask_bisect(auto=True))
             return
@@ -5011,31 +5379,82 @@ class App:
             messagebox.showinfo(bisect.TITLE, bisect.BLOCKED, parent=self.root)
         return True
 
+    def _bisect_ready(self) -> bool:
+        """The search's next launch (or its result) is known. It is worked out on another thread after an
+        answer and when a search is picked up again at startup; meanwhile the bar says so."""
+        session = self._bisect
+        return session is not None and session.ready and not self._bisect_computing
+
+    def _settle_bisect(self, then, work=None):
+        """What comes next in the search (``work``, by default Session.settle: the engine decides), on
+        another thread, then ``then(step or result)`` here. A format-1 search, or one whose next launch
+        is known already, needs no thread."""
+        session = self._bisect
+        if session is None or self._bisect_computing:
+            return
+        if session.legacy or (work is None and session.ready):
+            then((work or session.settle)())
+            return
+        self._bisect_computing = True
+        self._show_bisect_bar()
+        gc.collect()  # (here: tk objects left for the collector must not be freed on the worker thread)
+
+        def worker():
+            try:
+                result = (work or session.settle)()
+            except Exception as exc:
+                log.error("원인 찾기의 다음 실행을 고르지 못했습니다:\n%s", traceback.format_exc())
+                result = exc
+            self.events.put(("call", self._bisect_settled, session, result, then))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _bisect_settled(self, session, result, then):
+        self._bisect_computing = False
+        if self._closed or session is not self._bisect:  # (stopped meanwhile)
+            return
+        if isinstance(result, Exception):
+            self._abort_bisect(f"원인 찾기의 다음 실행을 고르지 못했습니다: {result}")
+            return
+        then(result)
+
     def _show_bisect_bar(self):
-        """The bar for the search's state: the step to play, the game running, or the result."""
+        """The bar for the search's state: the step to play, the game running, the result, or the next
+        launch being worked out."""
         session = self._bisect
         if session is None or self._closed:
             self.bisect_bar.pack_forget()
             return
-        nxt = session.next()
         second = None
         stop = (bisect.BUTTON_STOP, self.stop_bisect)
-        if isinstance(nxt, bisect.Result):
-            title = "원인 찾기를 그만두었습니다" if nxt.kind == "aborted" else "원인 찾기 결과"
-            body = bisect.result_title(nxt, session.names)
-            main = (BISECT_SHOW_RESULT, self.show_bisect_result)
-            stop = (bisect.RESULT_RESTORE, self.stop_bisect)
+        main = ("▶  " + bisect.BUTTON_LAUNCH, self.launch_game)
+        enabled = True
+        if not self._bisect_ready():
+            title, body, enabled = "원인 찾기", BISECT_COMPUTING, False
         else:
-            title = f"원인 찾기 {nxt.number}/{nxt.total}단계"
-            if session.awaiting_answer:
-                watched = self.watcher.available and not (self._watch_lost is not None
-                                                          and self._watch_lost == session.launched)
-                body = BISECT_PLAYING if watched else BISECT_PLAYING_MANUAL
-                main = (BISECT_ANSWER, self.ask_bisect)
-                second = ("게임 다시 실행", self.launch_game)
-            else:  # (not in the game folder yet: a deploy runs, or failed)
-                body = session.banner(nxt, applied=not self.manager.dirty).split(": ", 1)[-1]
-                main = ("▶  " + bisect.BUTTON_LAUNCH, self.launch_game)
+            nxt = session.next()
+            if isinstance(nxt, bisect.Result):
+                title = "원인 찾기를 그만두었습니다" if nxt.kind == "aborted" else "원인 찾기 결과"
+                body = bisect.result_title(nxt, session.names)
+                main = (BISECT_SHOW_RESULT, self.show_bisect_result)
+                stop = (bisect.RESULT_RESTORE, self.stop_bisect)
+            else:
+                title = f"원인 찾기 · {nxt.number}번째 실행" if nxt.engine else f"원인 찾기 {nxt.number}/{nxt.total}단계"
+                if session.awaiting_answer:
+                    watched = self.watcher.available and not (self._watch_lost is not None
+                                                              and self._watch_lost == session.launched)
+                    body = BISECT_PLAYING if watched else BISECT_PLAYING_MANUAL
+                    if nxt.engine and nxt.minutes and nxt.play:
+                        body += "\n" + nxt.play
+                    main = (BISECT_ANSWER, self.ask_bisect)
+                    second = ("게임 다시 실행", self.launch_game)
+                else:  # (not in the game folder yet: a deploy runs, or failed)
+                    body = session.banner(nxt, applied=not self.manager.dirty).split(": ", 1)[-1]
+                    if nxt.engine:
+                        body += "\n" + bisect.progress_text(nxt, session.names)
+                        change = session.last_change()  # (how the last answer moved it: kept until the next one)
+                        if change:
+                            body += "\n" + change
         self.bisect_title.configure(text=title)
         self.bisect_text.configure(text=body)
         for button in (self.bisect_main, self.bisect_second, self.bisect_stop):
@@ -5046,7 +5465,8 @@ class App:
             self.bisect_second.configure(text=second[0], command=second[1])
             self.bisect_second.pack(side="right", padx=(0, self.theme.px(4)))
         self.bisect_main.configure(text=main[0], command=main[1])
-        self.bisect_main.pack(side="right", padx=(0, self.theme.px(6)))
+        if enabled:  # (while the next launch is worked out only 그만두기 is there)
+            self.bisect_main.pack(side="right", padx=(0, self.theme.px(6)))
         if not self.bisect_bar.winfo_manager():
             px = self.theme.px
             self.bisect_bar.pack(fill="x", padx=px(20), pady=(px(10), 0), before=self.paned)
@@ -5056,6 +5476,10 @@ class App:
         session = self._bisect
         if session is None:
             self.start_bisect(record)
+            return
+        if not self._bisect_ready():
+            self._show_bisect_bar()
+            self.status_var.set(BISECT_COMPUTING)
             return
         nxt = session.next()
         if isinstance(nxt, bisect.Result):
@@ -5069,7 +5493,8 @@ class App:
                                               f"누르세요. 그만두려면 '{bisect.BUTTON_STOP}'를 누르세요.", parent=self.root)
 
     def start_bisect(self, record: str = ""):
-        """Look at the mods for a search (the game folder in the background), then show the start window."""
+        """Look at the mods and the records for a search (the slow part in the background: the evidence, the
+        engine's first decision, the game folder), then show the start window."""
         m = self.manager
         if self._bisect is not None or self._bisect_preparing:
             return
@@ -5092,17 +5517,23 @@ class App:
             self.apply()
             return
         try:
-            mods, deployed, backups = bisect.facts(m), m.deployed_files(), m.deployed_backups()
+            owners = bisect.conflict_owners(m)
+            mods, deployed, backups = bisect.facts(m, owners), m.deployed_files(), m.deployed_backups()
             last_good, version = gamewatch.load_last_good(m.crash_dir), m.game_version(refresh=True)
+            inputs = evidence.gather(m, record, owners)
         except Exception as exc:
+            log.error("원인 찾기를 준비하지 못했습니다:\n%s", traceback.format_exc())
             self.show_error(bisect.TITLE, f"원인 찾기를 준비하지 못했습니다: {exc}")
             return
         game_dir, profile, revision = m.game_dir, m.profile, m.revision
+        units = [f.id for f in mods if f.enabled and f.has_files]
+        loose = any("loose" in f.kinds for f in mods if f.enabled)
         self._bisect_preparing = True
-        self.status_var.set("원인 찾기 준비 중...")
+        self.status_var.set(BISECT_PREPARING)
+        gc.collect()  # (here: tk objects left for the collector must not be freed on the worker thread)
 
         def worker():
-            running, plan = False, None
+            running, plan, offer = False, None, None
             try:
                 running = is_game_running()
                 try:
@@ -5110,23 +5541,28 @@ class App:
                 except Exception as exc:  # only a list for the user
                     log.warning("매니저가 넣지 않은 파일을 찾지 못했습니다: %s", exc)
                     unmanaged = ([], 0)
+                found = evidence.build(inputs, evidence.equipment_choices(m, units))
                 plan = bisect.make_plan(mods, last_good, version, unmanaged, profile, bisect.backed_up_refw(backups),
-                                        revision)
+                                        revision, owners=owners, evidence=found)
+                try:
+                    offer = accessed.manager_offer(m, running, loose=loose)
+                except Exception as exc:  # then the search runs without the record of the files the game reads
+                    log.warning("REFramework 파일 기록 설정을 확인하지 못했습니다: %s", exc)
             except Exception as exc:
                 log.error("원인 찾기를 준비하지 못했습니다:\n%s", traceback.format_exc())
                 plan = exc
-            self.events.put(("call", self._bisect_planned, plan, running, record))
+            self.events.put(("call", self._bisect_planned, plan, running, record, offer))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _bisect_planned(self, plan, running: bool, record: str):
+    def _bisect_planned(self, plan, running: bool, record: str, offer=None):
         self._bisect_preparing = False
         if self.busy is None:
             self.status_var.set("준비")
         # outside the event pump: a window opened there would hold up every other event
-        self.root.after_idle(lambda: None if self._closed else self._open_bisect_start(plan, running, record))
+        self.root.after_idle(lambda: None if self._closed else self._open_bisect_start(plan, running, record, offer))
 
-    def _open_bisect_start(self, plan, running: bool, record: str):
+    def _open_bisect_start(self, plan, running: bool, record: str, offer=None):
         m = self.manager
         if isinstance(plan, Exception):
             self.show_error(bisect.TITLE, f"원인 찾기를 준비하지 못했습니다: {plan}")
@@ -5137,13 +5573,35 @@ class App:
         if self._bisect is not None or self._modal_open():
             return
         found = crashes.find_session(m.crash_dir, record) if record else None
-        if not BisectStartDialog(self.root, self.theme, plan, found.title() if found else "").show():
+        record_id = found.id if found else str(getattr(plan.evidence, "record", "") or "")
+        choice = BisectStartDialog(self.root, self.theme, plan, found.title() if found else "", offer,
+                                   m.settings.bisect_log_files).show()
+        if not choice:
             return
+        if choice is True:  # (a window that only says yes)
+            choice = {}
         if not self._idle() or self._bisect is not None:
             return
+        restore = None
+        if offer is not None and offer.available and not offer.already:
+            want = bool(choice.get("log"))
+            if want != m.settings.bisect_log_files:
+                m.update_settings(bisect_log_files=want)  # (the box's default next time)
+            if want:
+                try:
+                    restore = accessed.enable_logging(m.set_refw_option, offer)
+                except (DeployError, ValueError, OSError) as exc:
+                    self.show_error(bisect.TITLE, f"게임이 읽는 파일 기록을 켜지 못해 기록 없이 찾습니다: {exc}")
+                    restore = None
         try:
-            session, _nxt = bisect.start(m, plan, found.id if found else "")
+            session, _nxt = bisect.start(m, plan, record_id, when=choice.get("when"), minutes=choice.get("minutes"),
+                                         equip=choice.get("equip"), refw_restore=restore)
         except (bisect.BisectError, ValueError, OSError) as exc:
+            if restore:
+                try:
+                    accessed.restore_logging(m.set_refw_option, restore)
+                except (DeployError, ValueError, OSError) as undo:
+                    log.warning("REFramework 파일 기록 설정을 되돌리지 못했습니다: %s", undo)
             self.show_error(bisect.TITLE, f"원인 찾기를 시작하지 못했습니다: {exc}")
             return
         self._bisect = session
@@ -5158,9 +5616,14 @@ class App:
             self.apply()
 
     def _resume_bisect(self):
-        """Go on with the search that was running when the manager was closed (bisect.json)."""
+        """Go on with the search that was running when the manager was closed (bisect.json; its next
+        launch is worked out again from the answers first, on another thread)."""
         session = self._bisect
         if session is None:
+            return
+        if not session.ready:
+            self._show_bisect_bar()
+            self._settle_bisect(lambda _nxt: self._resume_bisect())
             return
         m = self.manager
         nxt = session.next()
@@ -5192,6 +5655,7 @@ class App:
             context = m.crash_context()
         except Exception:
             context = None
+        run_args = self._step_run_args(session)
 
         def worker():
             detection = None
@@ -5203,14 +5667,43 @@ class App:
                 log.warning("게임이 어떻게 끝났는지 확인하지 못했습니다: %s", exc)
                 detection = gamewatch.judge(noted)
             if detection is not None:
-                self.events.put(("call", self._game_ended, detection, launched))
+                run = accessed.step_run(detection, *run_args) if run_args is not None else None
+                self.events.put(("call", self._game_ended, detection, launched, run))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _step_run_args(self, session) -> tuple | None:
+        """(the step's mods, the manager's crashes.ModIndex, the content mods, the names of pak files) for
+        accessed.step_run, taken here on the GUI thread (None for a format-1 search)."""
+        if session is None or session.legacy:
+            return None
+        try:
+            index = self.manager.crash_index()
+        except Exception as exc:  # then the launch is judged without the record of the files the game read
+            log.warning("모드 파일 목록을 읽지 못했습니다: %s", exc)
+            index = None
+        return (list((session.current or {}).get("on") or []), index, list(session.content),
+                accessed.PakNames(self.manager.data_dir / "cache"))
+
+    def _apply_pending_restore(self):
+        """REFramework's file record setting left to put back when the game is closed (accessed.apply_pending)."""
+        try:
+            msg = accessed.apply_pending(self.manager, searching=self._bisect is not None)
+        except Exception as exc:  # tried again at the next start or game exit
+            log.warning("REFramework 파일 기록 설정을 되돌리지 못했습니다: %s", exc)
+            msg = ""
+        if msg:
+            log.info("%s", msg)
+            self.status_var.set(msg)
 
     def ask_bisect(self, auto: bool = False):
         """또 튕겼나요? for the step's game (``auto``: the game was seen ending, else the user asked)."""
         session = self._bisect
         if session is None or self._bisect_asking or self._closed:
+            return
+        if not self._bisect_ready():
+            if auto:
+                self.root.after(1000, lambda: self.ask_bisect(auto=True))
             return
         nxt = session.next()
         if isinstance(nxt, bisect.Result):
@@ -5233,12 +5726,14 @@ class App:
             return
         found = self._bisect_detection
         detection = found[1] if found is not None and found[0] == session.launched else None
+        current = session.current or {}
         self._bisect_asking = True
         try:
             if self.root.state() == "iconic":  # minimized when the game started
                 self.root.deiconify()
             self.root.lift()
-            choice = BisectAskDialog(self.root, self.theme, nxt, detection).show()
+            choice = BisectAskDialog(self.root, self.theme, nxt, detection, session.names, current.get("run"),
+                                     int(current.get("retries") or 0)).show()
         finally:
             self._bisect_asking = False
         if choice is None:
@@ -5247,8 +5742,13 @@ class App:
         self._answer_bisect({"crashed": True, "fine": False}.get(choice), detection.label if detection else "")
 
     def _answer_bisect(self, crashed: bool | None, detected: str = ""):
+        """Take the answer for the step (what the manager saw of its game is noted with it), then work out
+        the next launch on another thread and apply it, or show the result."""
         session = self._bisect
         if session is None:
+            return
+        if not self._bisect_ready():
+            self._show_bisect_bar()
             return
         if not self.can_mutate():  # (a task is running: the answer can be given again from the bar)
             self._show_bisect_bar()
@@ -5257,14 +5757,27 @@ class App:
         if reason:
             self._abort_bisect(reason)
             return
-        try:
-            nxt = bisect.answer(self.manager, session, crashed, detected)
-        except bisect.BisectError as exc:
-            self._abort_bisect(str(exc))
-            return
+        session.add_answer(crashed, detected)
         self._bisect_detection = None
+        self._settle_bisect(self._bisect_next)
+
+    def _bisect_next(self, nxt):
+        """The next launch is known: turn its mods on and apply them, or show the result."""
+        session = self._bisect
+        if session is None:
+            return
+        if isinstance(nxt, bisect.Step):
+            try:
+                nxt = bisect.apply_step(self.manager, session)
+            except bisect.BisectError as exc:
+                self._abort_bisect(str(exc))
+                return
         self.refresh()
         self._show_bisect_bar()
+        change = session.last_change()
+        if change:  # (in the bar too: applying the next step takes the status bar over at once)
+            log.info("%s", change)
+            self.status_var.set(change)
         if isinstance(nxt, bisect.Step):
             log.info("%s", session.banner(nxt))
             self._apply_bisect_step()
@@ -5287,6 +5800,10 @@ class App:
         session = self._bisect
         if session is None or self._closed:
             return
+        if not self._bisect_ready():
+            if auto:
+                self.root.after(1000, lambda: self.show_bisect_result(auto=True))
+            return
         result = session.next()
         if not isinstance(result, bisect.Result) or self._modal_open():
             self._show_bisect_bar()
@@ -5304,6 +5821,13 @@ class App:
         if not choice:
             self._show_bisect_bar()
             return
+        if choice[0] == "more":  # 계속 찾기 / 한 번 더 확인: the search goes on
+            if not self.can_mutate():
+                self._show_bisect_bar()
+                return
+            log.info("원인 찾기: %s", bisect.RESULT_MORE if result.kind == "unsure" else bisect.RESULT_CONFIRM)
+            self._settle_bisect(self._bisect_next, work=session.more)
+            return
         if self._finish_bisect(choice[1] if choice[0] == "disable" else ()) and choice[0] == "refw":
             self.root.after_idle(self._on_refw_click)
 
@@ -5312,20 +5836,28 @@ class App:
         session = self._bisect
         if session is None:
             return
-        if isinstance(session.next(), bisect.Result):
+        ready = self._bisect_ready()
+        if ready and isinstance(session.next(), bisect.Result):
             question = f"원래 프로필 '{session.original_profile}'(으)로 돌아갈까요? 원인 찾기용 임시 프로필은 지웁니다."
         else:
             question = (f"원인 찾기를 그만두고 원래 프로필 '{session.original_profile}'(으)로 돌아갈까요? "
                         "지금까지 확인한 결과는 남지 않습니다.")
+            if ready:
+                try:
+                    question += session.interim_note()
+                except Exception as exc:  # only a help
+                    log.warning("지금까지 가장 의심되는 모드를 알아내지 못했습니다: %s", exc)
         if messagebox.askyesno(bisect.TITLE, question, parent=self.root):
             self._finish_bisect(())
 
     def _finish_bisect(self, disable=()) -> bool:
-        """Back to the user's profile (turning ``disable`` off there), then apply it. Returns whether it did."""
+        """Back to the user's profile (turning ``disable`` off there), then apply it; REFramework's file
+        record setting goes back as it was (or once the game is closed). Returns whether it did."""
         session = self._bisect
         if session is None or not self.can_mutate():
             return False
         names = [session.name(i) for i in disable]
+        restore = session.refw_restore
         try:
             bisect.finish(self.manager, session, disable)
         except (KeyError, ValueError, OSError) as exc:
@@ -5333,13 +5865,25 @@ class App:
             return False
         self._bisect = None
         self._bisect_detection = None
+        self._bisect_computing = False
         self.bisect_bar.pack_forget()
         if names:
             log.info("원인 찾기: '%s'을(를) 원래 프로필에서 껐습니다.", "', '".join(names))
+        try:
+            restored = accessed.finish_restore(self.manager, restore)
+        except Exception as exc:  # (finish_restore keeps it for later itself; this is only in case)
+            log.warning("REFramework 파일 기록 설정을 되돌리지 못했습니다: %s", exc)
+            restored = ""
+        if restored:
+            log.info("%s", restored)
         self.refresh()
         self.warm_equipment()
         if self.manager.game_dir:
             self.apply()
+        if restored:
+            self.status_var.set(restored)
+            if self.busy is not None or self._apply_pending:  # (the deploy's end would replace it with "준비" at once)
+                self._status_after_task = restored
         return True
 
     # ------------------------------------------------------------------ closing

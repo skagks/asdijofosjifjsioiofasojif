@@ -754,6 +754,110 @@ def test_the_support_zip(game, crash_dir, tmp_path):
     assert not list(target.parent.glob("*.partial"))
 
 
+# ---- REFramework's record of the files the game read ---------------------------------------------------
+def access_text(start: float, entries=(), constructed_after: float = 3.0) -> str:
+    """reframework_accessed_files.txt: the CONSTRUCTED line ``constructed_after`` s after ``start``, then
+    (offset, path) lines."""
+    def line(t, msg):
+        return f"[{stamp(t)}] [LooseFileLoader] [info] {msg}"
+
+    return "\n".join([line(start + constructed_after, "LooseFileLoader constructed")]
+                     + [line(start + dt, p) for dt, p in entries]) + "\n"
+
+
+def test_the_record_of_the_files_the_game_read_goes_with_its_session(game, crash_dir, monkeypatch):
+    from mhwmm import accessed
+
+    put(game / "re2_framework_log.prev.txt", log_text(game, T0 - 3600, end=1200), T0 - 2400)
+    put(game / "re2_framework_log.txt", log_text(game, T0, crash=str(game / "MonsterHunterWilds.exe")), T0 + 600)
+    entries = [(10, "natives/STM/Art/a.mesh.241111606"), (590, "natives/STM/Art/b.tex.241106027")]
+    put(game / crashlog.ACCESSED_FILE, access_text(T0, entries), T0 + 600)
+    new, old = collect(crash_dir, game)
+    assert crashes.ACCESSED_COPY not in old.info["files"]  # (truncated at every start: the newest session's)
+    record = new.info["files"][crashes.ACCESSED_COPY]
+    assert record["lines"] == 3 and record["truncated"] is False and record["from"] == str(game / crashlog.ACCESSED_FILE)
+    log = crashes.find_session(crash_dir, new.id).accessed()
+    assert list(log.paths) == [p for _dt, p in entries] and log.started == pytest.approx(T0 + 3)
+    assert old.accessed() is None
+    assert collect(crash_dir, game) == []  # unchanged: not copied again
+    # logging off (only the first line) or written in a session no longer kept: nothing to copy
+    put(game / crashlog.ACCESSED_FILE, access_text(T0 + 9000), T0 + 9001)
+    put(game / "re2_framework_log.txt", log_text(game, T0 + 9000, end=60), T0 + 9060)
+    (latest, *_rest) = collect(crash_dir, game)
+    assert crashes.ACCESSED_COPY not in latest.info["files"]
+    put(game / crashlog.ACCESSED_FILE, access_text(T0 + 90_000, entries), T0 + 90_600)
+    assert all(crashes.ACCESSED_COPY not in s.info["files"] for s in collect(crash_dir, game))
+    # a large record keeps its first line and its end
+    monkeypatch.setattr(crashes, "MAX_LOG_COPY", 1000)
+    many = [(10 + i, f"natives/STM/Art/m{i:03d}.mesh.241111606") for i in range(100)]
+    put(game / crashlog.ACCESSED_FILE, access_text(T0 + 9000, many), T0 + 9200)
+    (latest, *_rest) = collect(crash_dir, game)
+    record = latest.info["files"][crashes.ACCESSED_COPY]
+    assert record["truncated"] and record["lines"] < 30
+    log = latest.accessed()
+    assert log.truncated and log.started == pytest.approx(T0 + 9003)
+    assert "natives/STM/Art/m099.mesh.241111606" in log.paths and "natives/STM/Art/m000.mesh.241111606" not in log.paths
+    # the game began a new record while it was copied: left for the next time
+    put(game / crashlog.ACCESSED_FILE, access_text(T0 + 9000, many[:5]), T0 + 9300)
+    real = accessed.read_head
+    monkeypatch.setattr(accessed, "read_head", lambda path: (b"[2026-10-16 18:00:00.000] other", real(path)[1]))
+    assert collect(crash_dir, game) == []
+    assert not list(latest.folder.glob("*" + crashes.fsutil.PART_SUFFIX))
+
+
+def test_what_the_game_read_right_before_the_crash(game, crash_dir):
+    put(game / "re2_framework_log.txt", log_text(game, T0, crash=str(game / "MonsterHunterWilds.exe")), T0 + 600)
+    a, b = "natives/STM/Art/a/x.mesh.241111606", "natives/STM/Art/a/y.mesh.241111606"
+    c = "natives/STM/Art/c/z.mesh.241111606"
+    put(game / crashlog.ACCESSED_FILE, access_text(T0, [(10, c), (595, a), (598, b)]), T0 + 600)
+    (s,) = collect(crash_dir, game, {"mods": [{"id": "a", "name": "A", "enabled": True},
+                                              {"id": "c", "name": "C", "enabled": True}]})
+    index = ModIndex(game, deployed((a, "a"), (b, "a"), (c, "c")), [ModRef("a", "갑옷", files=[a, b]),
+                                                                     ModRef("c", "무기", files=[c])])
+    found = [f for f in crashes.explain(s, index).findings if f.kind.startswith("accessed")]
+    assert [(f.kind, f.level, f.mods) for f in found] == [("accessed", "high", ["a"])]
+    assert found[0].text == "튕기기 직전 10초 동안 게임이 읽은 모드 파일 2개가 모두 '갑옷'의 것입니다 → 의심되는 모드 '갑옷'"
+    assert found[0].evidence == [f"튕기기 2.0초 전: {b}", f"튕기기 5.0초 전: {a}"]
+    assert "accessed" in crashes.KINDS and "accessed_some" in crashes.KINDS
+    # several mods: a weak hint only; nothing for a run that did not crash
+    put(game / crashlog.ACCESSED_FILE, access_text(T0, [(10, b), (596, a), (598, c)]), T0 + 601)
+    (s,) = collect(crash_dir, game)
+    found = [f for f in crashes.explain(s, index).findings if f.kind.startswith("accessed")]
+    assert [(f.kind, f.level, f.mods) for f in found] == [("accessed_some", "low", ["a", "c"])]
+    assert found[0].text == "튕기기 직전 10초 동안 게임이 여러 모드의 파일을 읽었습니다: '갑옷', '무기'"
+    put(game / "re2_framework_log.prev.txt", log_text(game, T0 - 3600, end=1200), T0 - 2400)
+    put(game / "re2_framework_log.txt", log_text(game, T0 + 7200, end=600), T0 + 7800)
+    put(game / crashlog.ACCESSED_FILE, access_text(T0 + 7200, [(595, a), (598, b)]), T0 + 7800)
+    normal = next(x for x in collect(crash_dir, game) if x.started == stamp(T0 + 7200))
+    assert normal.accessed() is not None
+    assert not [f for f in crashes.explain(normal, index).findings if f.kind.startswith("accessed")]
+
+
+def test_the_support_zip_holds_the_end_of_the_record_masked(game, crash_dir, tmp_path):
+    put(game / "re2_framework_log.txt", log_text(game, T0, crash=str(game / "MonsterHunterWilds.exe")), T0 + 600)
+    entries = [(10 + i, f"natives/STM/Art/m{i:03d}.mesh.241111606") for i in range(400)]
+    entries.append((590, r"C:\Users\김철수\Games\MonsterHunterWilds\natives\STM\last.tex.241106027"))
+    put(game / crashlog.ACCESSED_FILE, access_text(T0, entries), T0 + 600)
+    (s,) = collect(crash_dir, game)
+    target = tmp_path / "report.zip"
+    crashes.write_report(target, "report", [s])
+    with zipfile.ZipFile(target) as zf:
+        tail = zf.read(f"{s.id}/{crashes.ACCESSED_TAIL}").decode("utf-8").splitlines()
+        assert f"{s.id}/{crashes.ACCESSED_COPY}" not in zf.namelist()
+    assert len(tail) == crashes.REPORT_ACCESSED_LINES and "m101.mesh" in tail[0]
+    assert "김철수" not in tail[-1] and r"C:\Users\<사용자>\Games" in tail[-1]
+
+
+def test_the_record_of_a_run(game, crash_dir):
+    put(game / "re2_framework_log.prev.txt", log_text(game, T0 - 3600, end=1200), T0 - 2400)
+    put(game / "re2_framework_log.txt", log_text(game, T0, end=600), T0 + 600)
+    collect(crash_dir, game)
+    assert crashes.session_since(crash_dir, T0 - 3).started == stamp(T0)
+    assert crashes.session_since(crash_dir, T0 - 3700, until=T0 - 2400).started == stamp(T0 - 3600)
+    assert crashes.session_since(crash_dir, T0 + 60) is None
+    assert crashes.epoch(stamp(T0)) == pytest.approx(T0) and crashes.epoch("nonsense") is None
+
+
 def test_refw_options(game, tmp_path):
     assert not crashes.lua_logging(game, appdata="")  # no config yet: REFramework's default
     config = put(game / "re2_fw_config.txt", "FontSize=16\r\nScriptRunner_LogToDisk=false\r\n", T0)
@@ -877,6 +981,32 @@ def test_the_game_s_own_crash_report_is_a_crash(game, crash_dir):
     assert collect(crash_dir, game) == []  # the same report is not taken twice
 
 
+def test_where_a_report_s_crash_time_came_from(game, crash_dir, monkeypatch):
+    # the minidump's time is exact to the second even on a whole minute (1 in 60): only a time from the report's file
+    # name is the minute alone, and only that one may be up to a minute early (the "last 10 seconds" window)
+    from mhwmm import accessed
+
+    monkeypatch.setattr(crashes.time, "time", lambda: T0 + 86400)
+    minute = float(int(T0 // 60 * 60)) + 120  # (15:41:00)
+    put(game / "re2_framework_log.txt", log_text(game, T0, [(90, "Hooked DirectX 12", "info")]), T0 + 300)
+    report_zip(game / "CrashReport" / "2026_1016_1541.zip", game_report_text(game), minute, minute + 160)
+    s, = collect(crash_dir, game)
+    assert s.summary["crash_time"] == minute and s.summary["crash_time_from"] == "dump"
+    assert accessed.crash_slack(s) == accessed.REPORT_SLACK
+    # requests 30 s after the crash (the process lingered while CrashReport.exe wrote its zip) are not its last seconds
+    tex = "natives/STM/Art/Model/armor/a_ALBD.tex.241106027"
+    write(game / tex, "t")
+    index = ModIndex(game, {tex.lower(): {"path": tex, "mod": "a"}}, [ModRef("a", "Armor", files=[tex])])
+    log_ = accessed.parse("\n".join(f"[{stamp(t)}] [LooseFileLoader] [info] {p}" for t, p in (
+        (T0 + 5, accessed.CONSTRUCTED), (T0 + 20, "natives/STM/GUI/ui.tex.241106027"), (minute + 30, tex))))
+    found = accessed.exposure(log_, index, ["a"], ["a"], crash=minute, slack=accessed.crash_slack(s))
+    assert found.tail == {} and found.tail_files == []
+    # an unpacked report without its minidump: the folder's name says the minute only
+    put(game / "CrashReport" / "2026_1016_1700" / "CrashReport.txt", game_report_text(game), T0 + 5000)
+    folder = next(x for x in collect(crash_dir, game) if x.id != s.id)
+    assert folder.summary["crash_time_from"] == "name" and accessed.crash_slack(folder) == accessed.REPORT_SLACK_MINUTE
+
+
 def test_a_game_report_without_a_record_of_its_session(game, crash_dir, monkeypatch):
     monkeypatch.setattr(crashes.time, "time", lambda: T0 + 86400)  # (older reports get no session of their own)
     # a report whose log was overwritten since (or without REFramework): a session of its own
@@ -974,3 +1104,31 @@ def test_the_process_start_in_the_dump_finds_the_run(game, crash_dir):
     assert crashes.find_session(crash_dir, s.id).summary["crash_time"] == int(T0 + 3600)
     assert crashes._dump_times(b"MDMP" + bytes(10)) == (None, None)
     assert crashes._dump_times(dump_bytes(T0 + 1, T0 - 5)) == (int(T0 + 1), int(T0 - 5))
+
+
+def test_a_copy_made_while_the_game_ran_is_only_a_part(game, crash_dir, monkeypatch):
+    # the manager collected while the game ran (at its own start, or a command line), the game went on for 40
+    # minutes and was started again from Steam: the new start truncated the record, so the copy stays the early part
+    from mhwmm import accessed
+
+    a, b = "natives/STM/Art/a/x.mesh.241111606", "natives/STM/Art/b/y.mesh.241111606"
+    index = ModIndex(game, deployed((a, "a"), (b, "b")), [ModRef("a", "A", files=[a]), ModRef("b", "B", files=[b])])
+    for case, start in (("normal", T0), ("crash", T0 + 10_000)):
+        put(game / "re2_framework_log.txt", log_text(game, start, end=100), start + 100)
+        put(game / crashlog.ACCESSED_FILE, access_text(start, [(10, a)]), start + 100)
+        with monkeypatch.context() as m:
+            if case == "normal":  # (the copy's own time says so; a crash says it by itself, see below)
+                m.setattr(crashes.time, "time", lambda: start + 101)
+            s = next(x for x in collect(crash_dir, game) if x.started == stamp(start))
+        assert not crashes.find_session(crash_dir, s.id).accessed().partial  # (up to date then)
+        crash = str(game / "MonsterHunterWilds.exe") if case == "crash" else None
+        put(game / "re2_framework_log.prev.txt", log_text(game, start, crash=crash, end=2470), start + 2470)
+        put(game / "re2_framework_log.txt", log_text(game, start + 3000, end=60), start + 3060)
+        put(game / crashlog.ACCESSED_FILE, access_text(start + 3000), start + 3060)  # (CONSTRUCTED only: a new start)
+        collect(crash_dir, game)
+        s = crashes.find_session(crash_dir, s.id)
+        assert s.end_time == pytest.approx(start + 2470) and (s.problem() == "crash") == (case == "crash")
+        log = s.accessed()
+        assert log.partial and not log.truncated and list(log.paths) == [a], case
+        found = accessed.session_exposure(s, index, ["a", "b"], on=["a", "b"])
+        assert found.unexposed == [] and found.note == accessed.NOTE_PARTIAL  # (b may have been read later)

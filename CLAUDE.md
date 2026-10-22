@@ -50,14 +50,38 @@
     게임은 종료 코드 0으로 끝남) 읽기. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사
     (최근 10개), 모드와 맞춰 보기(explain, 항상 '의심'과 근거), 진단 zip(사용자 이름 가림, state.json 제외). 창은 gui.py의
     CrashDialog. 실제 사용자 기록·덤프는 저장소에 넣지 않고 테스트는 직접 만든 가짜 기록으로 한다
-  - `mhwmm/bisect.py`: 원인 모드 찾기. 다음 단계는 지금까지의 답만으로 다시 계산(`next_step`)하고, 진행 상황은 데이터 폴더
-    `bisect.json`. 현재 프로필을 복제한 임시 프로필 '원인 찾기 (임시)'에서만 켜고 끈다(사용자 프로필은 건드리지 않음).
+  - `mhwmm/bisect.py`: 원인 모드 찾기. 다음 구성은 시작할 때 고정한 것(사전 확률·지난 실행 관찰·파라미터)과 지금까지의
+    답만으로 다시 계산하고(재시작해도 같은 구성), 진행 상황은 데이터 폴더 `bisect.json`(형식 2). 현재 프로필을 복제한 임시 프로필
+    '원인 찾기 (임시)'에서만 켜고 끈다(사용자 프로필은 건드리지 않고, 모드를 끄는 것은 결과 창에서 사용자가 고를 때만 `finish(disable=)`).
     진행 중에는 GUI·CLI가 설치·삭제·켜기/끄기·옵션·순서·프로필·게임 폴더 변경을 막는다(`bisect.BLOCKED`, 매니저 자체는 막지 않음).
-    결과는 답 하나에만 기대지 않는다(원인 모드로 튕긴 것과 그 모드 없이 괜찮았던 것을 각각 두 번 본다). 찾는 순서를 바꾸면
-    test_bisect.py의 답 하나가 틀린 경우 시험이 엉뚱한 모드를 짚지 않는지 확인한다
-    창은 gui.py의 BisectStartDialog·BisectAskDialog·BisectResultDialog와 목록 위 안내 줄
+    다른 모드에 파일을 덮어쓰이는 모드는 덮어쓰는 모드와 함께만 켜고(`masking`), 파일이 모두 밀린 모드는 덮어쓰는 모드가
+    모두 켜질 때만 켠다(`hidden_winners`: 사용자 구성에서 읽히지 않던 파일이 들어가지 않게). 형식 1(v2.2.2·v2.2.3에서 시작한 것)은
+    예전 `_Search`/`next_step` 그대로 이어 간다. 결과는 늘 '의심'과 가능성(%)·근거로 말하고 확실하다고 하지 않는다.
+    창은 gui.py의 BisectStartDialog·BisectAskDialog·BisectResultDialog와 목록 위 안내 줄. 엔진 계산(`Session.settle`·
+    `make_plan`·재시작 뒤 첫 `next()`)은 GUI 스레드 밖에서 하고, GUI는 `session.ready`를 확인한 뒤에 `next()`를 부른다
+  - `mhwmm/bisect_engine.py`: 원인 찾기의 베이즈 계산(순수 함수, 입출력 없음). 원인 후보(한 모드·함께일 때만 튕기는 두/세 모드·
+    각각 튕기는 두 모드·모드 문제 아님·그 밖) × 재현율 r, 답의 무게(배경 튕김·틀린 답·플레이 시간 g·파일을 읽지 않은 모드),
+    정보량이 가장 큰 구성 고르기, 결과를 내는 규칙(피벗 규칙). 모델을 바꾸면 `ENGINE_FORMAT`을 올린다. 진행 중인 원인 찾기는
+    `bisect.json`에 저장한 파라미터로 계속한다. 같은 답이면 같은 구성(문자열 set을 그대로 돌지 않음, PYTHONHASHSEED와 무관)
+    - 피벗 규칙: 모드를 짚으려면 P(원인에 들어 있음) ≥ 0.95이고, 그 모드를 켜고 튕긴 실행(원인 찾기 실행이나 튕김 기록)과
+      그 모드만 빼고(나머지는 그 튕긴 구성 그대로) 충분히 오래 괜찮았던 원인 찾기 실행의 쌍이 서로 겹치지 않게 2개 이상(가끔
+      튕기면, 또는 '한 번 더 확인' 뒤에는 3개) 있어야 한다. 지난 실행 기록·마지막 정상 종료는 확률만 바꾸고 쌍에는 쓰지 않는다.
+      사전 확률을 읽지 않는 규칙이라 기록이 틀려도 실행만 늘어나고, 틀린 답 하나로는 엉뚱한 모드를 짚지 않는다. 그래픽카드
+      오류(DEVICE_HUNG 등) 기록이면 'rare' 사전 확률과 모든 모드를 끈 실행 두 번(`Params.controls`)을 먼저 본다
+      찾는 순서나 규칙을 바꾸면 test_bisect_engine.py의 '답 하나가 틀린 경우' 시험(엉뚱한 모드를 짚지 않음)을 꼭 확인한다.
+      `tools/bisect_sim.py --quick|--all|--timing`으로 모의 실험(CI에서는 돌리지 않음)
+  - `mhwmm/evidence.py`: 원인 찾기를 시작할 때의 근거 — 튕김 기록(crashes.explain의 발견)·재질 상태·오래된 REFramework·
+    최근 설치·모드 종류로 모드별 가중치와 강한 단서의 몫(share), 함께 튕길 만한 쌍, '모드 문제 아님' 배율, 기록·지난 실행
+    (`crashes\launches.json`)을 관찰로. 근거마다 이유 글을 붙이고, 출처 하나가 실패해도 나머지로 계속한다(`build`는 예외를
+    내지 않음). 숫자는 짐작이라 결과를 정하지 않는다(피벗 규칙). bisect_engine을 가져오지 않고 속성(`Evidence`)으로만 넘긴다
+  - `mhwmm/accessed.py`: REFramework의 `reframework_accessed_files.txt`(LooseFileLoader_LogAccessedFiles) 읽기, 요청을 모드에
+    대응(루스 파일 우선, 그다음 높은 PAK), 실행마다 '읽지 않은 모드'와 튕기기 직전 10초의 모드(`step_run`). 경로 형식이 실제
+    파일로 확인되지 않아 너그럽게 읽고, 대응이 안 되면 '근거 없음'이 되지 '읽지 않음'이 되지 않는다. 설정은 사용자가 고를 때만,
+    게임이 꺼져 있을 때만 바꾸고(`natives\`에 파일이 있으면 LooseFileLoader는 켜지 않음) 원인 찾기를 마치면 되돌린다(게임이
+    켜져 있으면 데이터 폴더 `refw_restore.json`에 두었다가 `apply_pending`)
   - `mhwmm/gamewatch.py`: 매니저에서 실행한(또는 켤 때 실행 중인) 게임 프로세스가 어떻게 끝났는지 확인(Windows API, 안 되면
-    tasklist, 다른 OS에서는 아무것도 하지 않음). 종료 코드는 모두 manager.log에 남기고, 정상 종료면 `crashes\last_good.json`.
+    tasklist, 다른 OS에서는 아무것도 하지 않음). 종료 코드는 모두 manager.log에 남기고, 정상 종료면 `crashes\last_good.json`,
+    실행마다 `crashes\launches.json`(최근 90일 100번). 게임 자체 오류 보고서가 있으면 종료 코드 0이어도 튕긴 것으로 본다.
     테스트는 가짜 ProcessApi로 한다 (진짜 프로세스는 Windows CI에서만)
   - `mhwmm/precheck.py`: 실행 전 점검. 빠른 `check()`(폴더 몇 개만 훑어 1초 안에, 예외를 내지 않음)와 느린 `background()`(지난
     게임 기록, 매니저가 넣지 않은 natives 파일의 읽기 전용 재질 점검. 결과는 `cache\precheck-scan.json`이고 `check()`가 지금도

@@ -13,7 +13,9 @@ With REFramework's crash handler the exit code is the exception code (0xC0000005
 code of a normal quit is not known for sure, so every exit is written to manager.log, and only a
 code >= 0xC0000000 (or 0x80000003) or a new REFramework crash record counts as a crash.  An exit
 with code 0 after more than NORMAL_SECONDS and no new record is a normal one: the mods it ran
-with are kept as the last good set (``crashes/last_good.json``) for 원인 모드 찾기.
+with are kept as the last good set (``crashes/last_good.json``) for 원인 모드 찾기, and every watched run
+is added to ``crashes/launches.json`` (how it ended, how long it ran and with which mods), which 원인 모드
+찾기 weighs as earlier runs of the same setup.
 
 Everything Windows-only is guarded: on other systems (or when an API is missing) nothing is
 watched, and no API failure reaches the caller.
@@ -22,6 +24,7 @@ watched, and no API failure reaches the caller.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import logging
 import os
@@ -46,6 +49,11 @@ NORMAL_SECONDS = 180.0  # an exit with code 0 after this long (and no crash reco
 LAUNCH_SECONDS = crashes.LAUNCH_SECONDS  # a process starting this soon after a launch from the manager is its
 LAST_GOOD_FILE = "last_good.json"  # in the crash records folder
 LAST_GOOD_FORMAT = 1
+LAUNCHES_FILE = "launches.json"  # in the crash records folder: every watched run, the newest last
+LAUNCHES_FORMAT = 1
+MAX_LAUNCHES = 100
+LAUNCH_DAYS = 90
+OUTCOMES = ("crash", "normal", "unknown")
 
 STILL_ACTIVE = 259
 CRASH_CODE_MIN = 0xC0000000  # NTSTATUS errors (and C++ exceptions, 0xE06D7363)
@@ -550,6 +558,7 @@ class Detection:
     code: str = ""  # exception code, 8 hex digits ("" if none)
     exit: GameExit | None = None
     record: crashes.Session | None = None  # a crash record written since the launch
+    session: crashes.Session | None = None  # the record of this run, crash or not (detect)
 
     @property
     def normal(self) -> bool:
@@ -590,9 +599,32 @@ def judge(exit: GameExit | None, record: crashes.Session | None = None, reported
 
 def detect(crash_dir, since: float | None, exit: GameExit | None = None, game_dir=None, context: dict | None = None,
            appdata=None) -> Detection:
-    """Collect REFramework's records of the session (with ``game_dir``) and judge how it ended.
-    ``since``: when the game was launched (records ending after it count). Reads files: run it
-    off the GUI thread."""
+    """Collect REFramework's records of the session (with ``game_dir``) and judge how it ended; the record of
+    this run, crash or not, is ``Detection.session``. ``since``: when the game was launched (records ending
+    after it count). Reads files: run it off the GUI thread."""
+    detection = _judge_records(crash_dir, since, exit, game_dir, context, appdata)
+    detection.session = run_session(crash_dir, since, exit)
+    return detection
+
+
+def run_session(crash_dir, since: float | None, exit: GameExit | None = None) -> crashes.Session | None:
+    """The kept record of the run launched at ``since`` (or the process ``exit`` describes); None if not known.
+    Without the exit (not watched: the command line, a restart of the manager) the first run since the launch:
+    the game may have been started again since."""
+    known = [t for t in ((exit.started, exit.seen) if exit is not None else ()) if t is not None]
+    start = min([*known, *([since] if since is not None else [])], default=None)
+    if start is None:
+        return None
+    try:
+        return crashes.session_since(crash_dir, start, exit.ended if exit is not None else None, first=exit is None)
+    except Exception as exc:
+        log.warning("게임 기록을 읽지 못했습니다: %s", exc)
+        return None
+
+
+def _judge_records(crash_dir, since: float | None, exit: GameExit | None = None, game_dir=None,
+                   context: dict | None = None, appdata=None) -> Detection:
+    """detect without the run's record (Detection.session)."""
     if game_dir:
         try:
             crashes.collect(crash_dir, game_dir, context, appdata)
@@ -606,7 +638,8 @@ def detect(crash_dir, since: float | None, exit: GameExit | None = None, game_di
     reported = False
     if start is not None:
         try:
-            record = crashes.crashed_since(crash_dir, start - 5)
+            record = crashes.crashed_since(crash_dir, start - 5, first=exit is None,  # (not watched: see run_session)
+                                           until=exit.ended if exit is not None and exit.ended else None)
         except Exception as exc:
             log.warning("게임 기록을 읽지 못했습니다: %s", exc)
         reported = record is None and game_reported_since(game_dir, start - 5,
@@ -722,4 +755,142 @@ def after_exit(crash_dir, exit: GameExit | None, launched: float | None = None, 
                     if detection.code else "")
     if keep_good and detection.normal:
         save_last_good(crash_dir, detection, context)
+    record_launch(crash_dir, detection, context, bisect=not keep_good)
     return detection
+
+
+# ---- every run (launches.json) -----------------------------------------------------------------------
+_launches_lock = threading.Lock()
+
+
+def options_digest(names) -> str:
+    """A mod's chosen options in 8 characters: the start of the sha1 of their names (sorted, one per line);
+    "" for none."""
+    names = sorted(str(n) for n in names or ())
+    return hashlib.sha1("\n".join(names).encode("utf-8")).hexdigest()[:8] if names else ""
+
+
+def launch_mods(context) -> list[list[str]] | None:
+    """[[id, stamp, options digest]] of the mods enabled and applied in a launch context (crash_context;
+    None when it does not say)."""
+    mods = context.get("mods") if isinstance(context, dict) else None
+    if not isinstance(mods, list):
+        return None
+    placed = context.get("placed")
+    placed = {i for i in placed if isinstance(i, str)} if isinstance(placed, list) else None
+    out = []
+    for m in mods:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not m.get("enabled"):
+            continue
+        if placed is None or m["id"] in placed:
+            options = m.get("options") if isinstance(m.get("options"), list) else ()
+            out.append([m["id"], str(m.get("stamp") or ""), options_digest(options)])
+    return out
+
+
+def _row(data) -> dict | None:
+    """A launches.json row as written, or None for a damaged one."""
+    if not isinstance(data, dict) or not isinstance(data.get("time"), (int, float)) or \
+            data.get("outcome") not in OUTCOMES or not isinstance(data.get("mods"), list):
+        return None
+    mods = [m for m in data["mods"] if isinstance(m, list) and len(m) == 3 and all(isinstance(x, str) for x in m)]
+    number = (lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+    return {"time": float(data["time"]), "started": number(data.get("started")), "seconds": number(data.get("seconds")),
+            "outcome": data["outcome"], "code": str(data.get("code") or ""), "category": str(data.get("category") or ""),
+            "game_version": str(data.get("game_version") or ""), "bisect": bool(data.get("bisect")),
+            "record": str(data.get("record") or ""), "where": str(data.get("where") or ""), "mods": mods}
+
+
+def _launch_rows(crash_dir) -> list[dict]:
+    data = fsutil.read_json(Path(crash_dir) / LAUNCHES_FILE, None)
+    if not isinstance(data, dict) or data.get("format") != LAUNCHES_FORMAT or not isinstance(data.get("rows"), list):
+        return []
+    return [r for r in map(_row, data["rows"]) if r is not None]
+
+
+def record_launch(crash_dir, detection: Detection, context: dict | None = None, bisect: bool = False,
+                  now: float | None = None) -> bool:
+    """Add one watched run to launches.json: how it ended ("crash", "normal" or "unknown"), when, how long it ran
+    and the mods it ran with (those of the launch from the manager it came from, else ``context``). ``bisect``:
+    a step of 원인 모드 찾기 (not the user's own setup). Keeps the last MAX_LAUNCHES of LAUNCH_DAYS. Returns
+    whether it was written; never raises."""
+    try:
+        exit_ = detection.exit
+        if exit_ is None:
+            return False
+        launched = launch_context(crash_dir, exit_.started or exit_.seen)
+        ctx = launched if isinstance(launched, dict) else context
+        mods = launch_mods(ctx)
+        if mods is None:
+            return False
+        record = detection.record if detection.record is not None else detection.session
+        code = detection.code
+        if not code and exit_.code is not None and (not detection.crashed or is_crash_code(exit_.code)):
+            code = crashlog.normalize_code(exit_.code)  # (not the 0 of a crash the game reported itself)
+        row = {"time": float(exit_.ended), "started": exit_.started if exit_.started is not None else exit_.seen,
+               "seconds": exit_.seconds,
+               "outcome": "crash" if detection.crashed else "normal" if detection.normal else "unknown",
+               "code": code, "category": str(detection.record.summary.get("category") or "")
+               if detection.record is not None else "", "game_version": str(ctx.get("game_version") or ""),
+               "bisect": bool(bisect or ctx.get("bisect")), "record": record.id if record is not None else "",
+               "where": crashes.crash_where(detection.record) if detection.record is not None else "", "mods": mods}
+        now = time.time() if now is None else now
+        with _launches_lock:
+            rows = [r for r in _launch_rows(crash_dir) if not (abs(r["time"] - row["time"]) < 1
+                                                               and r["started"] == row["started"])]
+            rows.append(row)
+            rows = sorted((r for r in rows if now - r["time"] <= LAUNCH_DAYS * 86400), key=lambda r: r["time"])
+            fsutil.atomic_write_json(Path(crash_dir) / LAUNCHES_FILE,
+                                     {"format": LAUNCHES_FORMAT, "rows": rows[-MAX_LAUNCHES:]})
+        return True
+    except Exception as exc:  # only a help for later searches
+        log.warning("게임 실행 기록을 저장하지 못했습니다: %s", exc)
+        return False
+
+
+def load_launches(crash_dir, game_version: str = "", now: float | None = None) -> list[dict]:
+    """The runs in launches.json of the last LAUNCH_DAYS, the newest first (of ``game_version`` when given), as
+    the crash records kept now tell them (_reconciled)."""
+    now = time.time() if now is None else now
+    rows = [r for r in _launch_rows(crash_dir) if now - r["time"] <= LAUNCH_DAYS * 86400
+            and (not game_version or r["game_version"] == game_version)]
+    return sorted(_reconciled(crash_dir, rows), key=lambda r: r["time"], reverse=True)
+
+
+def _reconciled(crash_dir, rows: list[dict]) -> list[dict]:
+    """Rows of runs whose crash was recorded only after the row was written - the game's own crash report, collected
+    later, of a run that ended with exit code 0 (as _crashed_during for the last normal exit), or one still being
+    written then (a crash without its code): crashes, with that record's code, category and place."""
+    pending = {id(r) for r in rows if r["outcome"] != "crash" or crashlog.normalize_code(r["code"]) in ("", "00000000")}
+    if not pending:
+        return rows
+    try:
+        kept = [s for s in crashes.sessions(crash_dir) if s.problem() == "crash"]
+    except Exception as exc:  # (the rows as written)
+        log.debug("게임 기록을 읽지 못했습니다: %s", exc)
+        return rows
+    if not kept:
+        return rows
+
+    def crashed_at(s) -> float | None:
+        t = s.summary.get("crash_time")
+        return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t else None
+
+    out = []
+    for r in rows:
+        start = r["started"] if r["started"] is not None else r["time"] - r["seconds"] if r["seconds"] is not None \
+            else None
+        found = None if id(r) not in pending else next(
+            (s for s in kept if (r["record"] and s.id == r["record"])
+             or (start is not None and (at := crashed_at(s)) is not None and start - 5 <= at <= r["time"] + 5)), None)
+        if found is None:
+            out.append(r)
+            continue
+        try:
+            where = crashes.crash_where(found)
+        except Exception as exc:
+            log.debug("튕긴 곳을 읽지 못했습니다 (%s): %s", found.id, exc)
+            where = ""
+        out.append({**r, "outcome": "crash", "code": crashlog.normalize_code(found.summary.get("crash") or ""),
+                    "category": str(found.summary.get("category") or ""), "where": where, "record": found.id})
+    return out
