@@ -41,7 +41,7 @@ jobs:
           spec = os.environ["BENCH_PATCH"].strip()
           if spec.startswith("file:"):
               with open(spec[5:], "rb") as f:
-                  diff = f.read()
+                  diff = f.read().replace(b"\r\n", b"\n")  # (the checkout gave it Windows line ends)
           else:
               diff = gzip.decompress(base64.b64decode(spec))
           subprocess.run(["git", "apply", "--stat"], input=diff, check=True)
