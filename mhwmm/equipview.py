@@ -15,7 +15,7 @@ from .equip import look as equip_look
 from .equip import overview as ov
 from .equip.model import (ARMOR_PARTS, BODIES, KIND_LABELS, PART_LABELS, Target, parse_armor_key,
                           parse_weapon_key)
-from .gui import Dialog, Image, ImageTk, Tooltip, autohide, load_image, set_dark_titlebar
+from .gui import Dialog, FollowWidth, Image, ImageTk, Tooltip, autohide, load_image, set_dark_titlebar
 
 log = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ class EquipmentWindow(tk.Toplevel):
         inner = ttk.Frame(canvas, style="TFrame" if plain else "Card.TFrame", padding=padding)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        FollowWidth(canvas, window)  # (all the tiles are laid out again for a new width: not on every drag step)
         return canvas, inner
 
     def _bind_wheel(self, widget, canvas):
@@ -457,7 +457,15 @@ class EquipmentWindow(tk.Toplevel):
             names += f" 외 {len(mods) - 4}개"
         users = ttk.Label(text, text=names, style="TileMuted.TLabel", wraplength=px(460), justify="left")
         users.pack(anchor="w", pady=(px(5), 0))
-        text.bind("<Configure>", lambda e: users.configure(wraplength=max(px(160), e.width - px(4))), add="+")
+        wrap = [px(460)]
+
+        def follow(event):  # (not when the new wraplength made it taller or it only moved)
+            width = max(px(160), event.width - px(4))
+            if width != wrap[0]:
+                wrap[0] = width
+                users.configure(wraplength=width)
+
+        text.bind("<Configure>", follow, add="+")
 
         def click(_event=None, target=item.target):
             self.select(target)
@@ -475,17 +483,26 @@ class EquipmentWindow(tk.Toplevel):
     @staticmethod
     def _flow(frame, gap: int):
         """Lay the frame's children out left to right, going on in a new line when one does not fit."""
+        laid: dict = {"width": None, "spots": None}
+
         def layout(_event=None):
             width = frame.winfo_width()
-            if width <= 1:
-                return
+            if width <= 1 or width == laid["width"]:
+                return  # moved, or the height below changed: the chips stay where they are
+            laid["width"] = width
+            children = frame.winfo_children()
             x = y = line = 0
-            for child in frame.winfo_children():
+            spots = []
+            for child in children:
                 w, h = child.winfo_reqwidth(), child.winfo_reqheight()
                 if x and x + w > width:
                     x, y, line = 0, y + line + gap, 0
-                child.place(x=x, y=y)
+                spots.append((x, y))
                 x, line = x + w + gap, max(line, h)
+            if spots != laid["spots"]:  # (a little wider or narrower mostly keeps every chip where it is)
+                laid["spots"] = spots
+                for child, (cx, cy) in zip(children, spots):
+                    child.place(x=cx, y=cy)
             if int(frame.cget("height")) != y + line:
                 frame.configure(height=y + line)
 

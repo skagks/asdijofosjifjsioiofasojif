@@ -54,6 +54,9 @@ KIND_LABELS = {
     "other": "기타",
 }
 MAX_FILE_ROWS = 3000
+# Lines kept in the log pane (all of them go to manager.log). Tk measures every line of a word-wrapped Text
+# again whenever it gets wider or narrower, so a long log made resizing the window stutter.
+LOG_LINES = 300
 INSTALL_FILETYPES = [
     ("모드 파일", " ".join(f"*{e}" for e in (*ARCHIVE_EXTS, ".pak", ".lua", ".dll"))),
     ("모든 파일", "*.*"),
@@ -145,6 +148,232 @@ def autohide(scrollbar: ttk.Scrollbar, **pack_options):
             scrollbar.pack(**pack_options)
         scrollbar.set(first, last)
     return set_
+
+
+# While a window's edge is dragged, Tk gets a new size for every mouse step (on Windows each one is handled
+# before the next mouse move). Content that is costly to lay out again keeps its width during the drag and
+# follows once the size has not changed for this long.
+RESIZE_SETTLE_MS = 120
+# A change on its own (maximize, restore) is followed at once. If it was the first step of a drag, laying the
+# window out for it can take longer than RESIZE_SETTLE_MS (all the tiles of 장비 외형 at 150%), so a change this
+# soon after a change on its own is the drag's next step (else each step would be laid out at once again).
+RESIZE_FIRST_MS = 600
+_RESIZE_TAG = "MhwmmResize"
+
+
+def _note_resize(event):
+    top = event.widget
+    if isinstance(top, str):  # (a toplevel tkinter does not know)
+        return
+    size = (event.width, event.height)
+    if getattr(top, "_mhwmm_size", None) != size:  # (moving the window is not resizing it)
+        now = time.perf_counter()  # (time.monotonic() is in 15.6 ms steps on Windows before Python 3.13)
+        last, alone = getattr(top, "_mhwmm_changed", None), getattr(top, "_mhwmm_alone", None)
+        # a drag from its second step on: a change on its own (maximize, restore, snapping to a screen edge, a
+        # drag with "show window contents while dragging" off) is followed at once
+        drag = (last is not None and now - last < RESIZE_SETTLE_MS / 1000) or \
+            (alone is not None and now - alone < RESIZE_FIRST_MS / 1000)
+        top._mhwmm_size, top._mhwmm_changed = size, now
+        top._mhwmm_resized, top._mhwmm_alone = (now, alone) if drag else (None, now)
+        for on_size in getattr(top, "_mhwmm_on_size", ()):
+            on_size(event)
+
+
+def watch_resizing(top: tk.Misc, on_size=None):
+    """Note when the toplevel ``top`` changes size (for ``resizing``) and then call ``on_size(event)``: before
+    anything in the window is laid out for the new size. One binding on the toplevel only."""
+    if on_size is not None:
+        top._mhwmm_on_size = getattr(top, "_mhwmm_on_size", ()) + (on_size,)
+    tags = top.bindtags()
+    if _RESIZE_TAG in tags:
+        return
+    if not top.bind_class(_RESIZE_TAG, "<Configure>"):
+        top.bind_class(_RESIZE_TAG, "<Configure>", _note_resize)
+    top.bindtags((_RESIZE_TAG,) + tuple(tags))
+
+
+def resizing(widget: tk.Misc) -> bool:
+    """True while the window of ``widget`` is being resized by dragging its edge: its size changed less than
+    RESIZE_SETTLE_MS ago, and less than RESIZE_SETTLE_MS after the change before (or soon after a change on its
+    own, see RESIZE_FIRST_MS)."""
+    top = widget.winfo_toplevel()
+    at = getattr(top, "_mhwmm_resized", None)
+    return at is not None and time.perf_counter() - at < RESIZE_SETTLE_MS / 1000
+
+
+class FollowWidth:
+    """Keeps the canvas window ``item`` (a scrolled frame of cards) as wide as ``canvas``. While the window's edge
+    is dragged the cards keep their width and are laid out once RESIZE_SETTLE_MS after the last change (doing
+    it on every step of the drag makes resizing stutter); other width changes (the first one, the drag's first
+    step, maximize or restore, the scrollbar showing up, another tab, the sash) are followed at once, as before."""
+
+    def __init__(self, canvas: tk.Canvas, item):
+        self.canvas, self.item = canvas, item
+        self.width: int | None = None  # what the item was given
+        self._after = None
+        watch_resizing(canvas.winfo_toplevel())
+        canvas.bind("<Configure>", self._on_configure, add="+")
+        canvas.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, _event=None):
+        if self._after is not None:
+            self.canvas.after_cancel(self._after)
+            self._after = None
+
+    def _on_configure(self, event):
+        if event.width == self.width and self._after is None:
+            return  # moved, or only the height changed
+        if self.width is not None and resizing(self.canvas):
+            if self._after is not None:
+                self.canvas.after_cancel(self._after)
+            self._after = self.canvas.after(RESIZE_SETTLE_MS, self._settled)
+        else:
+            self.apply(event.width)
+
+    def _settled(self):
+        self._after = None
+        self.apply()
+
+    def apply(self, width: int | None = None):
+        """Give the item the canvas's width now."""
+        if self._after is not None:
+            self.canvas.after_cancel(self._after)
+            self._after = None
+        try:
+            width = width if width is not None else self.canvas.winfo_width()
+            if width != self.width:
+                self.width = width
+                self.canvas.itemconfigure(self.item, width=width)
+        except tk.TclError:  # closed meanwhile
+            pass
+
+
+class HoldPane:
+    """While the window's edge is dragged, the first pane of the horizontal ttk.Panedwindow ``paned`` (the mod
+    list: drawing all of it again on every step of the drag made resizing stutter) keeps its width and the second
+    pane takes the change. RESIZE_SETTLE_MS after the drag the sash goes where it would be without the hold (ttk
+    shares a change in width out by the panes' weights, from where the sash was put). During the drag the first
+    pane catches up at once when it is more than ``lag`` pixels off, or when holding it would make the second pane
+    narrower than ``room`` and than it would be without the hold.
+
+    It works from the window's own size change: ttk lays the panes out as soon as the paned window gets its new
+    size (before a <Configure> binding of the paned window runs), and that happens once the window's content is
+    packed again, after the window's <Configure>."""
+
+    SLACK = 3  # pixels ttk's rounding can leave the sash off its share (further off: the sash was moved)
+
+    def __init__(self, paned: ttk.Panedwindow, lag: int, room: int):
+        self.paned, self.lag, self.room = paned, lag, room
+        self.first, self.second = (str(p) for p in paned.panes())
+        self.weights = tuple(int(paned.pane(p, "weight")) for p in (self.first, self.second))
+        self.width: int | None = None  # the paned window's width as laid out
+        self.offset: int | None = None  # how much narrower than its window it is
+        self.base: tuple[int, int] | None = None  # (sash, width) where the sash was put
+        self.held: int | None = None  # the first pane's width while it is held
+        self.gap = 0  # the sash's thickness
+        self.used = False  # held during this drag: the sash goes to its share when the drag stops
+        self._after = None
+        watch_resizing(paned.winfo_toplevel(), self._on_window_size)
+        paned.bind("<Configure>", self._on_configure, add="+")
+        paned.bind("<Destroy>", self._cancel, add="+")
+
+    def share(self, width: int) -> int:
+        """Where the sash goes at ``width`` without the hold."""
+        sash, base = self.base
+        first, total = self.weights[0], sum(self.weights)
+        if not total:
+            return sash
+        delta, rest = divmod(width - base, total)  # (as ttk::panedwindow: the first pane gets the rest first)
+        return sash + first * delta + min(first, rest)
+
+    def place(self, sash: int):
+        """Put the sash at ``sash``; changes in width are shared out by weight from there."""
+        self._cancel()
+        self._let_go()
+        self.used = False
+        self.paned.sashpos(0, sash)
+        self.base = (self.paned.sashpos(0), self.paned.winfo_width())
+
+    def finish(self):
+        """Put the sash where it goes now (the drag stopped, or the window closes)."""
+        self._cancel()
+        held, used = self.held, self.used
+        self.used = False
+        try:
+            moved = held is not None and self.paned.sashpos(0) != held
+            self._let_go()
+            if used and not moved and self.width:
+                target = self.share(self.width)
+                if 1 <= target <= self.width - self.gap - 1:
+                    self.paned.sashpos(0, target)
+        except tk.TclError:  # closed meanwhile
+            pass
+
+    def _cancel(self, _event=None):
+        if self._after is not None:
+            self.paned.after_cancel(self._after)
+            self._after = None
+
+    def _let_go(self):
+        if self.held is not None:
+            self.held = None
+            self.paned.pane(self.first, weight=self.weights[0])
+            self.paned.pane(self.second, weight=self.weights[1])
+
+    def _on_configure(self, event):  # the paned window was laid out for its new size
+        self.width = event.width
+        try:
+            self.offset = self.paned.winfo_toplevel().winfo_width() - event.width
+        except tk.TclError:
+            pass
+
+    def _on_window_size(self, event):
+        """The window got a new size; the paned window gets its share of it next."""
+        last, offset = self.width, self.offset
+        if last is None or offset is None:
+            return
+        width = event.width - offset
+        if width == last:
+            return  # only the height changed
+        try:
+            if self.held is None and not resizing(self.paned):
+                return  # shared out by weight as ttk does (a change on its own: maximize, restore)
+            self._step(last, width)
+        except tk.TclError:  # closed meanwhile
+            return
+        if self.held is not None or self.used:
+            self._cancel()
+            self._after = self.paned.after(RESIZE_SETTLE_MS, self.finish)
+
+    def _step(self, last: int, width: int):
+        """The paned window (``last`` wide as laid out now) gets ``width``: hold the first pane, or let it catch
+        up."""
+        paned = self.paned
+        sash = paned.sashpos(0)
+        if self.held is None:  # hold it from here
+            second = paned.nametowidget(self.second)
+            gap = second.winfo_x() - sash
+            if not second.winfo_ismapped() or gap < 0 or sash < 1 or last - sash - gap < 1:
+                return  # (a pane folded away: as without the hold)
+            if self.base is None or abs(self.share(last) - sash) > self.SLACK:
+                self.base = (sash, last)  # the sash was moved (by hand): shared out from where it is
+            paned.sashpos(0, sash)  # (ttk takes the panes' widths as they are, then the second one gets it all)
+            paned.pane(self.first, weight=0)
+            paned.pane(self.second, weight=1)
+            self.held, self.gap, self.used = sash, gap, True
+        elif sash != self.held:  # the sash was moved meanwhile: from where it is
+            self._let_go()
+            self.base, self.used = None, False
+            return
+        target = self.share(width)
+        held_room, free_room = width - self.held - self.gap, width - target - self.gap
+        if abs(target - self.held) <= self.lag and (held_room >= free_room or held_room >= self.room):
+            return  # held
+        if 1 <= target <= last - self.gap - 1 and free_room >= 1:
+            paned.sashpos(0, target)  # caught up, held from there
+            self.held = target
+        else:
+            self._let_go()  # (a pane would fold away: as without the hold)
 
 
 class QueueLogHandler(logging.Handler):
@@ -2254,7 +2483,7 @@ class App:
         s = self.manager.settings
         ratio = min(0.8, max(0.3, s.sash_ratio)) if s.remember_window else 0.58
         if width > 1:
-            self.paned.sashpos(0, int(width * ratio))
+            self.list_hold.place(int(width * ratio))
 
     def _restore_window(self):
         s = self.manager.settings
@@ -2279,6 +2508,7 @@ class App:
     def _save_window_state(self):
         s = self.manager.settings
         try:
+            self.list_hold.finish()  # (closed right after a drag: the sash where it goes)
             changes: dict = {"log_visible": self._log_visible}
             if s.remember_window:
                 zoomed = self.root.state() == "zoomed"
@@ -2311,36 +2541,40 @@ class App:
         ttk.Label(titles, text="MONSTER HUNTER WILDS", style="Eyebrow.TLabel").pack(anchor="w")
         ttk.Label(titles, text="모드 매니저", style="Title.TLabel").pack(anchor="w")
 
-        menu_button = ttk.Menubutton(header, text="☰", style="Ghost.TMenubutton")
+        # the widgets on the right in one frame: when the window gets wider or narrower only the frame moves
+        # (each widget moved is laid out and drawn again on every step of the drag)
+        right = ttk.Frame(header, style="Header.TFrame")
+        right.pack(side="right", fill="y")
+        menu_button = ttk.Menubutton(right, text="☰", style="Ghost.TMenubutton")
         menu_button.pack(side="right")
         self.main_menu = self._build_main_menu(menu_button)
         menu_button.configure(menu=self.main_menu)
         Tooltip(t, menu_button, "메뉴")
-        gear = ttk.Button(header, text="⚙", style="Ghost.TButton", command=self.open_settings)
+        gear = ttk.Button(right, text="⚙", style="Ghost.TButton", command=self.open_settings)
         gear.pack(side="right", padx=(0, px(2)))
         Tooltip(t, gear, "설정")
-        ttk.Separator(header, orient="vertical").pack(side="right", fill="y", padx=px(12), pady=px(4))
-        launch = ttk.Button(header, text="▶  게임 실행", command=self.launch_game)
+        ttk.Separator(right, orient="vertical").pack(side="right", fill="y", padx=px(12), pady=px(4))
+        launch = ttk.Button(right, text="▶  게임 실행", command=self.launch_game)
         launch.pack(side="right")
         Tooltip(t, launch, "Steam으로 몬스터 헌터 와일즈 실행")
 
-        self.game_button = ttk.Menubutton(header, text="", style="Chip.TMenubutton")
+        self.game_button = ttk.Menubutton(right, text="", style="Chip.TMenubutton")
         self.game_button.pack(side="right", padx=(0, px(8)))
         self.game_menu = t.mark(tk.Menu(self.game_button, tearoff=False, postcommand=self._fill_game_menu), "menu")
         self.game_button.configure(menu=self.game_menu)
         Tooltip(t, self.game_button, lambda: str(self.manager.game_dir) if self.manager.game_dir
                 else "MonsterHunterWilds.exe가 있는 폴더를 지정하세요")
 
-        self.refw_badge = ttk.Label(header, text="", style="BadgeNeutral.TLabel", cursor="hand2")
+        self.refw_badge = ttk.Label(right, text="", style="BadgeNeutral.TLabel", cursor="hand2")
         self.refw_badge.pack(side="right", padx=(0, px(10)))
         self.refw_badge.bind("<Button-1>", lambda e: self._on_refw_click())
         Tooltip(t, self.refw_badge, self._refw_tooltip)
         # Nexus mod updates: shown while checking, with the result, or when the API key is missing
-        self.mods_badge = ttk.Label(header, text="", style="BadgeNeutral.TLabel", cursor="hand2")
+        self.mods_badge = ttk.Label(right, text="", style="BadgeNeutral.TLabel", cursor="hand2")
         self.mods_badge.bind("<Button-1>", lambda e: self._on_mods_badge_click())
         Tooltip(t, self.mods_badge, self._mods_tooltip)
         # shown once a newer release is found
-        self.update_button = ttk.Button(header, text="", style="Update.TButton", command=self.show_update)
+        self.update_button = ttk.Button(right, text="", style="Update.TButton", command=self.show_update)
         Tooltip(t, self.update_button, "새 버전의 변경 내역을 보고 업데이트합니다")
 
     def _build_main_menu(self, parent) -> tk.Menu:
@@ -2381,8 +2615,8 @@ class App:
         bar.pack(fill="x")
         self.buttons: dict[str, ttk.Button] = {}
 
-        def button(key, text, command, style="TButton", tip=None, side="left", padx=None):
-            b = ttk.Button(bar, text=text, command=command, style=style)
+        def button(key, text, command, style="TButton", tip=None, side="left", padx=None, parent=bar):
+            b = ttk.Button(parent, text=text, command=command, style=style)
             b.pack(side=side, padx=padx if padx is not None else (0, px(6)))
             self.buttons[key] = b
             if tip:
@@ -2399,15 +2633,19 @@ class App:
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(0, px(14)), pady=px(4))
         button("equipment", "장비 외형", lambda: self.show_equipment(), tip="모드가 어떤 장비의 모습을 바꾸는지 보기")
 
-        button("apply", "✔  게임에 적용", self.apply, side="right", padx=(px(10), 0), tip="Ctrl+S")
+        # the widgets on the right in one frame, as in the header (made after the ones on the left: Tab goes
+        # through widgets in the order they were made)
+        right = ttk.Frame(bar)
+        right.pack(side="right", fill="y")
+        button("apply", "✔  게임에 적용", self.apply, side="right", padx=(px(10), 0), tip="Ctrl+S", parent=right)
         self.auto_var = tk.BooleanVar(value=self.manager.settings.auto_apply)
-        switch = ttk.Checkbutton(bar, text="  즉시 적용", variable=self.auto_var, command=self._toggle_auto_apply,
+        switch = ttk.Checkbutton(right, text="  즉시 적용", variable=self.auto_var, command=self._toggle_auto_apply,
                                  style="Switch.TCheckbutton", compound="left",
                                  image=(t.image("switch_off", 20), "selected", t.image("switch_on", 20)))
         switch.pack(side="right")
         Tooltip(t, switch, "켜 두면 모드를 켜고 끄거나 순서를 바꿀 때 바로 게임 폴더에 반영합니다")
         self.profile_var = tk.StringVar(value=self.manager.profile)
-        self.profile_button = ttk.Menubutton(bar, text="", style="Chip.TMenubutton")
+        self.profile_button = ttk.Menubutton(right, text="", style="Chip.TMenubutton")
         self.profile_button.pack(side="right", padx=(0, px(14)))
         self.profile_menu = t.mark(tk.Menu(self.profile_button, tearoff=False, postcommand=self._fill_profile_menu),
                                    "menu")
@@ -2422,11 +2660,13 @@ class App:
         self.status_sep.pack(side="bottom", fill="x")
         self.status_var = tk.StringVar(value="준비")
         ttk.Label(self.status_frame, textvariable=self.status_var, style="StatusMuted.TLabel").pack(side="left")
-        self.state_badge = ttk.Label(self.status_frame, text="", style="BadgeOk.TLabel")
+        right = ttk.Frame(self.status_frame, style="Status.TFrame")  # (in one frame, as in the header)
+        right.pack(side="right", fill="y")
+        self.state_badge = ttk.Label(right, text="", style="BadgeOk.TLabel")
         self.state_badge.pack(side="right")
-        self.log_button = ttk.Button(self.status_frame, text="로그 숨기기", style="Link.TButton", command=self.toggle_log)
+        self.log_button = ttk.Button(right, text="로그 숨기기", style="Link.TButton", command=self.toggle_log)
         self.log_button.pack(side="right", padx=(0, px(10)))
-        self.progress = ttk.Progressbar(self.status_frame, length=px(220), mode="determinate",
+        self.progress = ttk.Progressbar(right, length=px(220), mode="determinate",
                                         style="Accent.Horizontal.TProgressbar")
 
     def _build_log(self):
@@ -2469,7 +2709,15 @@ class App:
         self.bisect_title.pack(anchor="w")
         self.bisect_text = ttk.Label(text, text="", style="Banner.TLabel", justify="left")
         self.bisect_text.pack(anchor="w", fill="x", pady=(px(2), 0))
-        text.bind("<Configure>", lambda e: self.bisect_text.configure(wraplength=max(px(200), e.width - px(4))))
+        wrap = [None]
+
+        def follow(event):  # (only when the width changed: each new wraplength lays the window out again)
+            width = max(px(200), event.width - px(4))
+            if width != wrap[0]:
+                wrap[0] = width
+                self.bisect_text.configure(wraplength=width)
+
+        text.bind("<Configure>", follow)
         self.bisect_main = ttk.Button(buttons, text="", style="Update.TButton")
         self.bisect_second = ttk.Button(buttons, text="", style="BannerGhost.TButton")
         self.bisect_stop = ttk.Button(buttons, text=bisect.BUTTON_STOP, style="BannerGhost.TButton",
@@ -2493,7 +2741,9 @@ class App:
         self.conflicts_button = ttk.Button(head, text="", style="Conflict.TButton", command=self.show_conflicts)
         Tooltip(t, self.conflicts_button, "어떤 모드끼리 어떤 파일을 함께 바꾸는지 한눈에 봅니다")
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(head, textvariable=self.search_var, width=24)
+        right = ttk.Frame(head, style="Card.TFrame")  # (in one frame, as in the header; before the hint over it)
+        right.pack(side="right", fill="y")
+        self.search_entry = ttk.Entry(right, textvariable=self.search_var, width=24)
         self.search_entry.pack(side="right")
         self.search_hint = ttk.Label(head, text="⌕  모드 검색  (Ctrl+F)", style="FieldHint.TLabel", cursor="xterm")
         self.search_hint.bind("<Button-1>", lambda e: self.search_entry.focus_set())
@@ -2502,7 +2752,8 @@ class App:
         self.search_entry.bind("<Escape>", lambda e: self.search_var.set(""))
         self.search_var.trace_add("write", lambda *a: (self._update_search_hint(), self.refresh()))
         self.filter_var = tk.StringVar(value=FILTER_ALL)
-        filter_box = ttk.Combobox(head, textvariable=self.filter_var, values=list(FILTERS), state="readonly", width=12)
+        filter_box = ttk.Combobox(right, textvariable=self.filter_var, values=list(FILTERS), state="readonly",
+                                  width=12)
         filter_box.pack(side="right", padx=(0, px(8)))
         filter_box.bind("<<ComboboxSelected>>", lambda e: (filter_box.selection_clear(), self.refresh()))
         Tooltip(t, filter_box, "목록에 보일 모드 고르기")
@@ -2583,7 +2834,7 @@ class App:
         window = self.options_canvas.create_window((0, 0), window=self.options_inner, anchor="nw")
         self.options_inner.bind("<Configure>", lambda e: self.options_canvas.configure(
             scrollregion=self.options_canvas.bbox("all")))
-        self.options_canvas.bind("<Configure>", lambda e: self.options_canvas.itemconfigure(window, width=e.width))
+        self.options_width = FollowWidth(self.options_canvas, window)  # the cards as wide as the tab
         self._option_vars: list[tuple[str, tk.BooleanVar]] = []
         self.notebook.add(self.options_tab, text="옵션", state="hidden")
 
@@ -2606,6 +2857,8 @@ class App:
         self.notebook.add(conflicts, text="충돌")
         self.conflicts_tab = conflicts
         paned.add(right, weight=2)
+        # the mod list keeps its width while the window's edge is dragged (the details card takes the change)
+        self.list_hold = HoldPane(paned, lag=px(120), room=px(300))
 
         self.context_menu = t.mark(tk.Menu(self.tree, tearoff=False), "menu")
 
@@ -3851,9 +4104,9 @@ class App:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", time.strftime("%H:%M:%S  "), "time")
         self.log_text.insert("end", msg + "\n", tag)
-        lines = int(self.log_text.index("end-1c").split(".")[0])
-        if lines > 2000:
-            self.log_text.delete("1.0", f"{lines - 2000}.0")
+        lines = int(self.log_text.index("end-1c").split(".")[0]) - 1
+        if lines > LOG_LINES:
+            self.log_text.delete("1.0", f"{lines - LOG_LINES + 1}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 

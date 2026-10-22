@@ -138,6 +138,82 @@ def test_without_a_game_numbers_are_shown(tmp_path):
     assert m.equipment_summary(mod.id) == ["방어구 004-000 (남성: 몸통)"]
 
 
+def test_window_tiles_follow_the_width_once_resizing_stops(tmp_path, monkeypatch):
+    """The tiles keep their width while the window's edge is dragged (laying 120 of them out on every step made
+    it stutter), then the list, the mods' names and the part chips follow the new width."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("화면(display)이 없어 GUI 테스트를 건너뜁니다")
+    from mhwmm import gui
+
+    for name in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(gui.messagebox, name, lambda *a, **k: None)
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 400)
+    m = ModManager(tmp_path / "data")  # no game: the tiles show numbers
+    m.settings.check_updates = m.settings.check_refw_updates = m.settings.check_game_running = False
+    m.settings.check_materials = False
+    for n in range(6):
+        with m.prepare_install(make_tree(tmp_path / "src" / f"Armor mod with a rather long name number {n}", {
+                f"natives/STM/Art/Model/Character/ch02/{4 + n:03d}/000/2/ch02_{4 + n:03d}_0002.mesh.241111606": "x",
+                f"natives/STM/Art/Model/Character/ch03/{4 + n:03d}/000/2/ch03_{4 + n:03d}_0002.mesh.241111606": "x"})) as s:
+            m.install_package(s, s.variants)
+    try:
+        app = gui.App(root, m, queue.Queue())
+        px = app.theme.px
+
+        def pump(until, timeout=15.0):
+            end = time.time() + timeout
+            while time.time() < end:
+                root.update()
+                if until():
+                    return
+                time.sleep(0.02)
+            raise AssertionError("시간 초과")
+
+        app.show_equipment()
+        window = app.equipment_window
+        pump(lambda: window.overview is not None and len(window.tiles) == 12)
+
+        def parts(tile):
+            text = tile.winfo_children()[2]  # (picture, rarity column, text)
+            row = next(c for c in text.winfo_children() if c.winfo_children()
+                       and all(x.winfo_manager() == "place" for x in c.winfo_children()))
+            return text, row, text.winfo_children()[-1]
+
+        def laid_out():
+            if window.list.winfo_width() != window.list_canvas.winfo_width():
+                return False
+            for tile in window.tiles.values():
+                text, row, users = parts(tile)
+                if int(float(str(users.cget("wraplength")))) != max(px(160), text.winfo_width() - px(4)):
+                    return False
+                chips = row.winfo_children()
+                if row.winfo_width() <= 1 or any(c.winfo_x() and c.winfo_x() + c.winfo_reqwidth() > row.winfo_width()
+                                                 for c in chips):
+                    return False
+                if row.winfo_height() < max(c.winfo_y() + c.winfo_reqheight() for c in chips):
+                    return False
+            return True
+
+        pump(laid_out)
+        window.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+        width, height = window.winfo_width(), window.winfo_height()
+        for step in (40, 80, 120, 160, 200):  # (the first step is followed at once, the others wait)
+            window.geometry(f"{width + px(step)}x{height}")
+            window.update()
+        assert window.winfo_width() == width + px(200)
+        assert window.list.winfo_width() < window.list_canvas.winfo_width()  # waits for the drag to stop
+        pump(laid_out)
+        window.geometry(f"{px(1080)}x{height}")  # as narrow as it goes: the part chips may need two lines
+        pump(lambda: window.winfo_width() == px(1080) and laid_out())
+        window.close()
+    finally:
+        gc.collect()
+        root.destroy()
+
+
 def test_cli_lists_each_mods_equipment(equip_manager, capsys):
     m, _mods = equip_manager
     assert cli.main(["--data-dir", str(m.data_dir), "equipment"]) == 0

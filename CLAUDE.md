@@ -101,5 +101,12 @@
     게임 폴더는 바꾸지 않고, REFramework 설정만 사용자가 동의했을 때 게임이 꺼져 있을 때 `set_refw_option`으로 한 줄 바꾼다.
     느린 점검의 결과가 달라지는 변경을 하면 `precheck.BACKGROUND_FORMAT`을 올린다. 원인 모드 찾기 중에는 묻지 않는다.
     창은 gui.py의 PrecheckDialog(게임 실행 직전, ☰ → 실행 전 점검), 명령줄은 `check`
-  - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마
+  - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마. 창 크기를 바꿀 때 버벅이지 않게: 창 가장자리를 끄는 중인지는
+    `resizing`(크기가 `RESIZE_SETTLE_MS` 안에 연달아 바뀔 때만. 최대화·복원처럼 한 번 바뀌면 바로 따라감. 한 번 바뀐 뒤
+    `RESIZE_FIRST_MS` 안의 변경도 끌기로 봄: 첫 단계의 배치가 느리면 매 단계를 바로 다시 배치하게 되므로), 스크롤되는 카드
+    목록의 폭은 `FollowWidth`(끄는 동안은 그대로, 멈추고 한 번), 모드 목록 칸은 `HoldPane`(끄는 동안 폭을 두고 오른쪽 칸이
+    받음, 멈추면 무게대로의 자리. ttk가 칸을 paned window의 `<Configure>`보다 먼저 배치하므로 창의 크기 변경에서 처리),
+    로그 창은 `LOG_LINES`줄만(전체는 manager.log), `<Configure>` 처리기는 값이 바뀔 때만 일하고, 막대 오른쪽 위젯들은 한
+    프레임에 묶는다(왼쪽 위젯들 다음에 만들어야 Tab 순서가 그대로). 창 크기 시험은 `maxsize`를 크게 준다(Windows는 화면보다
+    크게 만들지 않음)
   - `mhwmm/cli.py`: 명령줄

@@ -176,6 +176,236 @@ def test_gui_options_show_pictures(root, manager, tmp_path, monkeypatch):
     assert len(shown) == 2
 
 
+def test_follow_width_waits_while_the_window_is_resized(root, monkeypatch):
+    """Cards in a scrolled canvas keep their width while the window's edge is dragged (laying them out on
+    every step made resizing stutter) and follow once it stops; other width changes are followed at once."""
+    from tkinter import ttk
+
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 600)  # (a slow machine must not make the drag look finished)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 600)
+    root.geometry("600x400")
+    canvas = tk.Canvas(root, width=1, height=1)
+    canvas.pack(side="left", fill="both", expand=True)
+    inner = ttk.Frame(canvas, height=50)
+    item = canvas.create_window((0, 0), window=inner, anchor="nw")
+    follow = gui.FollowWidth(canvas, item)
+
+    def given():
+        return int(float(canvas.itemcget(item, "width")))
+
+    def quiet():  # (the next change is one on its own, not a step of a drag)
+        end = time.time() + 0.8
+        while time.time() < end:
+            root.update()
+            time.sleep(0.02)
+
+    pump(root, lambda: canvas.winfo_width() > 500 and given() == canvas.winfo_width())  # the first width at once
+    quiet()
+    root.geometry("640x400")  # the drag's first step (or a change on its own): at once
+    root.update()
+    start = given()
+    assert start == canvas.winfo_width() and not gui.resizing(canvas)
+    for width in (680, 720, 700):  # the window's edge dragged on: the cards wait
+        root.geometry(f"{width}x400")
+        root.update()
+        assert canvas.winfo_width() > start and given() == start and gui.resizing(canvas)
+    pump(root, lambda: given() == canvas.winfo_width())  # ... and follow once it stopped
+    assert given() > start and follow.width == given()
+    root.geometry("700x500")  # taller only: nothing to do
+    root.update()
+    assert given() == canvas.winfo_width()
+
+    quiet()
+    for width in (900, 700, 860):  # maximize, restore (one change each): followed in the same frame
+        root.geometry(f"{width}x500")
+        root.update()
+        assert given() == canvas.winfo_width() and not gui.resizing(canvas)
+        quiet()
+
+    side = ttk.Frame(root, width=60)  # the canvas narrower while the window keeps its size: at once
+    side.pack(side="right", fill="y", before=canvas)
+    root.update()
+    assert given() == canvas.winfo_width() < 860 - 50
+    root.geometry("760x500")
+    root.update()
+    root.geometry("780x500")
+    root.update()
+    assert follow._after is not None
+    errors = []
+    root.report_callback_exception = lambda *exc: errors.append(exc)
+    canvas.destroy()  # a change still waiting when the canvas goes is dropped
+    assert follow._after is None
+    end = time.time() + 0.8
+    while time.time() < end:
+        root.update()
+        time.sleep(0.02)
+    assert not errors
+
+
+def test_follow_width_a_slow_first_step_is_not_a_pause(root, monkeypatch):
+    """The drag's first step is followed at once; when laying the cards out for it takes longer than
+    RESIZE_SETTLE_MS (all the tiles of 장비 외형 at 150%), the next steps still wait (each one laid out at once
+    again made the drag stutter worse than before)."""
+    from tkinter import ttk
+
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 200)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 1500)
+    root.geometry("600x400")
+    canvas = tk.Canvas(root, width=1, height=1)
+    canvas.pack(fill="both", expand=True)
+    inner = ttk.Frame(canvas, height=50)
+    item = canvas.create_window((0, 0), window=inner, anchor="nw")
+    gui.FollowWidth(canvas, item)
+    laid_out = []
+
+    def slow(event):  # a layout that takes longer than RESIZE_SETTLE_MS
+        laid_out.append(event.width)
+        time.sleep(0.35)
+
+    inner.bind("<Configure>", slow)
+
+    def given():
+        return int(float(canvas.itemcget(item, "width")))
+
+    pump(root, lambda: given() == canvas.winfo_width() > 500)
+    end = time.time() + 1.6
+    while time.time() < end:
+        root.update()
+        time.sleep(0.02)
+    laid_out.clear()
+    root.geometry("640x400")  # the first step: at once (and slow)
+    root.update()
+    first = given()
+    assert first == canvas.winfo_width() and laid_out == [first]
+    for width in (660, 680, 700):  # (the second step comes more than RESIZE_SETTLE_MS after the first)
+        root.geometry(f"{width}x400")
+        root.update()
+        assert given() == first and gui.resizing(canvas)
+    pump(root, lambda: given() == canvas.winfo_width() == 700)
+    assert laid_out == [first, 700]  # once more, when the drag stopped
+
+
+def test_gui_follows_the_window_size_once_resizing_stops(root, manager, tmp_path, monkeypatch):
+    """옵션 cards, the 원인 찾기 bar's text and the log after the window was dragged bigger and smaller."""
+    import logging
+
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 400)
+    with manager.prepare_install(make_zip(tmp_path / "Pack.zip", {
+            "Pack/One/natives/STM/a.tex": "1", "Pack/Two/natives/STM/a.tex": "2"})) as s:
+        mod = manager.install_package(s, s.variants)
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = False
+    app = gui.App(root, manager, queue.Queue())
+    px = app.theme.px
+    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+    root.geometry(f"{px(1240)}x{px(800)}")
+    app.show_options(mod.id)
+    canvas, inner = app.options_canvas, app.options_inner
+    pump(root, lambda: canvas.winfo_ismapped() and inner.winfo_width() == canvas.winfo_width())
+    app.bisect_title.configure(text="원인 찾기 · 3번째 실행")
+    app.bisect_text.configure(text="모드 14개를 끄고 게임을 실행합니다. " * 12)
+    app.bisect_bar.pack(fill="x", padx=px(20), pady=(px(10), 0), before=app.paned)
+    text = app.bisect_text.master
+
+    def wrapped():
+        return int(float(str(app.bisect_text.cget("wraplength")))) == max(px(200), text.winfo_width() - px(4))
+
+    pump(root, wrapped)
+    end = time.time() + 0.6  # (the sash placed at startup, and the drag's first step not part of an earlier one)
+    while time.time() < end:
+        root.update()
+        time.sleep(0.02)
+
+    width, height = root.winfo_width(), root.winfo_height()
+    assert width == px(1240)
+    for step in (40, 80, 120, 160, 120, 60):  # dragged wider, then back a little
+        root.geometry(f"{width + px(step)}x{height}")
+        root.update()
+    assert root.winfo_width() == width + px(60)
+    assert inner.winfo_width() < canvas.winfo_width()  # the cards wait for the drag to stop
+    pump(root, lambda: inner.winfo_width() == canvas.winfo_width() and wrapped())
+    for step in (40, 80, 120):  # ... and narrower
+        root.geometry(f"{width + px(60) - px(step)}x{height}")
+        root.update()
+    pump(root, lambda: root.winfo_width() == width + px(60) - px(120) and inner.winfo_width() == canvas.winfo_width()
+         and wrapped())
+
+    # the log keeps its last lines (all of them are in manager.log)
+    for i in range(gui.LOG_LINES + 40):
+        app._append_log(logging.INFO, f"줄 {i}")
+    root.update()
+    lines = app.log_text.get("1.0", "end-1c").splitlines()
+    assert len(lines) == gui.LOG_LINES
+    assert lines[0].endswith("  줄 40") and lines[-1].endswith(f"  줄 {gui.LOG_LINES + 39}")
+    assert app.log_text.yview()[1] == 1.0  # still at the end
+
+
+def test_gui_list_keeps_its_width_while_the_window_is_dragged(root, manager, tmp_path, monkeypatch):
+    """The mod list keeps its width while the window's edge is dragged (drawing all of it again on every step made
+    resizing stutter) and the details card takes the change. Once the drag stops the sash is where it is without
+    the hold; during the drag the list is never far behind and the details card is never narrower than without
+    the hold (or than px(300))."""
+    from mhwmm import gui
+
+    for n in range(3):
+        with manager.prepare_install(make_zip(tmp_path / f"M{n}.zip", {f"natives/STM/m{n}.tex": "x"})) as s:
+            manager.install_variant(s, s.variants[0])
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = True
+    manager.settings.window_geometry = ""
+    manager.settings.sash_ratio = 0.8  # a wide list, a narrow details card
+    app = gui.App(root, manager, queue.Queue())
+    px = app.theme.px
+    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+    paned, hold = app.paned, app.list_hold
+    left, right = (paned.nametowidget(str(p)) for p in paned.panes())
+    height = px(800)
+    start = px(1240)
+    pump(root, lambda: root.winfo_width() > 1)
+    narrowest = root.minsize()[0]
+    sizes = [start + px(20) * k for k in range(1, 25)]  # wider ...
+    sizes += list(range(sizes[-1] - px(30), narrowest, -px(30))) + [narrowest]  # ... as narrow as it goes ...
+    sizes += [narrowest + px(25) * k for k in range(1, 9)]  # ... and a little wider again
+
+    def drag(settle_ms):
+        monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", settle_ms)
+        monkeypatch.setattr(gui, "RESIZE_FIRST_MS", settle_ms)
+        root.geometry(f"{start}x{height}")
+        end = time.time() + 0.8
+        while time.time() < end:
+            root.update()
+            time.sleep(0.02)
+        pump(root, lambda: root.winfo_width() == start)
+        app._place_sash()  # (the saved ratio: the same sash both times)
+        root.update()
+        steps = []
+        for width in sizes:
+            root.geometry(f"{width}x{height}")
+            root.update()
+            assert root.winfo_width() == width
+            steps.append((left.winfo_width(), right.winfo_width()))
+        pump(root, lambda: hold.held is None and hold._after is None)
+        root.update()
+        return steps, paned.sashpos(0)
+
+    free, free_sash = drag(0)  # (0: no change is a drag step, as before the hold)
+    held, held_sash = drag(600)
+    assert held_sash == free_sash  # where the sash goes without the hold
+    assert left.winfo_width() == free_sash
+    kept = sum(1 for (a, _), (b, _) in zip(held[:24], held[1:24]) if a == b)
+    assert kept >= 10 and all(a != b for (a, _), (b, _) in zip(free[:24], free[1:24]))  # it held while wider
+    for (held_list, held_card), (free_list, free_card) in zip(held, free):
+        assert abs(held_list - free_list) <= px(120) + hold.SLACK
+        assert held_card >= min(free_card, px(300))
+    assert min(card for _, card in held) >= min(card for _, card in free)
+
+
 def test_gui_keeps_the_picked_tab_and_reads_old_option_pictures(root, manager, tmp_path, monkeypatch):
     from tkinter import ttk
 
