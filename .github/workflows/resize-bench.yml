@@ -12,6 +12,10 @@ on:
         description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant base --variant nofreeze --variant nolog+scale150 --repeat 3"
         type: string
         default: ""
+      patch:
+        description: "Optional: a change to measure before it is committed (git diff | gzip -9 | base64 -w0), applied with git apply"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -26,6 +30,17 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      - name: Apply the change to measure
+        if: inputs.patch != ''
+        shell: python
+        env:
+          BENCH_PATCH: ${{ inputs.patch }}
+        run: |
+          import base64, gzip, os, subprocess
+
+          diff = gzip.decompress(base64.b64decode(os.environ["BENCH_PATCH"]))
+          subprocess.run(["git", "apply", "--stat"], input=diff, check=True)
+          subprocess.run(["git", "apply"], input=diff, check=True)
       - name: Desktop
         # Real mouse input needs an interactive session with an input desktop (the hosted runner logs on
         # automatically). The bench reports the same again and falls back to SetWindowPos without it.
