@@ -175,26 +175,28 @@ def test_the_game_s_own_crash_report_is_a_crash_and_the_last_seconds_line_up(man
     assert row["outcome"] == "crash" and row["category"] == "gpu" and row["bisect"]
     assert gamewatch.load_last_good(manager.crash_dir) is None
 
-    # the start window says to look at the graphics driver and settings first (the search can still start)
+    # a graphics error is a crash like any other: no "not the mods" weight; the mods with render data up (here every
+    # armor mod's texture), no box telling the user to check the drivers first
     found = evidence.build(evidence.gather(manager, detection.record.id))
-    assert found.device_error == "DEVICE_HUNG" and found.none_scale >= 4
-    assert any("DEVICE_HUNG" in line for line in found.none_reasons)
+    assert found.device_error == "DEVICE_HUNG" and found.none_scale == 1.0 and found.none_reasons == []
+    assert found.weights[ids["a0"]] == pytest.approx(2.5) and found.weights[ids["plugin"]] == pytest.approx(2.0)
+    assert found.reasons[ids["a0"]] == ["게임이 그래픽 오류(DEVICE_HUNG)로 멈췄고 이 모드에 텍스처 파일이 있습니다"]
+    assert "그래픽 오류 (DEVICE_HUNG)" in found.record_title
     plan = bisect.prepare(manager, evidence=found)
-    assert "그래픽카드가 응답하지 않는 오류(DEVICE_HUNG)" in plan.device_note() and not plan.problem
-    assert "그래픽 드라이버를 새로 설치하거나" in plan.device_note()
-    assert plan.families["none"] > bisect.make_plan(bisect.facts(manager), game_version=plan.game_version).families["none"]
-    # such a crash comes and goes without mods: the search expects it to (the "rare" prior), names a mod only after
-    # two fine launches with every mod off, and the result says to look at the driver and settings too
+    assert not plan.problem and not hasattr(plan, "device_note")
+    # the search starts as for any other crash: the reproduction prior of 언제 튕기나요 (here "after a while", from the
+    # record's ~5 minutes), no two launches with every mod off asked for up front (v2.2.5) - only the rule of every
+    # search started now (one while "not the mods" keeps some probability) - and no driver note in the result
     params = plan.data["params"]
-    assert params["controls"] == 2 and params["r_prior"] == list(bisect.engine_mod.R_PRIORS["rare"])
+    assert plan.when == "time" and params["controls"] == 0
+    assert params["none_controls"] == bisect.engine_mod.CURRENT["none_controls"]
+    assert params["r_prior"] == list(bisect.engine_mod.R_PRIORS[bisect.engine_mod.WHEN_PRIOR[plan.when]])
     session, step = bisect.start(manager, plan, detection.record.id)
     result, launches = drive(manager, session, step, lambda on: ids["a5"] in on)
     assert result.kind == "found" and result.mods == [ids["a5"]]
-    assert sum(1 for s in session.steps if not s["on"] and not s["crashed"]) >= 2
-    assert any(s["reason"] == "control" for s in session.steps)
-    assert any("그래픽카드 오류는 모드 없이도" in line for line in session.report_lines() + [
-        bisect.step_text(Step(1, 1, "everything_off", [], [], reason="control", remaining=(1, 1)), session.names)])
-    assert any("그래픽카드가 응답하지 않는 오류(DEVICE_HUNG)" in line for line in session.result_lines(result))
+    controls = [s for s in session.steps if s["reason"] == "control"]
+    assert len(controls) <= 1 and all(not s["on"] for s in controls)
+    assert not any("그래픽카드" in line or "드라이버" in line for line in session.result_lines(result))
     bisect.finish(manager, session)
 
 
@@ -249,12 +251,19 @@ def test_the_launch_history_and_the_last_normal_exit_shorten_the_search(manager,
     assert plan.crash_times == [] and plan.passive[0].seconds == 500.0  # (the record's own time)
     session, step = bisect.start(manager, plan, found.record)
     result, launches = drive(manager, session, step, lambda on: new.id in on)
-    assert result.mods == [new.id] and launches <= 5
+    assert result.mods == [new.id] and launches <= 6
+
+    def searched(session) -> int:  # (launches but those with every mod off asked for before naming a mod)
+        return sum(1 for s in session.steps if s["reason"] != "control")
+
+    core = searched(session)
+    assert core <= 5
     bisect.finish(manager, session)
-    # without them the same search takes longer
+    # without them the same search takes longer (a search this short may add a launch with every mod off before it
+    # names the mod - "not the mods" still has some probability - which a longer one does not need)
     (manager.crash_dir / gamewatch.LAST_GOOD_FILE).unlink()
     session, step = bisect.start(manager, bisect.prepare(manager, owners=owners))
     _result, without = drive(manager, session, step, lambda on: new.id in on)
-    assert without > launches
+    assert searched(session) > core and without >= launches
     bisect.finish(manager, session)
     assert ids

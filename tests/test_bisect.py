@@ -1006,16 +1006,219 @@ def test_one_more_check_of_two_mods_that_each_crash(tmp_path):
 
 @pytest.mark.parametrize("record", ["rare", "device"])
 def test_a_single_mod_that_crashes_now_and_then_is_named(tmp_path, record):
-    # one managed mod, crashes that come and go ('가끔', or a graphics device error record): no one launch adds the
+    # one managed mod, crashes that come and go ('가끔', also from a graphics error record): no one launch adds the
     # third pivot pair, the search makes the two that do instead of stopping unsure
     mods = [ModFacts("x", "Only Mod", True, kinds=frozenset({"pak"}))]
-    ev = Ev(device_error="DEVICE_HUNG") if record == "device" else None
-    plan = bisect.make_plan(mods, evidence=ev, when="rare" if record == "rare" else "same")
+    ev = Ev(device_error="DEVICE_HUNG", weights={"x": 1.6}) if record == "device" else None
+    plan = bisect.make_plan(mods, evidence=ev, when="rare")
     session = bisect.Session.new(tmp_path, plan, "orig", {}, "temp")
     nxt = session.next()
     while isinstance(nxt, Step):
         nxt = session.record("x" in nxt.on)
     assert nxt.kind == "found" and nxt.mods == ["x"] and nxt.runs <= 5
+
+
+DEVICE_TITLE = "10월 21일 18:46 · 그래픽 오류 (DEVICE_HUNG)"
+
+
+def test_a_graphics_error_record_starts_a_search_like_any_other(tmp_path):
+    # a DEVICE_HUNG record (the graphics card could not finish the work the game gave it - in a modded game often a
+    # mod's render data) is a crash like any other: the same rules as any search started now (launches with every mod
+    # off only while "not the mods" keeps some probability, never two of them up front), the reproduction prior from
+    # 언제 튕기나요, and nothing about graphics cards or drivers in the steps or the result of a named mod
+    ev = Ev(device_error="DEVICE_HUNG", record_title=DEVICE_TITLE)
+    for when, prior in (("same", "middle"), ("start", "sharp"), ("time", "middle"), ("rare", "rare")):
+        plan = bisect.make_plan(twelve(), evidence=ev, when=when)
+        params = plan.data["params"]
+        assert params["controls"] == 0 and params["r_prior"] == list(bisect.engine_mod.R_PRIORS[prior]), when
+        assert params == bisect.make_plan(twelve(), when=when).data["params"], when  # (as without the record)
+        assert plan.data["record_title"] == DEVICE_TITLE and "device_error" not in plan.data
+    session = bisect.Session.new(tmp_path, bisect.make_plan(twelve(), evidence=ev), "orig", {}, "temp")
+    nxt = session.next()
+    texts = []
+    while isinstance(nxt, Step):
+        texts.append(bisect.step_text(nxt, session.names))
+        nxt = session.record("m4" in nxt.on)
+    assert nxt.kind == "found" and nxt.mods == ["m4"] and nxt.runs <= 7
+    assert not any("그래픽" in t for t in texts)
+    assert session.result_lines(nxt) == ["모드를 최신 버전으로 업데이트하거나, 재질 점검·복구를 해 보거나, 만든 사람에게 알려 보세요."]
+
+
+def test_a_search_v2_2_5_began_from_a_graphics_error_record_goes_on_as_it_began(tmp_path):
+    # v2.2.5 stored the "rare" prior and two fine launches with every mod off before a mod is named (Params.controls)
+    # for a DEVICE_HUNG record. Its bisect.json (the same formats: the engine's model did not change) goes on with
+    # them after the update - its launches stay what they were - and says nothing about the graphics card
+    from dataclasses import replace
+
+    from mhwmm.bisect_engine import Params
+
+    session = bisect.Session.new(tmp_path, bisect.make_plan(twelve(), evidence=Ev(device_error="DEVICE_HUNG")),
+                                 "orig", {}, "temp")
+    stored = replace(Params(), r_prior=bisect.engine_mod.R_PRIORS["rare"], timed_fine=False, controls=2).to_dict()
+    del stored["none_controls"], stored["max_controls"]  # (keys of a later release)
+    session.data.update(params=stored, r_prior=list(stored["r_prior"]), device_error="DEVICE_HUNG")
+    session.save()
+    assert json.loads((tmp_path / bisect.SESSION_FILE).read_text("utf-8"))["params"]["controls"] == 2
+    steps = []
+    nxt = bisect.Session.load(tmp_path).next()
+    while isinstance(nxt, Step):
+        steps.append(nxt)
+        session = bisect.Session.load(tmp_path)  # (a restart each time)
+        params = Params.from_dict(session.data["params"])
+        assert params.controls == 2 and params.r_prior == bisect.engine_mod.R_PRIORS["rare"]
+        assert params.none_controls == 0 and "none_controls" not in session.data["params"]
+        nxt = session.record("m4" in nxt.on)
+    assert nxt.kind == "found" and nxt.mods == ["m4"]
+    controls = [s for s in steps if s.reason == "control"]
+    assert len(controls) == 2 and all(not s.on for s in controls)  # (both fine: the culprit was off)
+    texts = [bisect.step_text(s, session.names) for s in controls]
+    assert bisect.CONTROL_TEXT in texts[0] and bisect.CONTROL_AGAIN in texts[1]
+    assert not any("그래픽" in t for t in texts)
+    assert not any("그래픽" in line for line in session.result_lines(nxt))
+    assert bisect.CONTROL_FINE.format(fine=2) in nxt.evidence
+
+
+def not_the_mods(seed, r=0.7):
+    """A game that crashes r of the time whatever is on."""
+    rnd = random.Random(seed)
+    return lambda on: rnd.random() < r
+
+
+def replay(path, answer):
+    """Every step and the result of the search kept in ``path``, restarting the session before each answer."""
+    steps = []
+    nxt = bisect.Session.load(path).next()
+    while isinstance(nxt, Step):
+        steps.append(nxt)
+        nxt = bisect.Session.load(path).record(answer(set(nxt.on)))
+    return steps, nxt
+
+
+def test_a_new_search_runs_the_game_with_every_mod_off_before_it_names_a_mod(tmp_path):
+    # a crash that comes and goes whatever is on can look like any mod: a search started now (any record, any answer
+    # to 언제 튕기나요; 가끔 more firmly) runs the game with every mod off while "not the mods" keeps some
+    # probability before it names a mod. The step says so plainly, and the result counts those launches in its 근거
+    engine_mod = bisect.engine_mod
+    for when in ("same", "rare"):
+        params = bisect.make_plan(twelve(), when=when).data["params"]
+        for key, value in {**engine_mod.CURRENT, **engine_mod.WHEN_RULES.get(when, {})}.items():
+            assert params[key] == value, (when, key)
+    assert engine_mod.WHEN_RULES["rare"]["none_controls"] < engine_mod.CURRENT["none_controls"]
+    seen = []
+    for k, seed in enumerate(range(40)):
+        path = tmp_path / str(k)
+        bisect.Session.new(path, bisect.make_plan(twelve()), "orig", {}, "temp").save()
+        steps, result = replay(path, not_the_mods(seed))
+        controls = [s for s in steps if s.reason == "control"]
+        assert all(not s.on and s.kind == "everything_off" for s in controls)
+        if controls:
+            seen.append((controls, result, bisect.Session.load(path)))
+        if len(seen) >= 3:
+            break
+    assert seen
+    for controls, result, session in seen:
+        texts = [bisect.step_text(s, session.names) for s in controls]
+        assert bisect.CONTROL_TEXT in texts[0]
+        for s, t in zip(controls[1:], texts[1:]):  # (later ones: how the earlier ones went)
+            assert s.control >= 1
+            after = bisect.CONTROL_AFTER_CRASH.format(crashes=bisect.off_crash_text(s.control, s.control_crashed))
+            assert (after if s.control_crashed else bisect.CONTROL_AGAIN) in t
+        assert not any("그래픽" in t for t in texts) and "모든 모드를 끄고 적용했습니다." in texts[0]
+        if result.kind in ("found", "together", "each"):
+            assert any(line.startswith("모든 모드를 끈 실행 ") for line in result.evidence)
+
+
+def test_a_crash_with_every_mod_off_is_said_after_the_answer_and_in_the_result(tmp_path):
+    # the first launch with every mod off crashes (가끔, the culprit m4 otherwise exact): the line after the answer says
+    # so and how "not the mods" moved, the next such launch says why it comes again, and the named result counts them
+    # in its 근거 and says what to look at if turning the mod off is not enough (after a restart too)
+    session = bisect.Session.new(tmp_path, bisect.make_plan(twelve(), when="rare"), "orig", {}, "temp")
+    session.save()
+    nxt, changes, controls, crashed = session.next(), [], [], 0
+    while isinstance(nxt, Step):
+        session = bisect.Session.load(tmp_path)
+        if nxt.reason == "control":
+            controls.append(nxt)
+        off_crash = nxt.reason == "control" and not crashed
+        crashed += off_crash
+        nxt = session.record(True if off_crash else "m4" in nxt.on)
+        changes.append((off_crash, session.last_change()))
+    assert crashed == 1 and len(controls) >= 2
+    change = next(text for off, text in changes if off)
+    assert f" · {bisect.OFF_CRASHED}(모드 문제가 아님 " in change and change.startswith("원인 찾기: ")
+    assert all(bisect.OFF_CRASHED not in text for off, text in changes if not off)
+    texts = [bisect.step_text(s, session.names) for s in controls]
+    assert bisect.CONTROL_TEXT in texts[0]
+    assert (bisect.CONTROL_AFTER_CRASH.format(crashes="모든 모드를 끈 실행에서도 튕겼습니다.")) in texts[1]
+    assert controls[1].control == 1 and controls[1].control_crashed == 1
+    assert nxt.kind == "found" and nxt.mods == ["m4"]
+    bare = [s for s in session.steps if not s["on"]]
+    assert bisect.CONTROL_SOME.format(count=len(bare), fine=len(bare) - 1) in nxt.evidence
+    assert not any(line.startswith(bisect.CONTROL_FINE.format(fine=len(bare) - 1)) for line in nxt.evidence)
+    note = bisect.OFF_CRASH_NOTE.format(count=1)
+    assert session.result_lines(nxt)[-1] == note and bisect.Session.load(tmp_path).result_lines(nxt)[-1] == note
+    # (no such crash: no note, and the 근거 line counts them all fine; the range shown at each step held them)
+    other = bisect.Session.new(tmp_path / "fine", bisect.make_plan(twelve(), when="rare"), "orig", {}, "temp")
+    nxt, shown = other.next(), []
+    while isinstance(nxt, Step):
+        shown.append(nxt.remaining)
+        nxt = other.record("m4" in nxt.on)
+    assert all(lo <= len(shown) - k <= hi for k, (lo, hi) in enumerate(shown)), shown
+    bare = [s for s in other.steps if not s["on"]]
+    assert nxt.kind == "found" and bare and bisect.CONTROL_FINE.format(fine=len(bare)) in nxt.evidence
+    assert all("모든 모드를 끈 실행에서도" not in line for line in other.result_lines(nxt))
+    assert bisect.off_crash_text(3, 1) == "모든 모드를 끈 실행 3번 중 1번 튕겼습니다."
+    assert bisect.off_crash_text(2, 2) == "모든 모드를 끈 실행 2번 모두 튕겼습니다."
+
+
+def test_not_the_mods_counts_every_launch_with_every_mod_off(tmp_path):
+    # the 근거 of "not the mods" counts the fine launches with every mod off too ("4번 중 3번"), and says "모두" only when
+    # each of them crashed
+    seen = set()
+    for seed in range(30):
+        path = tmp_path / str(seed)
+        bisect.Session.new(path, bisect.make_plan(twelve()), "orig", {}, "temp").save()
+        _steps, result = replay(path, not_the_mods(seed))
+        if result.kind != "not_mods":
+            continue
+        bare = [s for s in bisect.Session.load(path).steps if not s["on"]]
+        crashed = sum(1 for s in bare if s["crashed"])
+        assert crashed >= 2
+        if crashed < len(bare):
+            assert result.evidence[0] == f"모든 모드를 끈 실행 {len(bare)}번 중 {crashed}번 튕겼습니다."
+            seen.add("some")
+        else:
+            assert result.evidence[0] == bisect.CONTROL_NONE_FINE.format(count=len(bare))
+            seen.add("all")
+        if seen == {"some", "all"}:
+            break
+    assert seen == {"some", "all"}
+
+
+def test_a_search_stored_before_the_launches_with_every_mod_off_goes_on_without_them(tmp_path):
+    # bisect.json of a search started before this release (its params without none_controls / max_controls) goes on
+    # with the rule it began with: launch for launch what the field defaults give, no launch asked for "not the mods",
+    # and the file keeps its parameters; the same answers to a search started now do ask for such a launch
+    differs = 0
+    for seed in range(12):
+        runs = {}
+        for label in ("stored", "defaults", "current"):
+            path = tmp_path / f"{label}{seed}"
+            session = bisect.Session.new(path, bisect.make_plan(twelve()), "orig", {}, "temp")
+            if label != "current":
+                params = bisect.Params().to_dict()
+                if label == "stored":
+                    del params["none_controls"], params["max_controls"]
+                session.data["params"] = params
+            session.save()
+            steps, result = replay(path, not_the_mods(seed))
+            runs[label] = ([(s.on, s.reason) for s in steps], result.kind, result.mods)
+            if label == "stored":
+                assert "none_controls" not in json.loads((path / bisect.SESSION_FILE).read_text("utf-8"))["params"]
+                assert not any(s.reason == "control" for s in steps)
+        assert runs["stored"] == runs["defaults"], seed
+        differs += runs["current"] != runs["stored"]
+    assert differs
 
 
 def test_suspects_as_likely_as_the_top_one_are_never_named_alone(tmp_path):

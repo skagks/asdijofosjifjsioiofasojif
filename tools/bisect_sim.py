@@ -7,7 +7,9 @@ search (mhwmm.bisect.simulate), for the acceptance scenarios of the v2.2.4 desig
     python tools/bisect_sim.py S6 S7       only these scenarios
 
 Everything is seeded: the same command prints the same numbers. "innocent" means a named set that is
-not part of the real cause; launches are means.
+not part of the real cause; launches are means. The searches use the rules of a search started now
+(Params.current, and bisect_engine.WHEN_RULES for 가끔); "stored" rows use the field defaults, the rules of
+a search stored before the launches with every mod off while "not the mods" keeps some probability.
 """
 
 from __future__ import annotations
@@ -24,10 +26,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mhwmm import bisect  # noqa: E402
-from mhwmm.bisect_engine import Engine, Obs, Params, Prior, R_PRIORS, budget, simulate  # noqa: E402
+from mhwmm.bisect_engine import Engine, Obs, Params, Prior, R_PRIORS, WHEN_RULES, budget, simulate  # noqa: E402
 
 NAMED = ("found", "together", "each")
-RARE = Params(r_prior=R_PRIORS["rare"])
+RARE = Params.current(r_prior=R_PRIORS["rare"], **WHEN_RULES["rare"])  # what bisect._settle_data uses for 가끔
+STORED = Params()  # the rules of a search stored before Params.none_controls (no launches with every mod off)
 
 
 def ids(n, prefix="u"):
@@ -477,26 +480,97 @@ def expo_case(args):
     return len(steps), "right" if got == {culprit} else "innocent" if got else "none"
 
 
-# ---- S14: a graphics device error that is not the mods (v2.2.5) --------------------------------------------------------
-DEVICE = Params(r_prior=R_PRIORS["rare"], controls=2)  # what bisect._settle_data uses for DEVICE_HUNG ... records
+# ---- S14: a graphics error record (DEVICE_HUNG ...) -------------------------------------------------------------------
+# v2.2.5 read it as "usually not the mods": the "rare" prior, two fine launches with every mod off before a mod is named
+# (Params.controls) and "not the mods" x4 (W9, W9b), render data x1.5, scripts and plugins x0.7. v2.2.6 reads it as a
+# crash like any other (in a modded game the "badly formed commands" behind it often come from a mod's render data):
+# the prior of 언제 튕기나요 ("same" -> middle, 가끔 -> rare), no controls, no "not the mods" weight, render data x2.5,
+# Lua scripts and data files x0.8 (evidence.graphics), on top of the kind of mod (W17)
+V225 = Params(r_prior=R_PRIORS["rare"], controls=2)  # what v2.2.5's bisect._settle_data stored for such a record
+DEVICE_KINDS = ["render"] * 12 + ["script"] * 4 + ["plugin"] * 2 + ["data"] * 2  # 20 mods (and REFramework)
+DEVICE_SETUPS = {  # (params, weight by kind, "not the mods" scale)
+    "v2.2.5": (V225, {"render": 1.5, "script": 0.7 * 1.3, "plugin": 0.7 * 2.0, "data": 1.5}, 4.0),
+    "v2.2.6 same": (None, {"render": 2.5, "script": 0.8 * 1.3, "plugin": 2.0, "data": 0.8 * 1.5}, 1.0),
+    "v2.2.6 rare": (RARE, {"render": 2.5, "script": 0.8 * 1.3, "plugin": 2.0, "data": 0.8 * 1.5}, 1.0)}
+# (v2.2.6 rows: the current rules - launches with every mod off while "not the mods" keeps some probability; S17)
 
 
 def device_case(args):
-    seed, n, r, cause_none, params = args
+    """refw + 20 mods (DEVICE_KINDS) after a graphics error record; the cause one mod of ``cause``'s kind, or "none"
+    (the game crashes whatever is on); crashes with rate r (1.0: exact answers). Returns (launches, outcome)."""
+    seed, r, cause, setup = args
+    params, weights, none = DEVICE_SETUPS[setup]
     rnd = random.Random(seed)
-    us = ids(n)
+    us = ids(len(DEVICE_KINDS))
     units, req = ["refw", *us], {u: ["refw"] for u in us}
-    c = rnd.choice(us)
+    kind = dict(zip(us, DEVICE_KINDS))
+    prior = Prior(weights={u: weights[kind[u]] for u in us}, none_scale=none)
+    c = None if cause == "none" else rnd.choice([u for u in us if kind[u] == cause])
     local = random.Random(rnd.random())
 
     def answer(on, k):
-        real = (local.random() < r if cause_none else (c in on and local.random() < r)) or local.random() < 0.02
+        if r >= 1:
+            return c is None or c in on
+        real = ((c is None or c in on) and local.random() < r) or local.random() < 0.02
         return real != (local.random() < 0.02)
 
-    d, steps = simulate(units, req, answer, params=params, prior=Prior(none_scale=4.0))  # (W9 x2, W9b x2)
-    if cause_none:
+    d, steps = simulate(units, req, answer, params=params, prior=prior)
+    if c is None:
         return len(steps), "right" if d.kind == "not_mods" else "innocent" if named(d) else "none"
     return len(steps), outcome(named(d), (c,))
+
+
+# ---- S17: not the mods, crashing now and then whatever is on (v2.2.6) ------------------------------------------------
+# refw + 20 mods (DEVICE_KINDS). Starts: norec - no crash record (the user's report only, every mod suspected the same);
+# ord - an ordinary record (weights by the kind of mod, W17); mis - a misleading record (W17 and a strong pointer, share
+# 0.5, at a mod that is not the cause); S14 - a graphics error record as v2.2.6 reads it; S14r - the same and 가끔.
+# A crash that comes and goes whatever is on can look like any mod: the current rule asks for launches with every mod
+# off while "not the mods" keeps P >= Params.none_controls (up to max_controls fine ones) before a mod is named
+W17 = {"render": 1.0, "script": 1.3, "plugin": 2.0, "data": 1.5}
+STARTS = ("norec", "ord", "mis", "S14", "S14r")
+
+
+def notmods_case(args):
+    """Returns (launches, outcome, control launches): the cause is "none" (outcome right = 'not the mods') or one mod."""
+    seed, r, start, cause, rule = args
+    rnd = random.Random(seed)
+    us = ids(len(DEVICE_KINDS))
+    kind = dict(zip(us, DEVICE_KINDS))
+    c = None if cause == "none" else rnd.choice(us)
+    pointed = rnd.choice([u for u in us if u != c])
+    rare = start == "S14r"
+    if start == "norec":
+        prior = None
+    elif start in ("ord", "mis"):
+        prior = Prior(weights={u: W17[kind[u]] for u in us}, shares={pointed: 0.5} if start == "mis" else {})
+    else:
+        prior = Prior(weights={u: DEVICE_SETUPS["v2.2.6 same"][1][kind[u]] for u in us})
+    if rule == "stored":
+        params = Params(r_prior=R_PRIORS["rare"]) if rare else STORED
+    else:
+        params = RARE if rare else Params.current()
+    local = random.Random(rnd.random())
+
+    def answer(on, k):
+        if r >= 1:
+            return c is None or c in on
+        real = ((c is None or c in on) and local.random() < r) or local.random() < 0.02
+        return real != (local.random() < 0.02)
+
+    d, steps = simulate(["refw", *us], {u: ["refw"] for u in us}, answer, params=params, prior=prior)
+    got = named(d)
+    controls = sum(1 for s in steps if s.reason == "control")
+    if c is None:
+        return len(steps), "right" if d.kind == "not_mods" else "innocent" if got else d.kind, controls
+    return len(steps), outcome(got, (c,)) if d.kind != "not_mods" else "not_mods", controls
+
+
+def notmods_stats(rows):
+    n = len(rows)
+    res = [r[1] for r in rows]
+    return (f"{sum(r[0] for r in rows) / n:.2f} launches ({sum(r[2] for r in rows) / n:.2f} with every mod off), "
+            f"right {res.count('right') / n:.1%}, innocent {res.count('innocent') / n:.1%}, "
+            f"unsure {res.count('unsure') / n:.1%}, no_repro {res.count('no_repro') / n:.1%}")
 
 
 # ---- S15, S16: earlier sessions never make a pivot pair (v2.2.5) ------------------------------------------------------
@@ -560,7 +634,7 @@ def random_answers(seed):
 
 # ---- the remaining-launch estimate ------------------------------------------------------------------------------------
 def estimate_case(args):
-    n, culprit, r_true, seed = args
+    n, culprit, r_true, seed, *rest = args  # (rest: "rare" - the parameters of 가끔)
     us = ids(n)
     units = ["refw", *us]
     req = {u: ["refw"] for u in us}
@@ -572,7 +646,7 @@ def estimate_case(args):
         real = (culprit in on and local.random() < r_true) or local.random() < 0.02
         return real != (local.random() < 0.02)
 
-    d, steps = simulate(units, req, answer)
+    d, steps = simulate(units, req, answer, params=RARE if rest and rest[0] == "rare" else None)
     total = len(steps)
     out = []
     for k, s in enumerate(steps):
@@ -584,19 +658,23 @@ def estimate_case(args):
 
 def scenario_estimate(pool):
     lines = []
-    for label, jobs in (
-            ("S1 n=10", [(10, f"u{i}", 1.0, i) for i in range(10)]),
-            ("S1 n=30", [(30, f"u{i}", 1.0, i) for i in range(0, 30, 2)]),
-            ("S4 n=20 r=0.95", [(20, f"u{i % 20}", 0.95, 100 + i) for i in range(60)]),
-            ("S4 n=20 r=0.7", [(20, f"u{i % 20}", 0.7, 200 + i) for i in range(60)])):
+    for label, jobs, err in (
+            ("S1 n=10", [(10, f"u{i}", 1.0, i) for i in range(10)], 2.0),
+            ("S1 n=30", [(30, f"u{i}", 1.0, i) for i in range(0, 30, 2)], 2.0),
+            ("S4 n=20 r=0.95", [(20, f"u{i % 20}", 0.95, 100 + i) for i in range(60)], 2.0),
+            # (a per-bucket median oracle gets about 3.9 there: the answers are noisy)
+            ("S4 n=20 r=0.7", [(20, f"u{i % 20}", 0.7, 200 + i) for i in range(60)], None),
+            # 가끔 (RARE): launches with every mod off come before nearly every naming (Params.none_controls 0.002);
+            # at r=0.95 the rare prior's E[r] widens the range early (the stored rule, no such launches: 2.56)
+            ("가끔 n=20 exact", [(20, f"u{i % 20}", 1.0, 300 + i, "rare") for i in range(40)], 2.0),
+            ("가끔 n=20 r=0.95", [(20, f"u{i % 20}", 0.95, 400 + i, "rare") for i in range(60)], 3.0)):
         rows = [x for r in pool.map(estimate_case, jobs, chunksize=2) for x in r]
         inside = sum(1 for ok, _d in rows if ok) / len(rows)
         mean = sum(d for _ok, d in rows) / len(rows)
-        reachable = "r=0.7" not in label  # (a per-bucket median oracle gets about 3.9 there: the answers are noisy)
         lines.append(f"estimate {label}: actual in [lo, hi] for {inside:.0%} of {len(rows)} steps, "
-                     f"mean |mid - actual| {mean:.2f} [target >= 60%, <= 2"
-                     + ("]" if reachable else "; the error target is out of reach with these inputs]")
-                     + (" OK" if inside >= 0.6 and (mean <= 2 or not reachable) else " MISS"))
+                     f"mean |mid - actual| {mean:.2f} [target >= 60%"
+                     + (f", <= {err:g}]" if err is not None else "; an error target is out of reach with these inputs]")
+                     + (" OK" if inside >= 0.6 and (err is None or mean <= err) else " MISS"))
     return lines
 
 
@@ -649,19 +727,21 @@ def run(names: list[str], workers: int) -> None:
                 print(line, flush=True)
 
         t0 = time.time()
+        # (v2.2.6: the targets of searches that end short include the launches with every mod off asked for before a
+        # mod is named while "not the mods" keeps P >= Params.none_controls - about +0.5 on average, see S17)
         if "S1" in names:
             show(*scenario_exact(pool, "S1", "one", (10, 30, 100), {
-                10: "mean <= 5.6, max <= 7, right 100%", 30: "mean <= 7.2, max <= 8, right 100%",
-                100: "mean <= 9.4, max <= 11, right 100%"}))
+                10: "mean <= 6.1, max <= 7, right 100%", 30: "mean <= 7.7, max <= 9, right 100%",
+                100: "mean <= 9.9, max <= 11, right 100%"}))
         if "S2" in names:
             show(*scenario_exact(pool, "S2", "and", (10, 30), {
                 10: "mean <= 16.0, right >= 95%, innocent 0", 30: "mean <= 19.0, right >= 95%, innocent 0"}))
         if "S3" in names:
             show(*scenario_exact(pool, "S3", "or", (10, 30), {
-                10: "mean <= 13.0, right >= 95%, innocent 0", 30: "mean <= 17.0, right >= 93%, innocent 0"}))
+                10: "mean <= 13.2, right >= 95%, innocent 0", 30: "mean <= 17.0, right >= 93%, innocent 0"}))
         if "S4" in names:
-            for r, target in ((0.95, "right >= 97%, innocent <= 1.0%, mean <= 8.6"),
-                              (0.7, "right >= 88%, innocent <= 2.0%, mean <= 13.0"),
+            for r, target in ((0.95, "right >= 97%, innocent <= 1.0%, mean <= 8.9"),
+                              (0.7, "right >= 88%, innocent <= 2.0%, mean <= 13.3"),
                               (0.5, "right >= 58%, innocent <= 5.0%, mean <= 18.0")):
                 new, old = noisy(pool, 20, r)
                 show(f"S4 noisy n=20 r={r}: engine {stats(new)} | shipped {stats(old)} [target {target}]")
@@ -702,16 +782,16 @@ def run(names: list[str], workers: int) -> None:
             b = pool.map(pointer_case, [(i, "last_good_unchanged", 1.0) for i in range(60)])
             ma, mb = sum(r[0] for r in a) / 60, sum(r[0] for r in b) / 60
             show(f"S7 last_good n=30 exact: culprit changed {stats(a)} | unchanged after a game update {stats(b)} "
-                 f"[target mean <= 5.8 / <= 7.2, right 100%]" + (" OK" if ma <= 5.8 and mb <= 7.2 else " MISS"))
+                 f"[target mean <= 7.0 / <= 7.8, right 100%]" + (" OK" if ma <= 7.0 and mb <= 7.8 else " MISS"))
         if "S8" in names:
-            for mis, target in ((0.1, 8.8), (0.4, 9.0)):
+            for mis, target in ((0.1, 9.4), (0.4, 9.7)):
                 parts = []
                 for use in ("old", "new", "plain"):
                     rows = pool.map(mixed_case, [(1000 + i, 30, mis, 0.5, use) for i in range(160)], chunksize=4)
                     parts.append(f"{ {'old': 'shipped', 'new': 'engine', 'plain': 'engine without evidence'}[use]} "
                                  f"{stats(rows)}")
                 show(f"S8 mixed n=30 misleading={mis}: " + " | ".join(parts)
-                     + f" [target with evidence mean <= {target}, right >= 96%, innocent <= 0.7%; without mean <= 11.0]")
+                     + f" [target with evidence mean <= {target}, right >= 96%, innocent <= 0.7%; without mean <= 11.4]")
         if "S9" in names:
             for use in (True, False):
                 rows = pool.map(time_case, [(5000 + i, 20, "times", use) for i in range(150)], chunksize=4)
@@ -743,7 +823,7 @@ def run(names: list[str], workers: int) -> None:
             for use in (True, False):
                 rows = pool.map(time_case, [(5000 + i, 20, "history", use) for i in range(150)], chunksize=4)
                 show(f"S11 history, {'6 rows' if use else 'none'}: engine {stats([r[1] for r in rows])} | shipped "
-                     f"{stats([r[0] for r in rows])}" + (" [target mean <= 7.0, right >= 99%]" if use else ""))
+                     f"{stats([r[0] for r in rows])}" + (" [target mean <= 7.3, right >= 99%]" if use else ""))
         if "S12" in names:
             got = [never(n) for n in (5, 20, 60)]
             ok = all(k <= 6 and kind == "no_repro" for _l, k, kind in got)
@@ -756,16 +836,16 @@ def run(names: list[str], workers: int) -> None:
             show(f"S13 random answers, 300 seeds, n=0..14: {len(over)} over budget, rankings summing over 1: {len(sums)} "
                  f"[target 0]" + (" OK" if not over and not sums else f" MISS {over[:3]}"))
         if "S14" in names:
-            for r in (0.95, 0.7, 0.5):
-                parts = []
-                for label, params in (("middle", None), ("rare+2 controls", DEVICE)):
-                    rows = pool.map(device_case, [(7000 + i, 20, r, True, params) for i in range(100)], chunksize=4)
-                    parts.append(f"{label} {stats(rows)}")
-                show(f"S14 not the mods (device error, none x4), n=20, crashes r={r} whatever is on: " + " | ".join(parts)
-                     + (" [target with controls: innocent <= 10% at r=0.7]" if r == 0.7 else ""))
-            for label, params in (("middle", None), ("rare+2 controls", DEVICE)):
-                rows = pool.map(device_case, [(7000 + i, 20, 1.0, False, params) for i in range(100)], chunksize=4)
-                show(f"S14 one mod after a device error record, n=20, exact: {label} {stats(rows)}")
+            for cause, rates, what in (("render", (1.0, 0.95, 0.7), "a mod with render data is the cause"),
+                                       ("script", (1.0, 0.7), "a Lua script is the cause (the record misleads)"),
+                                       ("none", (0.95, 0.7, 0.5), "not the mods: crashes whatever is on")):
+                for r in rates:
+                    parts = []
+                    for setup in DEVICE_SETUPS:
+                        rows = pool.map(device_case, [(7000 + i, r, cause, setup) for i in range(100)], chunksize=4)
+                        parts.append(f"{setup} {stats(rows)}")
+                    show(f"S14 graphics error record, n=20, {what}, r={r}: " + " | ".join(parts)
+                         + (" [right = 'not the mods']" if cause == "none" else ""))
         if "S15" in names:
             got = pool.map(ordinary_play_case, [(12, rows, seed) for rows in (6, 8, 12) for seed in range(8)])
             bad = [b for r in got for b in r[0]]
@@ -779,6 +859,36 @@ def run(names: list[str], workers: int) -> None:
                     parts.append(f"e={e} {stats(rows)}")
                 show(f"S16 {k} older crashes like the record's with the culprit not installed yet, exact: "
                      + " | ".join(parts) + " [target innocent 0]")
+        if "S17" in names:
+            for cause, rates in (("none", (0.95, 0.8, 0.7, 0.5)), ("one", (1.0, 0.95, 0.7, 0.5))):
+                for r in rates:
+                    means = {"stored": [], "current": []}
+                    for start in STARTS:
+                        parts = []
+                        for rule in ("stored", "current"):
+                            base = 7000 if cause == "none" else 17000
+                            rows = pool.map(notmods_case, [(base + i, r, start, cause, rule) for i in range(300)],
+                                            chunksize=4)
+                            parts.append(f"{rule} {notmods_stats(rows)}")
+                            means[rule].append((sum(x[0] for x in rows) / len(rows),
+                                                sum(x[1] == "right" for x in rows) / len(rows),
+                                                sum(x[1] == "innocent" for x in rows) / len(rows)))
+                        what = "not the mods" if cause == "none" else "one mod"
+                        show(f"S17 {what}, r={r}, {start}: " + " | ".join(parts))
+                    avg = {k: [sum(v[i] for v in rows) / len(rows) for i in range(3)] for k, rows in means.items()}
+                    line = (f"S17 {what}, r={r}, mean of the {len(STARTS)} starts: stored {avg['stored'][0]:.2f} launches, "
+                            f"right {avg['stored'][1]:.1%}, innocent {avg['stored'][2]:.1%} | current "
+                            f"{avg['current'][0]:.2f} ({avg['current'][0] - avg['stored'][0]:+.2f}), right "
+                            f"{avg['current'][1]:.1%}, innocent {avg['current'][2]:.1%}")
+                    if cause == "none" and r == 0.7:
+                        line += " [target current innocent <= 11%]" + (" OK" if avg["current"][2] <= 0.11 else " MISS")
+                    if cause == "one" and r == 1.0:
+                        line += " [target current launches <= stored + 1.0]" + (
+                            " OK" if avg["current"][0] <= avg["stored"][0] + 1.0 else " MISS")
+                    if cause == "one" and r in (0.7, 0.5):
+                        line += " [target current right >= stored - 1 point]" + (
+                            " OK" if avg["current"][1] >= avg["stored"][1] - 0.01 else " MISS")
+                    show(line)
         if "EST" in names:
             show(*scenario_estimate(pool))
         if "T" in names:
@@ -787,7 +897,7 @@ def run(names: list[str], workers: int) -> None:
 
 
 ALL = ["S1", "S2", "S3", "S4", "S4r", "S5", "S6", "S6b", "S7", "S8", "S9", "S10", "S11", "S12", "S13", "S14", "S15", "S16",
-       "EST", "T"]
+       "S17", "EST", "T"]
 
 
 def main(argv=None) -> int:

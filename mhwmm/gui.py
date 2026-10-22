@@ -1523,13 +1523,6 @@ class BisectStartDialog(Dialog):
         if record_title:
             ttk.Label(body, text=f"게임 튕김 기록: {record_title}", style="Muted.TLabel", font=f["small"],
                       wraplength=wrap, justify="left").pack(anchor="w", pady=(px(2), 0))
-        device = plan.device_note() if not self.problem else ""
-        if device:  # (a graphics device error: the driver and settings first; the search can still start)
-            box = ttk.Frame(body, style="Callout.TFrame", padding=(px(14), px(10)))
-            box.pack(fill="x", pady=(px(10), 0))
-            ttk.Label(box, text="⚠  먼저 그래픽 설정과 드라이버를 확인해 보세요", style="CalloutTitle.TLabel").pack(anchor="w")
-            ttk.Label(box, text=device, style="Callout.TLabel", font=f["small"], wraplength=wrap - px(28),
-                      justify="left").pack(anchor="w", pady=(px(2), 0))
         ttk.Label(body, text=self.problem or plan.intro(), wraplength=wrap, justify="left").pack(
             anchor="w", pady=(px(10), 0))
         self.when_var = tk.StringVar(self, value=plan.when if plan.when in BISECT_WHEN_CHOICES else "same")

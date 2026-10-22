@@ -588,16 +588,12 @@ def cmd_crash(manager: ModManager, args) -> int:
 
 
 def _print_plan(plan, when: str | None = None, minutes: float | None = None, started: bool = False) -> None:
-    """The start window as text: the device error advice, the introduction, the suspects with their 근거, details
+    """The start window as text: the introduction, the suspects with their 근거, details
     (``when``/``minutes``: 언제 튕기나요 as given, else the plan's; ``started``: the search runs already, so it is
     changed by stopping it first)."""
     if plan.problem:
         print(plan.problem)
         return
-    device = plan.device_note()
-    if device:
-        print(f"주의: {device}")
-        print()
     print(plan.intro())
     if plan.v2:
         print()

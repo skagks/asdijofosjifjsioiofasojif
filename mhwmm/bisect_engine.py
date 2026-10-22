@@ -49,9 +49,25 @@ S_c minus x is a subset of S_f.  By Konig's theorem a matching of m pivot pairs 
 twice) survives any m - 1 wrong answers.  The rule does not read the prior, so misleading evidence
 can only slow the search down; masking edges keep tests monotone for file conflicts.
 
-A crash the game reports itself as a graphics device error (DEVICE_HUNG ...) is usually not the mods
-and comes and goes; such a search starts with the "rare" reproduction prior and names a mod only
-after ``controls`` launches with every mod off ran fine (Params.controls).
+Not the mods.  A crash that comes and goes whatever is on can look like any mod: the search still
+converges on one, and its pivot pairs come by chance (the posterior is right about how rare "not the
+mods" is, but given that it is the cause, a search with crashes 70% of the time named a mod in about a
+quarter of the runs).  Only a launch with every mod off tests "not the mods" against every mod at once,
+and a crash there cannot be explained by another mod.  So right before a cause is named (after the
+launches about its kind or the others), while P(none) >= ``Params.none_controls`` the next launch has
+every mod off instead, until ``Params.max_controls`` of them ran fine, however long (a crash moves the
+mass to "not the mods" and the search goes on; a short one barely lowers it, so it is not asked for again
+and again).  The rule reads the posterior and the answers only, never the kind of error in the record;
+until a suspect is near being named, the remaining-launch estimate adds these launches to its upper
+bound only.  It costs about half a launch on average where the crash comes back every time
+(more when evidence made the search short), and lowers "a mod named although it is not the mods" from
+about 27% to 10% at 70% crashes (tools/bisect_sim.py S17: cutting it further costs about a launch more
+per search wherever the crash comes back every time - the two cannot be told apart from the answers).
+``Params.controls``: that many fine launches with every mod off whatever the probabilities (searches
+started by v2.2.5 from a graphics error record stored 2 and keep it; a graphics error, DEVICE_HUNG ...,
+is a crash like any other: in a modded game the "badly formed commands" behind it often come from a
+mod's render data).  A search stored without the newer keys keeps the rule it began with (the field
+defaults); ``Params.current`` is what a search started now uses.
 
 Everything here is deterministic: sets of strings are never iterated in a decision path (units go
 in their index order), and ties go to the higher score rounded to 1e-9, then more mods on, then the
@@ -72,6 +88,9 @@ CRASH_SOURCES = ("report", "search")  # the crash half of a pivot pair (see the 
 FINE_SOURCES = ("search",)  # its fine half
 R_PRIORS = {"sharp": (0.62, 0.20, 0.12, 0.06), "middle": (0.45, 0.25, 0.18, 0.12), "rare": (0.30, 0.30, 0.25, 0.15)}
 WHEN_PRIOR = {"start": "sharp", "same": "middle", "equip": "middle", "time": "middle", "rare": "rare", "": "middle"}
+# 언제 튕기나요 -> Params a search started now changes on top of Params.current (가끔: it comes and goes, so "not the
+# mods" has to be ruled out more firmly before a mod is named)
+WHEN_RULES = {"rare": {"none_controls": 0.002}}
 
 NONE, ONE, AND, OR, AND3, REST = range(6)
 WEAK = 1e-12  # hypotheses lighter than this are left out of the gains
@@ -134,7 +153,20 @@ class Params:
     # start-up) the user goes there, and the play time says nothing
     timed_fine: bool = True
     passive_times: bool = True  # the record's and older crashes' seconds join the crash times (not when the user typed them)
-    controls: int = 0  # fine launches with every mod off before a mod is named (graphics device errors: 2)
+    # fine launches with every mod off (long enough to count) before a mod is named, whatever the answers (v2.2.5 for
+    # a graphics error record: 2)
+    controls: int = 0
+    # before a mod is named, one more launch with every mod off while P(not the mods) >= none_controls, until
+    # max_controls of them ran fine (however long). The defaults are the rule of a search stored without these keys (none: v2.2.5 and
+    # v2.2.6 before it); a search started now takes CURRENT (Params.current)
+    none_controls: float = 0.0
+    max_controls: int = 0
+
+    @classmethod
+    def current(cls, **kw) -> Params:
+        """The parameters of a search started now: the field defaults (what a search stored without a key keeps) with
+        the rules added since (CURRENT), then ``kw``."""
+        return cls(**{**CURRENT, **kw})
 
     def to_dict(self) -> dict:
         out = {}
@@ -178,7 +210,11 @@ class Params:
 
 
 _UNIT_FIELDS = {"b", "e", "e_agrees", "leak", "p_none", "p_one", "p_and", "p_or", "p_and3", "p_rest", "tau", "tau_fix",
-                "tau_exact", "confirm_at", "r_confident", "fine_weight", "near_best", "clear_mass", "share_max"}
+                "tau_exact", "confirm_at", "r_confident", "fine_weight", "near_best", "clear_mass", "share_max",
+                "none_controls"}
+# the rules a search started now adds to the field defaults (Params.current; a stored search keeps what it stored):
+# launches with every mod off while "not the mods" keeps this much probability (see the module docstring)
+CURRENT = {"none_controls": 0.004, "max_controls": 5}
 
 
 def budget(n_units: int, extra: int = 0, params: Params | None = None) -> int:
@@ -343,7 +379,7 @@ class Engine:
     def __init__(self, units: Sequence[str], requires: Mapping[str, Sequence[str]] | None = None, *,
                  content: Iterable[str] = (), prior: Prior | None = None, params: Params | None = None,
                  crash_times: Sequence[float] = (), strict: bool = False):
-        self.p = params if isinstance(params, Params) else Params()
+        self.p = params if isinstance(params, Params) else Params.current()
         self.units = list(dict.fromkeys(u for u in units if isinstance(u, str)))
         n = self.n = len(self.units)
         self.index = {u: i for i, u in enumerate(self.units)}
@@ -822,9 +858,44 @@ class Engine:
         return out
 
     def _controls(self) -> int:
-        """Fine launches of the search with every mod off (long enough to count)."""
+        """Fine launches of the search with every mod off (long enough to count: Params.controls)."""
         fw = self.p.fine_weight
         return sum(1 for o in self.obs if o.source == "search" and not o.on and not o.crashed and o.w >= fw)
+
+    def _bare_controls(self) -> int:
+        """Fine launches of the search with every mod off however long they ran (Params.max_controls caps these: a
+        short one barely lowers P(not the mods), so counting only long ones asked for the same launch again and
+        again, up to the budget, when the user kept playing it briefly)."""
+        return sum(1 for o in self.obs if o.source == "search" and not o.on and not o.unknown and not o.crashed)
+
+    def _p_none(self, post: _Post) -> float:
+        s, end = self.ranges[NONE]
+        return post.ph.get(s, 0.0) if end > s else 0.0
+
+    def _none_control_due(self, post: _Post) -> bool:
+        """The cause is being named now: one more launch with every mod off first? (while P(not the mods) >=
+        Params.none_controls, until Params.max_controls of them ran fine, however long each ran)"""
+        p = self.p
+        return bool(p.none_controls) and self._bare_controls() < p.max_controls \
+            and self._p_none(post) >= p.none_controls
+
+    def _controls_left(self, post: _Post, near: bool) -> int:
+        """About how many launches with every mod off are still to come before a cause is named (the estimate): the
+        missing Params.controls, and for Params.none_controls - once a suspect is ``near`` being named (before that
+        the search's own answers still lower P(not the mods): _remaining adds them to the upper bound only) - the
+        fine ones that bring P(not the mods) under it, each multiplying it by about P(fine | not the mods), up to
+        Params.max_controls fine ones however long."""
+        p = self.p
+        left = max(0, p.controls - self._controls())
+        done = self._bare_controls()
+        pn = self._p_none(post)
+        if near and p.none_controls and done < p.max_controls and pn >= p.none_controls:
+            s, _end = self.ranges[NONE]
+            prh = post.prh.get(s)
+            fine = sum(q * (1 - r) for q, r in zip(prh, self.grid)) if prh else 0.5
+            k = max(1, math.ceil(math.log(p.none_controls / pn) / math.log(min(0.9, max(0.05, fine))) - 1e-9))
+            left = max(left, min(p.max_controls - done, k))
+        return left
 
     def _need(self, r_mean: float) -> int:
         return 3 if self.strict or r_mean < self.p.r_confident else 2
@@ -1061,10 +1132,17 @@ class Engine:
         piv = self.matching(self._pivot_parts(top_one)[2], need) if top_one is not None else 0
         p = self.p
         x = max(1, math.ceil(math.log2(max(1.0, n_eff)) - 1e-9) + (need - min(piv, need)) + p.est_shift)
-        x += max(0, p.controls - self._controls())
+        near = top_one is not None and probs[top_one] >= p.confirm_at
+        controls = self._controls_left(post, near)
+        x += controls
         noisy = post.r_mean < p.r_confident and launches >= p.est_noisy_after
         lo = max(1, x - p.est_lo - (p.est_noisy_lo if noisy else 0))
         hi = x + p.est_hi + (p.est_noisy_hi if noisy else 0)
+        if p.none_controls and not near:
+            # the launches with every mod off a naming may still need, in the upper bound only: the search's own
+            # answers often lower P(not the mods) enough on the way (with 가끔 they seldom do), and counting them in
+            # x made the middle of the range worse; left out, the range fell short whenever they came
+            hi += self._controls_left(post, True) - controls
         left = max(1, limit - launches)
         return min(lo, left), max(min(hi, left), min(lo, left))
 
@@ -1151,11 +1229,13 @@ class Engine:
             fix = self._fix(post, self.masks[top])
             named = Decision({ONE: "found", AND: "together", AND3: "together", OR: "each"}[kind],
                              mods=tuple(self.units[i] for i in members), p=sure, pivots=robust, fix=fix)
-            if p.controls and self._controls() < p.controls and launches < limit:
-                # (a graphics device error: is the game fine with every mod off? the crash may come and go)
-                return finish(Decision("test", frozenset(), "control", mods=named.mods, p=ptop, pivots=robust,
-                                       fix=fix))
+            control = Decision("test", frozenset(), "control", mods=named.mods, p=ptop, pivots=robust, fix=fix)
+            if launches < limit and self._controls() < p.controls:
+                # (Params.controls - v2.2.5 searches from a graphics error record: is the game fine with every mod off?)
+                return finish(control)
             if (fix >= p.tau_fix and ptop >= p.tau_exact) or launches >= limit:
+                if launches < limit and self._none_control_due(post):  # (Params.none_controls)
+                    return finish(control)
                 named.can_confirm = robust < 3 and self._can_confirm(post, top, parts, robust)
                 return finish(named)
         if named is None and launches >= limit:
@@ -1180,6 +1260,8 @@ class Engine:
                 if g >= p.min_gain:
                     test = Decision("test", self.ids(m), why, mods=named.mods, p=ptop, pivots=robust, fix=named.fix)
                     return finish(test)
+            if launches < limit and self._none_control_due(post):  # (nothing left to learn about the kind: named now)
+                return finish(control)
             named.can_confirm = robust < 3 and self._can_confirm(post, top, parts, robust)
             return finish(named)
         confirming = nameable and sure >= p.confirm_at and robust < need

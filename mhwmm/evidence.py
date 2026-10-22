@@ -55,9 +55,28 @@ RECENT_DAYS = 7
 CONTENT = frozenset({"loose", "pak"})
 CRASH_PLACES = ("plugin", "reframework", "game", "gpu", "root_dll", "system", "other", "unknown", "named",
                 "corrupted_pak")
-# graphics device errors the game's own crash report names (crashlog.GameReport.device_error) that point at the
-# graphics driver or settings more than at mods (the graphics card stopped answering)
-DRIVER_ERRORS = ("DEVICE_HUNG", "DEVICE_RESET", "DRIVER_INTERNAL_ERROR")
+# graphics errors the game reports itself (crashlog.GameReport.device_error; a removed device by its reason) where the
+# graphics card could not finish the work the game gave it ("badly formed commands", Microsoft's DXGI documentation).
+# In a modded game that work often comes from a mod: a model made before a game update, a broken or huge texture, a
+# stale material, a shader, a graphics plugin. A driver or a setting is another cause, not the presumed one: such a
+# crash is evidence for the mods that give the graphics card work, never for "not the mods"
+HUNG_ERRORS = ("DEVICE_HUNG", "DEVICE_RESET")
+# what the graphics card draws with or works on itself: file types (loose files, pak entries the bundled list names)
+# and their names - models, textures, materials, shaders, and what runs on the graphics card: effects (GPU particles),
+# GPU cloth, GPU buffers, fur
+RENDER_TYPES = {"mesh": "모델", "tex": "텍스처", "mdf2": "재질", "mmtr": "셰이더", "efx": "이펙트", "gpuc": "GPU 옷감",
+                "gpbf": "GPU 버퍼", "sfur": "털"}
+RENDER_ORDER = ("모델", "텍스처", "재질", "셰이더", "이펙트", "GPU 옷감", "GPU 버퍼", "털")
+# files of graphics plugins in the game folder: the proxies ReShade, OptiScaler and fakenvapi use, and ReShade's own
+GRAPHICS_DLLS = frozenset({"dxgi.dll", "d3d11.dll", "d3d12.dll", "nvngx.dll", "nvapi64.dll"})
+GRAPHICS_FOLDERS = ("reshade-shaders/", "d3d12/")
+GRAPHICS_EXTS = (".fx", ".fxh", ".addon", ".addon64")
+GRAPHICS_NAMES = ("reshade", "optiscaler")
+# the multipliers (guesses: the pivot rule decides) - (render data, the same with files that do not fit this game
+# version, a pak mod whose files are not known): for DEVICE_HUNG and DEVICE_RESET, and for any other graphics crash
+GPU_HUNG = (2.5, 3.0, 1.6)
+GPU_OTHER = (1.5, 2.0, 1.2)
+GPU_NO_RENDER = 0.8  # Lua scripts and data files only (no RENDER_TYPES): they give the graphics card no work
 
 
 @dataclass
@@ -207,14 +226,35 @@ def _is_script(info: ModInfo) -> bool:
                for f in info.files)
 
 
+def _ext(path: str) -> str:
+    """A game file's type (``natives/STM/x.tex.241106027`` -> "tex")."""
+    name = crashlog.resource_key(path).rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[-1] if "." in name else ""
+
+
 def _types(info: ModInfo) -> set[str]:
     """File types of a mod's loose files (tex, mesh, user...)."""
-    out = set()
+    return {_ext(f) for f in info.files if f.replace("\\", "/").lower().startswith("natives/")}
+
+
+def _render(types: Iterable[str]) -> list[str]:
+    """The names of the render data among file types ("모델", "텍스처" ...), in RENDER_ORDER."""
+    found = {RENDER_TYPES[t] for t in types if t in RENDER_TYPES}
+    return [x for x in RENDER_ORDER if x in found]
+
+
+def _is_graphics_plugin(info: ModInfo) -> bool:
+    """The mod places a graphics plugin in the game folder (ReShade, OptiScaler, an upscaler or frame generation
+    DLL, a D3D12 runtime)."""
     for f in info.files:
-        if f.replace("\\", "/").lower().startswith("natives/"):
-            name = crashlog.resource_key(f).rsplit("/", 1)[-1]
-            out.add(name.rsplit(".", 1)[-1] if "." in name else "")
-    return out
+        low = f.replace("\\", "/").lower()
+        if low.startswith(("natives/", "reframework/")):
+            continue
+        name = low.rsplit("/", 1)[-1]
+        if low.startswith(GRAPHICS_FOLDERS) or name in GRAPHICS_DLLS or name.endswith(GRAPHICS_EXTS) \
+                or name.startswith(GRAPHICS_NAMES) or (name.endswith(".dll") and crashlog.game_place(low)[0] == "gpu"):
+            return True
+    return False
 
 
 def _faulty_name(evidence: list[str]) -> str:
@@ -253,6 +293,7 @@ class _Builder:
         self.where = ""  # crashes.crash_where of the record
         self.crash_at: float | None = None
         self.refw_old = False
+        self.graphic = False  # a graphics crash: render data is weighed in graphics(), not by the kind of mod
         self.history_crashes: list[dict] = []
 
     # ---- recording the effects
@@ -435,17 +476,6 @@ class _Builder:
             for x in self.on:
                 if _is_script(self.mods[x]):
                     self.weight(x, "W8", 1.5, "튕긴 곳이 REFramework(dinput8.dll) 안입니다 (Lua 스크립트가 그 안에서 실행됨)")
-        elif category == "gpu":
-            self.none("W9", 2.0, "그래픽(D3D12) 쪽에서 튕겨 모드 문제가 아닐 수도 있습니다")
-            if self.ev.device_error in DRIVER_ERRORS:  # (the game's own report: the graphics card stopped answering)
-                self.none("W9b", 2.0, f"그래픽카드가 응답하지 않는 오류({self.ev.device_error})는 대개 그래픽 드라이버·설정 "
-                          "문제입니다")
-            for x in self.on:
-                info = self.mods[x]
-                if _types(info) & {"tex", "mesh"}:
-                    self.weight(x, "W9", 1.5, "그래픽(D3D12) 쪽에서 튕겼고 이 모드에 텍스처·모델 파일이 있습니다")
-                elif _is_plugin(info) or _is_script(info):
-                    self.weight(x, "W9", 0.7)
         elif category == "unknown":
             for x in self.on:
                 if _is_plugin(self.mods[x]) or _is_script(self.mods[x]):
@@ -455,6 +485,68 @@ class _Builder:
             self.none("W11", 1.5, "Windows 시스템 파일에서 튕겼습니다")
         elif category == "other":
             self.none("W12", 3.0, "튕긴 곳이 매니저가 넣지 않은 파일입니다")
+        if category == "gpu" or self.ev.device_error:
+            self.graphics()
+
+    def graphics(self) -> None:
+        """A crash in the graphics runtime or driver, or a graphics error the game reported itself: the mods that give
+        the graphics card work - models, textures, materials, shaders, effects, GPU cloth, fur (RENDER_TYPES), graphics
+        plugins - more (most for DEVICE_HUNG and DEVICE_RESET, the card given work it could not finish; more again with
+        files that do not fit this game version), Lua scripts and data files a little less. Never "not the mods": a
+        driver or a setting shows in the launches with every mod off."""
+        self.graphic = True
+        error = self.ev.device_error
+        render_f, stale_f, pak_f = GPU_HUNG if error in HUNG_ERRORS else GPU_OTHER
+        lead = f"게임이 그래픽 오류({error})로 멈췄고" if error else "그래픽(D3D12) 쪽에서 튕겼고"
+        stale = {ref.id for ref in self.inputs.index.mods.values() if ref.stuck or ref.material_state == "stale"}
+        paks = None
+        for x in self.on:
+            info = self.mods[x]
+            render = _render(_types(info))
+            unknown = False
+            if not render and "pak" in info.kinds:
+                if paks is None:
+                    try:
+                        paks = self._pak_types()
+                    except Exception as exc:  # (then no pak mod's files are known)
+                        log.warning("PAK 모드의 파일 종류를 읽지 못했습니다: %s", exc)
+                        paks = {}
+                types, whole = paks.get(x, (set(), False))
+                render, unknown = _render(types), not whole
+            if render:
+                self.weight(x, "W9", stale_f if x in stale else render_f,
+                            f"{lead} 이 모드에 {'·'.join(render)} 파일이 있습니다")
+            elif _is_graphics_plugin(info):
+                self.weight(x, "W9", render_f, f"{lead} 이 모드는 그래픽 플러그인(ReShade·업스케일러·프레임 생성 등)입니다")
+            elif unknown:
+                self.weight(x, "W9", pak_f, f"{lead} 이 모드의 PAK에 모델·텍스처가 들어 있을 수 있습니다")
+            elif x not in stale and not _is_plugin(info) and (_is_script(info) or _types(info) or "pak" in info.kinds):
+                self.weight(x, "W9", GPU_NO_RENDER)
+
+    def _pak_types(self) -> dict[str, tuple[set[str], bool]]:
+        """mod -> (file types of its pak entries the bundled list of the game's paths names, every entry named) for
+        the mods on with a pak in the game folder (reads the pak tables; the list is built on first use)."""
+        index = self.inputs.index
+        names = None
+        out: dict[str, tuple[set[str], bool]] = {}
+        for mod, rel, _rank in index.pak_paths():
+            if mod not in self.on_set:
+                continue
+            types, whole = out.get(mod, (set(), True))
+            pak = index.pak_file(rel)
+            if pak is None:
+                out[mod] = (types, False)
+                continue
+            if names is None:
+                names = accessed.PakNames(Path(self.inputs.data_dir) / "cache")
+            for h in pak.hashes:
+                name = names(int(h))
+                if name:
+                    types.add(_ext(name))
+                else:
+                    whole = False
+            out[mod] = (types, whole)
+        return out
 
     def access(self) -> None:
         """The mods whose files the game asked for in the last seconds before the crash."""
@@ -492,7 +584,7 @@ class _Builder:
             self.ev.notes.append(f"재질 점검: 이 게임 버전과 맞지 않는 파일이 있는 모드 {flagged}개")
 
     def kinds(self) -> None:
-        """What kind of mod it is (plugins crash the game more often than textures)."""
+        """What kind of mod it is (plugins crash the game more often than textures - except in a graphics crash)."""
         for x in self.on:
             info = self.mods[x]
             types = _types(info)
@@ -502,7 +594,7 @@ class _Builder:
                 self.weight(x, "W17", 1.3)
             elif types & {"user", "pfb", "scn"}:
                 self.weight(x, "W17", 1.5)
-            elif types == {"tex"} and info.kinds == {"loose"}:
+            elif types == {"tex"} and info.kinds == {"loose"} and not self.graphic:
                 self.weight(x, "W17", 0.6)
 
     def recent(self) -> None:

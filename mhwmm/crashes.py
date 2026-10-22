@@ -361,7 +361,7 @@ class Session:
         s = self.summary
         parts = [_when(s.get("crash_time") or self.end_time, now)]
         if s.get("device_error"):
-            parts.append(f"그래픽 장치 오류 ({s['device_error']})")
+            parts.append(f"그래픽 오류 ({s['device_error']})")
         elif s.get("crash"):
             parts.append(f"오류 코드 {exception_label(s['crash'])}")
         elif s.get("game_report"):
@@ -1612,8 +1612,9 @@ def crash_finding(place: str, bases: Sequence[str], index: ModIndex, evidence: l
         return Finding("game", "게임 본체에서 오류가 났습니다. 기록만으로는 어떤 모드인지 알 수 없습니다.", evidence, [], "info",
                        "bisect")
     if category == "gpu":
-        return Finding("gpu", "그래픽(D3D12) 쪽에서 오류가 났습니다. 드라이버·오버레이·프레임 생성 설정이나 텍스처·모델 모드가 "
-                       "원인일 수 있어 기록만으로는 모드를 알 수 없습니다.", evidence, [], "info", "bisect")
+        return Finding("gpu", "그래픽(D3D12) 쪽에서 오류가 났습니다. 모드의 모델·텍스처·재질 파일이나 그래픽 플러그인이 "
+                       "그래픽카드에 잘못된 작업을 보내도 이렇게 나고, 드라이버·오버레이·프레임 생성 설정 때문일 수도 있어 "
+                       "기록만으로는 모드를 알 수 없습니다.", evidence, [], "info", "bisect")
     if category == "root_dll" and rel in crashlog.PROXY_DLLS:  # never a file of the game
         return Finding("root_dll", f"게임 폴더에 직접 넣은 '{name}'에서 오류가 났습니다. 매니저가 넣은 파일이 아닙니다"
                        "(ReShade·OptiScaler 같은 프로그램일 수 있음) → 이 파일을 빼고 다시 해 보세요", evidence, [], "high")
@@ -1799,8 +1800,9 @@ def _setup_findings(info: LogInfo, bases: Sequence[str], index: ModIndex) -> lis
     if info.present_errors:
         names = {"-7785fffb": "DEVICE_REMOVED", "-7785fffa": "DEVICE_HUNG", "-7785fff9": "DEVICE_RESET"}
         shown = ", ".join(names.get(c, c) for c in info.present_errors[:3])
-        out.append(Finding("present", f"그래픽 장치 오류가 기록되어 있습니다({shown}). 드라이버·VRAM 부족·오버레이 문제일 수 "
-                           "있습니다.", [f"Present failed: {c}" for c in info.present_errors[:3]], [], "low"))
+        out.append(Finding("present", f"그래픽 오류가 기록되어 있습니다({shown}). 모드의 모델·텍스처·재질 파일이나 그래픽 "
+                           "플러그인, 드라이버·VRAM 부족·오버레이 때문일 수 있습니다.",
+                           [f"Present failed: {c}" for c in info.present_errors[:3]], [], "low"))
     return out
 
 
@@ -1914,7 +1916,7 @@ def _report_finding(report: crashlog.GameReport) -> Finding:
     """The lead finding of a session the game's own crash reporter recorded (REFramework saw no error)."""
     evidence = [e for e in (report.message, f"예외 코드: {exception_label(report.code)}" if report.code else "") if e]
     if report.device_error:
-        return Finding("game_report", f"그래픽 장치 오류({report.device_error})로 게임이 멈췄고, 게임이 스스로 오류 보고서"
+        return Finding("game_report", f"그래픽 오류({report.device_error})로 게임이 멈췄고, 게임이 스스로 오류 보고서"
                        "(CrashReport)를 만든 뒤 종료했습니다. 이런 오류는 REFramework 기록에 남지 않습니다.", evidence,
                        [], "info")
     return Finding("game_report", "게임이 스스로 오류를 잡아 오류 보고서(CrashReport)를 만든 뒤 종료했습니다. 이런 오류는 "
@@ -1942,7 +1944,7 @@ def _summary(session: Session | None, info: LogInfo | None, builds, now, running
     elif report:
         parts = [f"{_when(session.summary.get('crash_time') or session.end_time, now)} 종료"]
         if session.summary.get("device_error"):
-            parts.append(f"그래픽 장치 오류 ({session.summary['device_error']})")
+            parts.append(f"그래픽 오류 ({session.summary['device_error']})")
         elif session.summary.get("crash"):
             parts.append(f"오류 코드 {exception_label(session.summary['crash'])}")
         parts.append("게임 오류 보고서")
@@ -1983,18 +1985,26 @@ def explain_text(text: str, index: ModIndex, session: Session | None = None) -> 
         evidence = [f"Fatal D3D error ({number}, {name}, {hresult})"
                     + (f" DeviceRemovedReason({reason})" if reason else "")]
         removed = crashlog.DXGI_ERRORS.get(reason.removeprefix("0x"), "") if reason else ""
+        error = removed or name.removeprefix("DXGI_ERROR_")
         if name in crashlog.D3D_OUT_OF_MEMORY or removed == "E_OUTOFMEMORY":
             out.append(Finding("d3d", "그래픽 메모리(VRAM)가 모자라 게임이 멈췄습니다 → 그래픽 설정이나 고해상도 텍스처 모드를 "
                                "줄여 보세요", evidence, [], "info"))
-        elif removed in ("DEVICE_HUNG", "DEVICE_RESET", "DRIVER_INTERNAL_ERROR"):
-            out.append(Finding("d3d", f"그래픽카드가 응답하지 않아({removed}) 그래픽 드라이버가 장치를 다시 시작했고, 그래서 게임이 "
-                               "멈췄습니다. 대개 그래픽 드라이버, 레이 트레이싱, 프레임 생성, GPU 오버클럭·언더볼트, 화면 위 "
-                               "오버레이(녹화·FPS 표시) 때문이고, 모드가 원인인 경우는 드뭅니다(셰이더·모델·고해상도 텍스처 모드는 "
-                               "가능) → 레이 트레이싱과 프레임 생성을 끄고, 그래픽 드라이버를 새로 설치하거나 이전 버전으로 바꿔 "
-                               "보세요. 모드를 모두 끄면 괜찮다면 원인 모드 찾기를 해 보세요", evidence, [], "info", "bisect"))
+        elif error in ("DEVICE_HUNG", "DEVICE_RESET"):  # ("badly formed commands": Microsoft's DXGI documentation)
+            out.append(Finding("d3d", f"게임이 그래픽카드에 보낸 그리기 작업을 그래픽카드가 끝내지 못해({error}) Windows가 "
+                               "그래픽카드를 다시 시작했고, 그래서 게임이 멈췄습니다. 그래픽카드가 고장 났다는 뜻은 대개 아닙니다. "
+                               "잘못 만들어진 작업 때문인데, 모드를 쓰면 모드의 모델·텍스처·재질·셰이더 파일(특히 게임 업데이트 "
+                               "전에 만든 것)이나 그래픽 플러그인(ReShade·업스케일러 등) 때문인 경우가 많고, 그래픽 드라이버, GPU "
+                               "오버클럭·언더볼트, 프레임 생성, 화면 위 오버레이(녹화·FPS 표시)도 원인일 수 있습니다 → 재질 "
+                               "점검·복구를 해 보고 원인 모드 찾기로 좁혀 보세요. 모든 모드를 꺼도 튕기면 그래픽 드라이버와 설정을 "
+                               "확인해 보세요", evidence, [], "info", "bisect"))
+        elif error == "DRIVER_INTERNAL_ERROR":
+            out.append(Finding("d3d", "그래픽 드라이버 안에서 문제가 생겨(DRIVER_INTERNAL_ERROR) 게임이 멈췄습니다 → 먼저 그래픽 "
+                               "드라이버를 새로 설치해 보세요. 모드의 모델·텍스처·재질 파일이나 그래픽 플러그인 때문일 수도 있으니, "
+                               "그래도 튕기면 원인 모드 찾기로 좁혀 보세요", evidence, [], "info", "bisect"))
         else:
-            out.append(Finding("d3d", f"그래픽 오류({name})로 게임이 멈췄습니다. 드라이버·오버레이·프레임 생성 설정이나 텍스처·모델 "
-                               "모드가 원인일 수 있어 기록만으로는 모드를 알 수 없습니다.", evidence, [], "info", "bisect"))
+            out.append(Finding("d3d", f"그래픽 오류({name})로 게임이 멈췄습니다. 모드의 모델·텍스처·재질 파일이나 그래픽 플러그인, "
+                               "드라이버·오버레이·프레임 생성 설정이 원인일 수 있어 기록만으로는 모드를 알 수 없습니다.", evidence, [],
+                               "info", "bisect"))
     for where in found.unhandled:
         out.append(Finding("unhandled", "게임 본체에서 처리되지 않은 오류가 났습니다. 기록만으로는 어떤 모드인지 알 수 없습니다. "
                            "시작하자마자 난다면 REFramework가 게임 버전에 맞지 않거나 pak_mods의 PAK이 너무 많을 수 있습니다.",

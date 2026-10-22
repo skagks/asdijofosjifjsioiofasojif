@@ -186,7 +186,8 @@ def test_the_last_normal_exit():
         d, steps = run(units, req, lambda on, c=c: c in on,
                        passive=[report, Obs(good, False, rho=0.15, e=0.02, source="last_good")])
         assert d.kind == "found" and d.mods == (c,)
-    assert sum(launches) / len(launches) <= 5.6
+    # (5 launches and, the search being this short, one with every mod off before naming it: Params.none_controls)
+    assert sum(launches) / len(launches) <= 6.0
 
 
 def test_a_short_play_counts_little():
@@ -442,9 +443,9 @@ def test_older_crashes_from_before_the_culprit_never_name_another_mod():
     assert all(launches[(k, 0.25)] < launches[(k, 0.02)] for k in (1, 3, 5))
 
 
-def test_a_graphics_device_error_needs_launches_with_every_mod_off():
-    # DEVICE_HUNG and the like come and go without mods: the "rare" prior and two fine launches with every mod off
-    # before a mod is named
+def test_launches_with_every_mod_off_before_a_mod_is_named():
+    # Params.controls: two fine launches with every mod off before a mod is named, with the "rare" prior - what v2.2.5
+    # stored for a graphics error record (new searches use 0); a search it started goes on with them
     us, units, req = setup(10)
     p = Params(r_prior=be.R_PRIORS["rare"], controls=2)
     for c in us:
@@ -466,6 +467,151 @@ def test_a_graphics_device_error_needs_launches_with_every_mod_off():
         counts.append(got)
     assert counts[1] <= 4 and counts[1] < counts[0]
     assert Params.from_dict(json.loads(json.dumps(p.to_dict()))) == p
+
+
+def not_the_mods(local, r=0.7):
+    """Answers of a game that crashes r of the time whatever is on (2% other crashes, 2% wrong answers)."""
+    return lambda on, k: (local.random() < r or local.random() < 0.02) != (local.random() < 0.02)
+
+
+def test_not_the_mods_coming_and_going_is_checked_with_every_mod_off():
+    # a crash that comes and goes whatever is on can look like any mod (the search converges on one and its pivot pairs
+    # come by chance). A search started now runs the game with every mod off before naming a cause while "not the
+    # mods" keeps P >= none_controls (Params.current): it names an innocent mod far less often than the rule of a
+    # search stored without it (the field defaults), whatever the record says
+    us, units, req = setup(12)
+    named_by = {}
+    for label, params in (("stored", Params()), ("current", Params.current())):
+        rnd = random.Random(31)
+        got = 0
+        for k in range(60):
+            prior = None if k % 2 else Prior(shares={us[k % 12]: 0.5})  # (half of them with a misleading record)
+            d, _steps = simulate(units, req, not_the_mods(random.Random(rnd.random())), params=params, prior=prior)
+            got += d.kind in NAMED
+        named_by[label] = got
+    assert named_by["current"] <= 6 and named_by["current"] <= 0.5 * named_by["stored"], named_by  # (13 -> 5)
+    assert Params().none_controls == 0 and Params().max_controls == 0  # (the stored rule: none of these launches)
+
+
+def test_launches_with_every_mod_off_only_while_not_the_mods_keeps_some_probability():
+    # exact answers: a launch with every mod off ("control") comes only when a cause could be named and P(not the
+    # mods) >= none_controls; the culprit is named once it is under it (or after max_controls fine ones), on average
+    # with less than one such launch
+    p = Params.current()
+    assert p.none_controls > 0 and p.max_controls >= 2
+    us, units, req = setup(20)
+    controls = []
+    for c in us:
+        eng = Engine(units, req)
+        eng.add(Obs(frozenset(units), True, e=0.02, source="report"))
+        asked = 0
+        while True:
+            d = eng.decide()
+            if d.kind != "test":
+                break
+            if d.reason == "control":
+                asked += 1
+                assert not d.on and d.mods == (c,) and eng.p_of("none", ()) >= p.none_controls
+            eng.add(Obs(d.on, c in d.on))
+        assert d.kind == "found" and d.mods == (c,)
+        assert eng.p_of("none", ()) < p.none_controls or asked == p.max_controls
+        assert asked <= p.max_controls
+        controls.append(asked)
+    assert any(controls) and sum(controls) / len(controls) < 1.0
+
+
+def test_short_launches_with_every_mod_off_count_toward_max_controls():
+    # 한동안 / 가끔 (timed fine answers): a launch with every mod off played far shorter than the crash takes barely
+    # lowers P(not the mods), yet it counts toward max_controls however long it ran - otherwise the same launch came
+    # back again and again up to the budget. A crash there only raises P(not the mods): never more than max_controls
+    # fine ones before a cause is named, and none asked for once there are that many
+    us, units, req = setup(20)
+    capped = 0
+    for rules in ({}, be.WHEN_RULES["rare"]):
+        p = Params.current(r_prior=be.R_PRIORS["rare" if rules else "middle"], timed_fine=True, **rules)
+        for c in us[::3]:
+            for crash_first in (False, True):
+                eng = Engine(units, req, params=p, crash_times=[1200.0])
+                eng.add(Obs(frozenset(units), True, e=0.02, seconds=1200.0, source="report"))
+                fine_off = crashed_off = launches = 0
+                while True:
+                    d = eng.decide()
+                    if d.kind != "test":
+                        break
+                    launches += 1
+                    if d.reason == "control":
+                        assert not d.on and fine_off < p.max_controls
+                    if not d.on:  # (5 minutes against a crash at 20: g about 0.01)
+                        crashed = crash_first and not crashed_off and d.reason == "control"
+                        crashed_off += crashed
+                        fine_off += not crashed
+                        eng.add(Obs(d.on, crashed, seconds=1200.0 if crashed else 300.0))
+                    else:
+                        crashed = c in d.on
+                        eng.add(Obs(d.on, crashed, seconds=1200.0 if crashed else 3600.0))
+                assert fine_off <= p.max_controls and launches <= be.budget(len(units), 0, p)
+                if not crash_first:
+                    assert d.kind == "found" and d.mods == (c,)
+                capped += fine_off == p.max_controls
+    assert capped  # (the cap is what ended them: P(not the mods) stayed above none_controls)
+
+
+def test_launches_with_every_mod_off_after_the_launches_about_the_kind():
+    # the other place a cause is named: after the launches about its kind (or the other causes) when none of them is
+    # worth making any more - the launches with every mod off come first there too. (With the shipped thresholds a
+    # naming seldom ends that way; tau_exact 1 and min_gain 1e9 send every naming there.)
+    us, units, req = setup(6)
+    rest = frozenset(units) - {"u0"}
+    obs = [Obs(frozenset(units), True, e=0.02, source="report"), Obs(frozenset({"refw", "u0"}), True), Obs(rest, False),
+           Obs(frozenset({"refw", "u0", "u1", "u2"}), True), Obs(frozenset({"refw", "u1", "u2"}), False)]
+    for params, controls in ((Params.current(tau_exact=1.0, min_gain=1e9, none_controls=1e-9, max_controls=2), 2),
+                             (Params(tau_exact=1.0, min_gain=1e9), 0)):  # (the stored rule: named at once)
+        eng = Engine(units, req, params=params)
+        for o in obs:
+            eng.add(o)
+        for _ in range(controls):
+            d = eng.decide()
+            assert d.kind == "test" and d.reason == "control" and not d.on and d.mods == ("u0",)
+            eng.add(Obs(d.on, False))
+        d = eng.decide()
+        assert d.kind == "found" and d.mods == ("u0",)
+
+
+@pytest.mark.parametrize("n", [12, 20])
+def test_the_estimate_counts_the_launches_with_every_mod_off_still_to_come(n):
+    # until a suspect is near being named, the launches with every mod off a naming may still need are in the upper
+    # bound of the remaining-launch estimate (with 가끔 they come before nearly every naming): an exact search always
+    # ends within the range shown at each step ("앞으로 약 N~M번")
+    us, units, req = setup(n)
+    for params in (Params.current(), Params.current(r_prior=be.R_PRIORS["rare"], **be.WHEN_RULES["rare"])):
+        controls = 0
+        for c in us:
+            d, steps = run(units, req, lambda on, c=c: c in on, params=params)
+            assert d.kind == "found" and d.mods == (c,)
+            controls += sum(1 for s in steps if s.reason == "control")
+            for k, s in enumerate(steps):
+                lo, hi = s.remaining
+                assert lo <= len(steps) - k <= hi, (params.none_controls, c, k, s.remaining, len(steps))
+        assert controls
+
+
+def test_a_search_stored_before_the_launches_with_every_mod_off_keeps_its_rule():
+    # parameters stored without none_controls / max_controls (v2.2.5, v2.2.6 before them) read back as the field
+    # defaults: the same launches as before, none asked for "not the mods"; a search started now round-trips its own
+    us, units, req = setup(12)
+    stored = Params().to_dict()
+    del stored["none_controls"], stored["max_controls"]
+    old = Params.from_dict(json.loads(json.dumps(stored)))
+    assert old == Params() and old.none_controls == 0 and old.max_controls == 0
+    assert Params.from_dict(json.loads(json.dumps(Params.current().to_dict()))) == Params.current()
+    assert Params.from_dict({**stored, "none_controls": 2.0, "max_controls": -1}) == Params()  # (out of range)
+    rnd = random.Random(8)
+    for _ in range(12):
+        seed = rnd.random()
+        d, steps = simulate(units, req, not_the_mods(random.Random(seed)), params=old)
+        assert not any(s.reason == "control" for s in steps)
+        again, steps2 = simulate(units, req, not_the_mods(random.Random(seed)), params=Params())
+        assert [s.on for s in steps] == [s.on for s in steps2] and (d.kind, d.mods) == (again.kind, again.mods)
 
 
 def test_one_more_check_after_a_record_that_pointed_at_the_culprit():
@@ -528,7 +674,8 @@ def test_one_more_check_of_two_mods_that_each_crash_never_repeats_a_launch(n):
 
 def test_a_single_mod_that_crashes_now_and_then_is_named():
     # one unit and the "rare" prior: three pairs are needed and no one launch adds the third (it takes a crash and a
-    # fine run), so the search plans both rather than stopping unsure with nothing left to learn
+    # fine run), so the search plans both rather than stopping unsure with nothing left to learn (also with the
+    # controls of a search v2.2.5 started from a graphics error record)
     for params in (Params(r_prior=be.R_PRIORS["rare"]), Params(r_prior=be.R_PRIORS["rare"], controls=2)):
         d, steps = run(["x"], {}, lambda on: "x" in on, params=params)
         assert d.kind == "found" and d.mods == ("x",), (params.controls, [s.on for s in steps])

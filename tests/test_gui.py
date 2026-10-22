@@ -1406,13 +1406,17 @@ def test_gui_bisect_start_window(root, monkeypatch, tmp_path):
     assert "disabled" in dialog.log_check.state()
     assert not any("그래픽" in t for t in shown)
     dialog.destroy()
-    # already on (REFramework settings): ticked, nothing to change; a graphics device error says what to try first
-    device = v2_plan(Ev(device_error="DEVICE_HUNG", none_scale=4.0))
+    # already on (REFramework settings): ticked, nothing to change. A graphics error record (DEVICE_HUNG) is a crash like
+    # any other: its title line and the render data mods' 근거, no box telling the user to check the drivers first
+    line = "게임이 그래픽 오류(DEVICE_HUNG)로 멈췄고 이 모드에 모델·텍스처 파일이 있습니다"
+    device = v2_plan(Ev(device_error="DEVICE_HUNG", record_title="10월 21일 18:46 · 그래픽 오류 (DEVICE_HUNG)",
+                        weights={"m3": 2.5}, reasons={"m3": [line]}))
     dialog = gui.BisectStartDialog(root, theme, device, "", accessed.Offer(True, True, accessed.LOG_ALREADY))
     shown = texts(dialog)
     assert dialog.log_var.get() and "disabled" in dialog.log_check.state() and accessed.LOG_ALREADY in shown
-    assert device.device_note() in shown and "그래픽카드가 응답하지 않는 오류(DEVICE_HUNG)" in device.device_note()
-    assert v2_plan(Ev(device_error="DEVICE_REMOVED")).device_note() == ""
+    assert "게임 튕김 기록: 10월 21일 18:46 · 그래픽 오류 (DEVICE_HUNG)" in shown and f"근거: {line}" in shown
+    assert not any("드라이버" in t or "드뭅니다" in t or "그래픽카드" in t for t in shown)
+    assert not hasattr(device, "device_note")
     dialog.destroy()
     # a window taller than the screen scrolls (its buttons stay under it)
     monkeypatch.setattr(gui.BisectStartDialog, "winfo_screenheight", lambda self: 500)

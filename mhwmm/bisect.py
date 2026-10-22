@@ -20,9 +20,14 @@ probabilities).  Units are every enabled mod with files that reaches the game (R
 libraries too); a unit on brings what it requires, and a mod whose files another overwrites brings
 that mod (a test never loads a copy of a file the user's own setup never loads).  Mods that need
 an option first, mods whose files all lose to others (on only with every mod covering them) and
-files the manager did not place are left out and listed.  A record of a graphics device error the
-game reported itself asks for launches with every mod off first.  Every result is a suspicion with a
-probability and its evidence.
+files the manager did not place are left out and listed.  Before a mod is named, the game runs with
+every mod off while "not the mods" keeps some probability (up to five fine launches: a crash that
+comes and goes whatever is on can otherwise look like any mod; Params.none_controls).  A record of a
+graphics error the game reported itself (DEVICE_HUNG ...) is a crash like any other: it raises the
+suspicion of mods with render data (evidence), not of "not the mods" (a search started by v2.2.5
+from such a record keeps the two launches with every mod off it asked for first, a search started
+before this release keeps its rules: the parameters stored with it).  Every result is a suspicion
+with a probability and its evidence.
 
 A search started by v2.2.2/v2.2.3 (format 1) goes on with the search it started with (``_Search``
 below: a fixed halving, kept unchanged for those sessions only).
@@ -92,16 +97,6 @@ NO_EVIDENCE_KINDS = ("기록에서 특별히 의심되는 모드가 없습니다
                      "다르게 매겼습니다.")
 CONFIRM_NOTE = "한 번 더 실행해 확인하면 더 확실해집니다 (답 하나가 틀렸더라도 결과가 바뀌지 않도록 이미 확인했습니다)."
 WEAK_ANSWER = " · 이번 답은 약하게만 반영했습니다(지난번 튕긴 시점보다 짧게 실행)"
-# the record is a graphics device error the game reported itself (evidence.DRIVER_ERRORS): drivers and settings first
-DRIVER_ERRORS = ("DEVICE_HUNG", "DEVICE_RESET", "DRIVER_INTERNAL_ERROR")
-DEVICE_NOTE = ("이번 튕김은 그래픽카드가 응답하지 않는 오류({error})입니다. 이 오류는 대개 그래픽 드라이버, 레이 트레이싱, 프레임 "
-               "생성, GPU 오버클럭·언더볼트, 화면 위 오버레이(녹화·FPS 표시) 때문이고 모드가 원인인 경우는 드뭅니다. 먼저 레이 "
-               "트레이싱과 프레임 생성을 끄고, 그래픽 드라이버를 새로 설치하거나 이전 버전으로 바꿔 보세요. 그래도 튕기면 원인 모드 "
-               "찾기로 모드 때문인지 확인할 수 있습니다.")
-DEVICE_RESULT_NOTE = ("처음 튕김 기록은 그래픽카드가 응답하지 않는 오류({error})였습니다. 이 오류는 모드 없이도 가끔 나므로, 이 "
-                      "결과대로 한 뒤에도 튕기면 그래픽 드라이버, 레이 트레이싱, 프레임 생성, GPU 오버클럭·언더볼트, 화면 위 "
-                      "오버레이를 먼저 확인해 보세요.")
-DEVICE_CONTROLS = 2  # a graphics device error: fine launches with every mod off before a mod is named
 UNAPPLIED = " 게임을 실행하면 먼저 게임 폴더에 적용합니다."
 
 KINDS = ("half", "base", "last_good", "confirm", "partner", "again", "full", "everything_off", "core",
@@ -117,7 +112,18 @@ PLAY = {"start": "타이틀 화면을 지나 저장 데이터를 불러올 때�
 REASON_TEXT = {"split": "나눠 보기", "full": "모두 켜기", "everything_off": "모두 끄기", "confirm_crash": "확인(튕기는지)",
                "confirm_fine": "확인(괜찮은지)", "others": "다른 원인 확인", "kind": "원인의 종류 확인",
                "dry": "다시 모두 켜기", "control": "모드 없이 확인"}
-CONTROL_TEXT = "그래픽카드 오류는 모드 없이도 나는 경우가 많아, 모든 모드를 꺼도 괜찮은지 확인합니다. "
+# a launch with every mod off before a mod is named (Params.none_controls; Params.controls of a v2.2.5 search)
+CONTROL_TEXT = "모드 없이도 튕기는지 한 번 확인합니다. "
+CONTROL_AGAIN = "모드 없이도 튕기는지 한 번 더 확인합니다. "  # (after launches with every mod off, all fine)
+# (after launches with every mod off of which some crashed - off_crash_text: a crash there only raises "not the mods")
+CONTROL_AFTER_CRASH = "{crashes} 모드 문제가 아닐 수도 있어 모드 없이 한 번 더 확인합니다. "
+CONTROL_FINE = "모든 모드를 끈 실행 {fine}번은 괜찮았습니다."  # (a named result's 근거)
+CONTROL_SOME = "모든 모드를 끈 실행 {count}번 중 {fine}번 괜찮았습니다."
+CONTROL_NONE_FINE = "모든 모드를 끈 실행 {count}번 모두 튕겼습니다."
+OFF_CRASHED = "모든 모드를 꺼도 튕겼습니다"  # (the line after such an answer: how "not the mods" moved)
+# (a named result after a launch with every mod off crashed: what to look at if turning the mods off is not enough)
+OFF_CRASH_NOTE = ("모든 모드를 끈 실행에서도 {count}번 튕겼습니다. 결과대로 모드를 끈 뒤에도 가끔 튕기면 모드 문제가 아닐 수 "
+                  "있으니 Steam의 '게임 파일 무결성 확인', 그래픽 드라이버 업데이트, 오버레이·녹화 프로그램 끄기를 해 보세요.")
 NAMED = ("found", "together", "each", "core")
 
 
@@ -147,6 +153,8 @@ class Step:
     crash_minutes: float | None = None  # when the latest crash came (minutes; the search's own first), timed answers only
     play: str = ""  # what to do in the game (texts)
     off_suspects: int = 0  # suspected mods turned off in this step
+    control: int = 0  # reason "control": the launches with every mod off before this one (0: the first)
+    control_crashed: int = 0  # ... of them the ones that crashed
 
     @property
     def engine(self) -> bool:
@@ -858,7 +866,6 @@ class Plan:
     singles: list = field(default_factory=list)  # (unit, P(only it)) most likely first
     families: dict[str, float] = field(default_factory=dict)  # P of each family of causes
     data: dict = field(default_factory=dict, repr=False)  # what a session starts with (Session.new)
-    device_error: str = ""  # the record is the game's own report of a graphics device error ("DEVICE_HUNG" ...)
 
     @property
     def count(self) -> int:
@@ -896,11 +903,6 @@ class Plan:
     def dominant(self) -> str | None:
         """The top single mod when it has P >= 50%."""
         return self.singles[0][0] if self.singles and self.singles[0][1] >= 0.5 else None
-
-    def device_note(self) -> str:
-        """The record is a graphics device error that points at the driver or settings more than at mods:
-        what to try first ("" otherwise). The search can still be started."""
-        return DEVICE_NOTE.format(error=self.device_error) if self.device_error in DRIVER_ERRORS else ""
 
     def intro(self) -> str:
         if not self.v2:
@@ -1038,7 +1040,7 @@ def _clean_evidence(evidence) -> dict:
             "reasons": reasons, "none_reasons": [str(x) for x in get("none_reasons", [], (list, tuple))][:3],
             "when_hint": get("when_hint", "", str), "minutes_hint": float(minutes) if _num(minutes) and minutes > 0 else None,
             "equipment": equipment, "record": get("record", "", str), "record_title": get("record_title", "", str),
-            "notes": [str(x) for x in get("notes", [], (list, tuple))], "device_error": get("device_error", "", str)}
+            "notes": [str(x) for x in get("notes", [], (list, tuple))]}
 
 
 def make_plan(mods: Sequence[ModFacts], last_good: dict | None = None, game_version: str = "",
@@ -1090,7 +1092,7 @@ def make_plan(mods: Sequence[ModFacts], last_good: dict | None = None, game_vers
         "equipment": [[k, label, list(ids)] for k, label, ids in ev["equipment"]], "names": {m.id: m.name for m in mods},
         "when": when, "minutes": minutes, "minutes_typed": bool(typed), "equip": "", "equip_label": "", "extra": 0,
         "strict": False,
-        "record_title": ev["record_title"], "device_error": ev["device_error"]}
+        "record_title": ev["record_title"]}
     _settle_data(data)
     changes = changes_since(last_good, mods, game_version)
     core = dependency_order(base, req, refw)
@@ -1098,7 +1100,7 @@ def make_plan(mods: Sequence[ModFacts], last_good: dict | None = None, game_vers
                 list(unmanaged[0]), int(unmanaged[1]), changes, game_version, profile, refw_backup=refw_backup,
                 revision=revision, hidden=hidden, masking=masks, content=content, evidence=evidence,
                 prior=Prior.from_dict(data["prior"]), passive=passive, crash_times=list(data["crash_times"]),
-                when=when, minutes=minutes, data=data, device_error=ev["device_error"])
+                when=when, minutes=minutes, data=data)
     view = _View(data)
     eng = view.engine([])
     decision = eng.decide(0)
@@ -1114,14 +1116,16 @@ def make_plan(mods: Sequence[ModFacts], last_good: dict | None = None, game_vers
 
 
 def _settle_data(data: dict) -> None:
-    """The parameters and first crash times that follow from ``when``, ``minutes`` and the record (a graphics
-    device error: the "rare" reproduction prior, and launches with every mod off before a mod is named)."""
+    """The parameters and first crash times that follow from ``when`` and ``minutes``: the rules of a search started
+    now (Params.current: launches with every mod off before a mod is named while "not the mods" keeps some
+    probability, whatever the record - a graphics error record is a crash like any other, its reproduction prior the
+    user's 언제 튕기나요). A search started earlier keeps the parameters it stored (v2.2.5: two control launches after
+    a graphics error record; before this release: none)."""
     when = data.get("when") if data.get("when") in WHEN else "same"
-    device = data.get("device_error") in DRIVER_ERRORS
     typed = data.get("minutes_typed") is True and when == "time"
-    params = Params(r_prior=engine_mod.R_PRIORS["rare" if device else engine_mod.WHEN_PRIOR.get(when, "middle")],
-                    timed_fine=when in ("time", "rare"), passive_times=not typed,
-                    controls=DEVICE_CONTROLS if device else 0)
+    params = Params.current(r_prior=engine_mod.R_PRIORS[engine_mod.WHEN_PRIOR.get(when, "middle")],
+                            timed_fine=when in ("time", "rare"), passive_times=not typed,
+                            **engine_mod.WHEN_RULES.get(when, {}))
     data["params"] = params.to_dict()
     data["r_prior"] = list(params.r_prior)
     passive = [o for o in (Obs.from_dict(x) for x in data.get("passive") or []) if o is not None]
@@ -1344,9 +1348,12 @@ class _View:
         minutes, crash_minutes = self.times(eng)
         suspected = {u for u, x in d.involvement.items() if units and x >= 0.2 / len(units)}
         named = list(d.mods) if d.reason in ("others", "kind") else []
+        bare = [o for o in eng.obs if o.source == "search" and not o.on and not o.unknown] \
+            if d.reason == "control" else []
         return Step(number, number - 1 + hi, kind, on, off, named, "main", d.reason, focus, list(d.ranking), d.suspects,
                     d.ranking[0].p if d.ranking else 0.0, (lo, hi), minutes, crash_minutes,
-                    self.play(minutes, crash_minutes), sum(1 for u in off if u in suspected))
+                    self.play(minutes, crash_minutes), sum(1 for u in off if u in suspected), len(bare),
+                    sum(1 for o in bare if o.crashed))
 
     def result_of(self, d: Decision, eng: Engine, steps: Sequence[dict]) -> Result:
         base = set(self.ids("base"))
@@ -1378,9 +1385,15 @@ class _View:
 
         if result.kind == "unsure":
             return [f"{suspect_label(s, names)} 약 {percent(s.p)}" for s in result.ranking[:3]]
+        bare = [o for o in search if not o.on and not o.unknown]  # (the search's launches with every mod off)
+        bare_crashed = sum(1 for o in bare if o.crashed)
         if result.kind == "not_mods":
-            off = [o for o in crashes if not o.on and not o.unknown]
-            out = [f"모든 모드를 끈 실행 {len(off)}번 모두 튕겼습니다." if off else "모든 모드를 끈 실행에서도 튕겼습니다."]
+            if bare_crashed:  # (each of them, the fine ones too)
+                out = [CONTROL_NONE_FINE.format(count=len(bare)) if bare_crashed == len(bare)
+                       else f"모든 모드를 끈 실행 {len(bare)}번 중 {bare_crashed}번 튕겼습니다."]
+            else:  # (the record's crash with every mod off)
+                off = [o for o in crashes if not o.on and not o.unknown]
+                out = [f"모든 모드를 끈 실행 {len(off)}번 모두 튕겼습니다." if off else "모든 모드를 끈 실행에서도 튕겼습니다."]
             out += [f"기록: {x}" for x in _ids(self.data.get("none_reasons"))[:2]]
             return out
         if result.kind == "no_repro":
@@ -1415,6 +1428,11 @@ class _View:
             alone = eng.mask(eng.close(result.mods))
             if any(o.on and not o.on & ~alone for o in crashes):
                 out.append("이 모드(와 필요한 모드)만 켰을 때도 튕겼습니다.")
+        if bare:
+            bare_fine = len(bare) - bare_crashed
+            out.append(CONTROL_FINE.format(fine=bare_fine) if not bare_crashed
+                       else CONTROL_SOME.format(count=len(bare), fine=bare_fine) if bare_fine
+                       else CONTROL_NONE_FINE.format(count=len(bare)))
         bits = [eng.mask([m]) for m in result.mods]
         if d.family in ("and", "and3") and len(bits) > 1:
             each_fine = all(any(not o.crashed and o.on & b and any(not o.on & c for c in bits if c != b) for o in search)
@@ -1918,6 +1936,11 @@ class Session:
             text = "원인 찾기: " + " · ".join(f"{suspect_label(s, self.names)} {b} → {percent(s.p)}"
                                           for s, b in zip(tied, befores))
         last = self.steps[-1]
+        if last.get("crashed") and not last.get("on"):  # (it only raises "not the mods": say how much)
+            text += f" · {OFF_CRASHED}"
+            h = eng.hypothesis("none", ())
+            if h is not None and not any(s.family == "none" for s in tied):
+                text += f"(모드 문제가 아님 {percent(before_ph.get(h, 0.0))} → {percent(eng.last_ph.get(h, 0.0))})"
         if not last.get("crashed") and eng.obs and eng.obs[-1].source == "search" and eng.obs[-1].g < 0.5:
             text += WEAK_ANSWER  # (how the engine weighed it: play time counts only for 한동안 / 가끔)
         return text
@@ -1929,8 +1952,8 @@ class Session:
 
     def result_lines(self, result: Result, refw: str | None = None) -> list[str]:
         """What the result means (``refw``: the REFramework mod's id)."""
-        return result_lines(result, self.names, refw, self.requires, self.unmanaged[1], self.refw_backup,
-                            "" if self.legacy else str(self.data.get("device_error") or ""))
+        off = 0 if self.legacy else sum(1 for s in self.steps if s.get("crashed") is True and not s.get("on"))
+        return result_lines(result, self.names, refw, self.requires, self.unmanaged[1], self.refw_backup, off)
 
     def step_lines(self) -> list[str]:
         """The answered launches, a line each (the result window): "2번째 · 'X'만 끄고 실행 → 튕김 (0xC0000005) · 12분"."""
@@ -2191,6 +2214,14 @@ def step_text(step: Step, names: dict[str, str], applied: bool = True, refw_back
     return head + body + extra + " " + PLAY_AGAIN
 
 
+def off_crash_text(count: int, crashed: int) -> str:
+    """How the launches with every mod off went when some crashed: "모든 모드를 끈 실행에서도 튕겼습니다." (the one so
+    far), "... 2번 모두 튕겼습니다.", "... 3번 중 1번 튕겼습니다."."""
+    if crashed >= count:
+        return "모든 모드를 끈 실행에서도 튕겼습니다." if count <= 1 else CONTROL_NONE_FINE.format(count=count)
+    return f"모든 모드를 끈 실행 {count}번 중 {crashed}번 튕겼습니다."
+
+
 def _engine_step_text(step: Step, names: Mapping[str, str], applied: bool, refw_backup: bool) -> str:
     head = f"원인 찾기 {step.number}번째 실행: "
     count = len(step.on)
@@ -2200,7 +2231,8 @@ def _engine_step_text(step: Step, names: Mapping[str, str], applied: bool, refw_
     elif step.reason == "kind":
         prefix = "한 모드만의 문제인지, 함께 켰을 때만인지 확인합니다. "
     elif step.reason == "control":
-        prefix = CONTROL_TEXT
+        prefix = CONTROL_TEXT if not step.control else CONTROL_AGAIN if not step.control_crashed else \
+            CONTROL_AFTER_CRASH.format(crashes=off_crash_text(step.control, step.control_crashed))
     q = _quoted(step.focus, names)
     extra = ""
     kind = step.kind if step.on else "everything_off"
@@ -2276,13 +2308,13 @@ def disable_unsure_text(result: Result, names: Mapping[str, str]) -> str:
 
 def result_lines(result: Result, names: dict[str, str], refw: str | None = None,
                  requires: dict[str, list[str]] | None = None, unmanaged: int = 0,
-                 refw_backup: bool = False, device_error: str = "") -> list[str]:
+                 refw_backup: bool = False, off_crashes: int = 0) -> list[str]:
     """What the result means and what to try (under the headline and its 근거). ``refw``: the REFramework
     mod's id; ``refw_backup``: a dinput8.dll placed by hand came back whenever the REFramework mod was off;
-    ``device_error``: the record was a graphics device error (DRIVER_ERRORS: said with a mod's name too)."""
+    ``off_crashes``: launches of the search with every mod off that crashed (a named result: OFF_CRASH_NOTE)."""
     lines = _result_lines(result, names, refw, requires, unmanaged, refw_backup)
-    if device_error in DRIVER_ERRORS and result.kind in (*NAMED, "unsure"):
-        lines.append(DEVICE_RESULT_NOTE.format(error=device_error))
+    if off_crashes > 0 and result.kind in NAMED and result.p is not None:
+        lines.append(OFF_CRASH_NOTE.format(count=off_crashes))
     return lines
 
 

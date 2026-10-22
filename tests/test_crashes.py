@@ -667,6 +667,51 @@ def test_pasted_error_text(game, crash_dir):
     assert crashes.explain_text("RE ENGINE - Aborted", index)[0].action == "bisect"
 
 
+@pytest.mark.parametrize("text, error", [
+    ("Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0006)", "DEVICE_HUNG"),
+    ("Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887A0007)", "DEVICE_RESET"),
+    ("Fatal D3D error (11, DXGI_ERROR_DEVICE_HUNG, 0x887a0006)", "DEVICE_HUNG"),  # (no removed reason: the error itself)
+    ("Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0020)",
+     "DRIVER_INTERNAL_ERROR"),
+    ("Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005)", ""),
+])
+def test_a_graphics_error_is_not_blamed_on_the_graphics_card(game, text, error):
+    # DEVICE_HUNG / DEVICE_RESET: the card could not finish the work the game gave it ("badly formed commands" in
+    # Microsoft's DXGI documentation) - with mods often a mod's render data; never "mods are rarely the cause"
+    advice, = crashes.explain_text(text, ModIndex(game))
+    assert advice.kind == "d3d" and advice.action == "bisect" and advice.mods == []
+    assert "드뭅니다" not in advice.text and "응답하지 않" not in advice.text
+    assert "모델·텍스처·재질" in advice.text
+    if error in ("DEVICE_HUNG", "DEVICE_RESET"):
+        assert f"끝내지 못해({error}) Windows가 그래픽카드를 다시 시작했고" in advice.text
+        assert "고장 났다는 뜻은 대개 아닙니다" in advice.text and "재질 점검·복구" in advice.text
+        assert advice.text.index("모드의 모델") < advice.text.index("그래픽 드라이버")  # (the mods first, then the rest)
+    elif error == "DRIVER_INTERNAL_ERROR":  # (the driver itself failed: reinstall it first, a mod is still possible)
+        assert advice.text.startswith("그래픽 드라이버 안에서 문제가 생겨(DRIVER_INTERNAL_ERROR)")
+        assert "드라이버를 새로 설치해 보세요" in advice.text and "원인 모드 찾기" in advice.text
+    else:
+        assert advice.text.startswith("그래픽 오류(DXGI_ERROR_DEVICE_REMOVED)로 게임이 멈췄습니다.")
+
+
+def test_no_text_says_a_graphics_error_is_rarely_the_mods():
+    # the help and the search's own texts: a graphics error is not the graphics card's fault by default
+    from mhwmm import bisect, helptext
+
+    def strings(x):
+        if isinstance(x, str):
+            yield x
+        elif isinstance(x, (tuple, list)):
+            for y in x:
+                yield from strings(y)
+
+    texts = [t for s in helptext.SECTIONS for t in strings(s.blocks)]
+    texts += [v for k, v in vars(bisect).items() if k.isupper() and isinstance(v, str)]
+    joined = "\n".join(texts)
+    assert "그래픽 오류 DEVICE_HUNG · DEVICE_RESET은" in joined and "대개 그래픽카드 고장이 아닙니다" in joined
+    for bad in ("드뭅니다", "응답하지 않", "응답 없음", "그래픽 장치 오류", "드라이버 · 설정부터", "그래픽카드 오류는"):
+        assert bad not in joined, bad
+
+
 def test_modules_an_error_window_names_without_a_folder(game):
     index = ModIndex(game, deployed(("reframework/plugins/Artian.dll", "artian")), [ModRef("artian", "Artian")])
 
@@ -969,14 +1014,21 @@ def test_the_game_s_own_crash_report_is_a_crash(game, crash_dir):
     assert snapshot(game) == before
     assert s.problem() == "crash" and s.summary["crash"] == "c0000005" and s.summary["crash_time"] == int(T0 + 80)
     assert s.summary["device_error"] == "DEVICE_HUNG" and s.summary["category"] == "gpu"
-    assert "그래픽 장치 오류 (DEVICE_HUNG)" in s.title()
+    assert "그래픽 오류 (DEVICE_HUNG)" in s.title()
     assert sorted(s.info["files"]) == [crashes.GAME_REPORT_FILE, crashes.LOG_FILE]  # only its text: no DxDiag & co
     ex = crashes.explain(s, ModIndex(game, {}, []))
     assert ex.crashed and ex.code == "c0000005" and ex.category == "gpu"
     assert ex.findings[0].kind == "game_report" and "스스로 오류 보고서" in ex.findings[0].text
     advice = next(f for f in ex.findings if f.kind == "d3d")
-    assert "그래픽카드가 응답하지 않아(DEVICE_HUNG)" in advice.text and advice.action == "bisect" and not ex.suspects
-    assert "게임 오류 보고서" in ex.summary
+    # the graphics card could not finish the work the game gave it ("badly formed commands"): with mods often a mod's
+    # render data, never "the graphics card is broken" nor "mods are rarely the cause"
+    assert "그리기 작업을 그래픽카드가 끝내지 못해(DEVICE_HUNG)" in advice.text and advice.action == "bisect"
+    assert "고장 났다는 뜻은 대개 아닙니다" in advice.text and "모델·텍스처·재질·셰이더 파일" in advice.text
+    assert "원인 모드 찾기" in advice.text and "모든 모드를 꺼도 튕기면 그래픽 드라이버" in advice.text
+    assert "그래픽 오류 (DEVICE_HUNG) · 게임 오류 보고서" in ex.summary and not ex.suspects
+    assert "그래픽 오류(DEVICE_HUNG)로 게임이 멈췄고" in ex.findings[0].text
+    for f in ex.findings:
+        assert "드뭅니다" not in f.text and "응답하지 않" not in f.text and "그래픽 장치 오류" not in f.text
     assert crashes.crashed_since(crash_dir, T0).id == s.id
     assert collect(crash_dir, game) == []  # the same report is not taken twice
 

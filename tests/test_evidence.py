@@ -271,8 +271,8 @@ def test_the_call_stack_lua_errors_and_plugins_that_did_not_start(world):
 
 @pytest.mark.parametrize("module, none, weights, none_reason", [
     ("_storage_/dinput8.dll", 1.0, {"refw": 6.0, "S": 1.5 * 1.3, "P": 2.0, "T": 0.6}, ""),
-    ("D3D12/D3D12Core.dll", 2.0, {"P": 0.7 * 2.0, "T": 1.5 * 0.6, "M": 1.5, "S": 0.7 * 1.3},
-     "그래픽(D3D12) 쪽에서 튕겨 모드 문제가 아닐 수도 있습니다"),
+    # (a crash in the graphics runtime is no hint that it is not the mods: render data, models and textures alike, up)
+    ("D3D12/D3D12Core.dll", 1.0, {"P": 2.0, "T": 1.5, "M": 1.5, "S": 0.8 * 1.3}, ""),
     ("", 1.0, {"P": 1.5 * 2.0, "T": 0.6, "S": 1.5 * 1.3}, ""),
     (r"C:\WINDOWS\SYSTEM32\ntdll.dll", 1.5, {"P": 2.0, "T": 0.6, "S": 1.3}, "Windows 시스템 파일에서 튕겼습니다"),
     (r"C:\Program Files\Avast\aswhook.dll", 3.0, {"P": 2.0, "T": 0.6, "S": 1.3}, "튕긴 곳이 매니저가 넣지 않은 파일입니다"),
@@ -291,7 +291,90 @@ def test_where_it_crashed(world, module, none, weights, none_reason):
     if module == "":
         assert ev.reasons["P"] == ["튕긴 곳이 어느 파일에도 속하지 않는 코드입니다 (플러그인·스크립트가 바꾼 게임 코드일 수 있음)"]
     if module.startswith("D3D12"):
-        assert ev.reasons["M"] == ["그래픽(D3D12) 쪽에서 튕겼고 이 모드에 텍스처·모델 파일이 있습니다"]
+        assert ev.reasons["M"] == ["그래픽(D3D12) 쪽에서 튕겼고 이 모드에 모델 파일이 있습니다"]
+        assert ev.reasons["T"] == ["그래픽(D3D12) 쪽에서 튕겼고 이 모드에 텍스처 파일이 있습니다"]
+
+
+ARMOR_MESH = "natives/STM/Art/Model/Character/ch03/k/k.mesh.241111606"
+ARMOR_CLOTH = "natives/STM/Art/Model/Character/ch03/f/f.gpuc.241111606"
+ARMOR_FUR = "natives/STM/Art/Model/Character/ch03/f/f.sfur.241111606"
+ARMOR_CHAIN = "natives/STM/Art/Model/Character/ch03/f/f.chain2.241111606"
+HUNG = "Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0006)"
+DRIVER = "Fatal D3D error (24, DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) DeviceRemovedReason(0x887a0020)"
+
+
+def graphics_record(world: World, message: str) -> crashes.Session:
+    """The game's own report of a graphics error 590 s in (REFramework saw nothing, as in a real DEVICE_HUNG)."""
+    from test_crashes import game_report_text, report_zip
+
+    report_zip(world.game / "CrashReport" / datetime.fromtimestamp(CRASH).strftime("%Y_%m%d_%H%M.zip"),
+               game_report_text(world.game, message), CRASH - 10, CRASH + 40, started=T0 - 1)
+    return world.record(log_text(world.game))
+
+
+@pytest.mark.parametrize("message, error, render, stale, pak", [
+    (HUNG, "DEVICE_HUNG", 2.5, 3.0, 1.6),
+    (HUNG.replace("0x887a0006", "0x887a0007"), "DEVICE_RESET", 2.5, 3.0, 1.6),
+    (DRIVER, "DRIVER_INTERNAL_ERROR", 1.5, 2.0, 1.2),  # (the driver's own failure: render data up less, still not "not mods")
+])
+def test_a_graphics_error_points_at_render_data_not_away_from_the_mods(world, monkeypatch, message, error, render,
+                                                                       stale, pak):
+    # the graphics card could not finish the work the game gave it ("badly formed commands", Microsoft's DXGI
+    # documentation): with mods that work is often a mod's model, texture, material or shader, or a graphics plugin.
+    # So no "not the mods" weight at all; those mods up (more with files that do not fit this game version, a pak
+    # mod whose files are not known a little), Lua scripts and data files a little down
+    from mhwmm.matfix.pak import path_hash, write_pak
+
+    standard(world)  # P plugin, T texture, M mesh, S script
+    world.add("X", ["natives/STM/Art/Model/armor/c.mesh.241111606", "natives/STM/Art/Model/armor/c.mdf2.45"])
+    world.material["X"] = "stale"
+    world.add("D", ["natives/STM/GameDesign/z.user.3"])
+    world.add("R", ["dxgi.dll", "reshade-shaders/Shaders/Bloom.fx"])
+    world.add("K", ["Armor.pak"])  # (its entries named by the list of the game's paths: a model)
+    world.add("U", ["Unknown.pak"])  # (not in the game folder: its files are not known)
+    # what the graphics card works on itself: GPU particle effects, GPU cloth and fur (loose files and a pak's entries)
+    world.add("E", ["natives/STM/Art/Effect/Wp/x.efx.4064419"])
+    world.add("C", ["natives/STM/Art/Model/armor/c.gpuc.241111606", "natives/STM/Art/Model/armor/c.chain2.13",
+                    "natives/STM/GameDesign/c.user.3"])
+    world.add("B", ["natives/STM/Art/Model/armor/b.gpbf.241111606"])
+    world.add("F", ["Fur.pak"])  # (named entries only GPU cloth, fur and a chain)
+    for mod, entries in (("K", [ARMOR_MESH]), ("F", [ARMOR_CLOTH, ARMOR_FUR, ARMOR_CHAIN])):
+        placed = world.game / next(e["path"] for e in world.deployed.values() if e["mod"] == mod)
+        placed.parent.mkdir(parents=True, exist_ok=True)
+        write_pak([(path_hash(name), b"x", 1, 0) for name in entries], placed)
+    names = {path_hash(name): name.lower() for name in (ARMOR_MESH, ARMOR_CLOTH, ARMOR_FUR, ARMOR_CHAIN)}
+    monkeypatch.setattr(accessed, "PakNames", lambda cache_dir=None: names.get)
+    s = graphics_record(world, message)
+    assert s.summary["device_error"] == error and s.summary["category"] == "gpu"
+    ev = world.build()
+    assert ev.record == s.id and ev.device_error == error
+    assert ev.none_scale == 1.0 and ev.none_reasons == []
+    assert ev.weights == pytest.approx({"M": render, "T": render, "X": stale * 3.0, "R": render, "K": render, "U": pak,
+                                        "E": render, "C": 1.5 * render, "B": render, "F": render,
+                                        "P": 2.0, "S": 1.3 * 0.8, "D": 1.5 * 0.8})
+    assert min(ev.weights[x] for x in "MTXRKECBF") > ev.weights["S"]  # (a mesh or texture mod over a Lua script)
+    lead = f"게임이 그래픽 오류({error})로 멈췄고 "
+    assert ev.reasons["M"] == [lead + "이 모드에 모델 파일이 있습니다"]
+    assert ev.reasons["T"] == [lead + "이 모드에 텍스처 파일이 있습니다"]
+    assert lead + "이 모드에 모델·재질 파일이 있습니다" in ev.reasons["X"]
+    assert "이 게임 버전과 맞지 않는 재질·데이터 파일이 있습니다" in ev.reasons["X"]
+    assert ev.reasons["R"] == [lead + "이 모드는 그래픽 플러그인(ReShade·업스케일러·프레임 생성 등)입니다"]
+    assert ev.reasons["K"] == [lead + "이 모드에 모델 파일이 있습니다"]
+    assert ev.reasons["U"] == [lead + "이 모드의 PAK에 모델·텍스처가 들어 있을 수 있습니다"]
+    assert ev.reasons["E"] == [lead + "이 모드에 이펙트 파일이 있습니다"]
+    assert ev.reasons["C"] == [lead + "이 모드에 GPU 옷감 파일이 있습니다"]
+    assert ev.reasons["B"] == [lead + "이 모드에 GPU 버퍼 파일이 있습니다"]
+    assert ev.reasons["F"] == [lead + "이 모드에 GPU 옷감·털 파일이 있습니다"]
+    assert "S" not in ev.reasons and "D" not in ev.reasons and "P" not in ev.reasons
+
+
+def test_a_crash_that_is_no_graphics_crash_leaves_render_data_alone(world):
+    # (the texture-only mod keeps its lower weight: plugins crash the game more often than textures)
+    standard(world)
+    graphics_record(world, "Some other error")
+    ev = world.build()
+    assert ev.device_error == "" and ev.none_scale == 1.0
+    assert ev.weights == pytest.approx({"P": 2.0, "T": 0.6, "S": 1.3}) and not ev.reasons
 
 
 def test_files_no_mod_placed_that_refw_could_not_load(world):
