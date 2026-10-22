@@ -25,17 +25,20 @@ real App (gui.App) with the log pane open and full, and measures resizing the wi
 
 Each variant runs in its own process (a hang or a crash is reported, not inherited; a timed out variant is
 killed and the mouse button released). Variants change the app before/after it is built, to find what costs
-on Windows; join modifiers with '+', e.g. --variant nolog+scale150. --list shows them. The resize modes
-(gui.RESIZE_MODE: snapshot, the default; freeze; off) and the first-step detection (gui.RESIZE_FIRST_STEP,
-Windows) are variants too; 'all' compares them. In the freeze and snapshot modes the steps of a drag after the
-first are the same frozen step whatever the window holds, so the removals (nolog, emptylist, ...) say what costs
-in a layout only with +off. Each variant reports the mode that was in effect (snapshot falls back to freeze where
-there is no capture: off Windows, unless +fakecapture), the time to take and show the content's picture at the
-drag's start and to bring the content back at its end (FreezeContent.timings), whether the drag's first step
-was frozen and what the first-step probe read at it (the mouse button, Windows' move or size loop, the cursor on
-the sizing border). A last check times the parts of a picture (GDI grab, PhotoImage, Label) and, on Windows, compares the
-grab with the screen. Tk's window classes are a variant too (gui.RESIZE_CLASS_REDRAW: keep, top, child, both; with a
-gui without that switch the benchmark takes the styles off itself), combined with the modes ('both+freeze').
+on Windows; join modifiers with '+', e.g. --variant nolog+scale150. --list shows them. 'base' is the app as it
+ships (its defaults: gui.RESIZE_MODE freeze, RESIZE_CLASS_REDRAW both, RESIZE_FIRST_STEP on). The resize modes
+(gui.RESIZE_MODE: freeze; off), Tk's window classes (gui.RESIZE_CLASS_REDRAW: keep, top, child, both; with a gui
+without that switch the benchmark takes the styles off itself) and the first-step detection (gui.RESIZE_FIRST_STEP,
+Windows) are variants too, combined with '+' ('keep+freeze'); 'all' compares them with the app's defaults. In the
+freeze mode the steps of a drag after the first are the same frozen step whatever the window holds, so the removals
+(nolog, emptylist, ...) say what costs in a layout only with +off. Each variant reports the mode that was in effect,
+the time to lay the content out again at the drag's end (FreezeContent.timings), whether the drag's first step was
+frozen and what the first-step probe read at it (the mouse button, Windows' move or size loop, the cursor on the
+sizing border).
+The snapshot variants (snapshot, unmap, fakecapture: a picture of the content in its place during a drag) are for
+an app that has that mode (it was measured and taken out again: the classes without the redraw styles and the freeze
+were as fast with less code); with an app without it they are skipped with a note. With one, the content's picture
+is timed and, on Windows, compared with the screen.
 
 Visual checks (Windows; GDI grabs of the toplevel's client area, from its own window: other windows do not matter;
 --no-visual leaves them out), so that a variant that leaves wrong pixels shows:
@@ -67,7 +70,7 @@ after each variant; --report FILE prints its tables again). --budget SECONDS cap
 do not fit are reported as skipped and the tables are printed either way.
 
   python tools/resize_bench.py                          all variants (see --list)
-  python tools/resize_bench.py --variant snapshot --variant freeze --variant off --repeat 3
+  python tools/resize_bench.py --variant base --variant keep+freeze --variant off --repeat 3
   python tools/resize_bench.py --variant both+freeze --variant top+freeze --variant child+freeze
   python tools/resize_bench.py --screen 1920x1080       try that display mode first (Windows, CI runners)
   python tools/resize_bench.py --report resize-bench.json
@@ -109,7 +112,8 @@ pc = time.perf_counter
 # ---------------------------------------------------------------------------------------------- variants
 MODIFIERS = {
     "base": "150 mods (options, pictures, long names), the selected mod with a picture, long 정보 text and many "
-            "conflicts, log pane open with LOG_LINES lines, 원인 찾기 bar shown with long text",
+            "conflicts, log pane open with LOG_LINES lines, 원인 찾기 bar shown with long text; the app's resize "
+            "defaults (RESIZE_MODE freeze, RESIZE_CLASS_REDRAW both, RESIZE_FIRST_STEP on)",
     "bare": "a plain Tk window with a few ttk widgets, no app: what resizing costs Tk itself",
     "nolog": "log pane hidden (로그 숨기기)",
     "emptylist": "no mods installed",
@@ -125,11 +129,12 @@ MODIFIERS = {
     "files": "the 파일 tab shown",
     "nodefer": "RESIZE_SETTLE_MS = RESIZE_FIRST_MS = 0: no change is taken for a drag step, so every step is laid "
                "out (the same as off; not in 'all')",
-    "snapshot": "gui.RESIZE_MODE = 'snapshot', the default: a picture of the content stands in for it during a drag "
-                "and the content is moved out of the window (needs a capture: Windows, or +fakecapture; else it is "
-                "the freeze)",
-    "freeze": "gui.RESIZE_MODE = 'freeze': the content keeps its size during a drag (on Windows still drawn again on "
-              "every step); with a gui before RESIZE_MODE: RESIZE_FREEZE = True",
+    "snapshot": "gui.RESIZE_MODE = 'snapshot', in an app that has it (skipped with a note in one that does not): a "
+                "picture of the content stands in for it during a drag and the content is moved out of the window "
+                "(needs a capture: Windows, or +fakecapture; else it is the freeze; not in 'all')",
+    "freeze": "gui.RESIZE_MODE = 'freeze', the default: the content keeps its size during a drag (on Windows drawn "
+              "again on every step unless Tk's classes lose their redraw styles: both); with a gui before "
+              "RESIZE_MODE: RESIZE_FREEZE = True",
     "off": "gui.RESIZE_MODE = 'off': the window's content laid out again on every step of a drag, as before the "
            "freeze; with a gui before RESIZE_MODE: RESIZE_FREEZE = False",
     "nofreeze": "the same as off (its older name)",
@@ -138,31 +143,36 @@ MODIFIERS = {
                  "the drag's first step (not in 'all')",
     "nofirststep": "gui.RESIZE_FIRST_STEP = False: the drag's first step is laid out at once (it is not told apart "
                    "from a maximize)",
-    "unmap": "gui.RESIZE_SNAPSHOT_HIDE = 'unmap': while its picture shows the content is unmapped (place_forget) "
-             "instead of moved out of the window (not in 'all')",
-    "fakecapture": "the snapshot's picture made by a stand-in (gui.photo_from_bgrx of plain bytes, the content's "
-                   "size) instead of taken from the screen: the snapshot path off Windows (not in 'all')",
-    "keep": "gui.RESIZE_CLASS_REDRAW = 'keep': Tk's window classes as they are (CS_HREDRAW|CS_VREDRAW; the app's "
-            "default today; the variants without top/child/both have the app's default)",
+    "unmap": "gui.RESIZE_SNAPSHOT_HIDE = 'unmap', in an app with the snapshot mode: while its picture shows the "
+             "content is unmapped (place_forget) instead of moved out of the window (not in 'all')",
+    "fakecapture": "in an app with the snapshot mode: the snapshot's picture made by a stand-in (gui.photo_from_bgrx "
+                   "of plain bytes, the content's size) instead of taken from the screen: the snapshot path off "
+                   "Windows (not in 'all')",
+    "keep": "gui.RESIZE_CLASS_REDRAW = 'keep': Tk's window classes as they are (CS_HREDRAW|CS_VREDRAW: every child "
+            "window drawn again on each step; the variants without keep/top/child/both have the app's default)",
     "top": "gui.RESIZE_CLASS_REDRAW = 'top': CS_HREDRAW|CS_VREDRAW taken off the class of Tk's outer toplevel windows "
            "(TkTopLevel; Windows; with a gui without the switch the benchmark does it once the window is shown)",
     "child": "gui.RESIZE_CLASS_REDRAW = 'child': CS_HREDRAW|CS_VREDRAW taken off the class of Tk's other windows "
              "(TkChild: the toplevel's own window and every widget's)",
-    "both": "gui.RESIZE_CLASS_REDRAW = 'both': CS_HREDRAW|CS_VREDRAW taken off both classes, so that Windows repaints "
-            "only the uncovered part of a resized window and not every child window",
+    "both": "gui.RESIZE_CLASS_REDRAW = 'both', the default: CS_HREDRAW|CS_VREDRAW taken off both classes, so that "
+            "Windows repaints only the uncovered part of a resized window and not every child window",
     "noclassredraw": "the same as both (its older name; not in 'all')",
     "nodnd": "tk.Tk() instead of TkinterDnD.Tk()",
     "scale150": "tk scaling for 150% (144 dpi) before the app is built (default: 100%, 96 dpi)",
 }
-# The resize modes against each other, and with Tk's window classes changed (gui.RESIZE_CLASS_REDRAW), the classes one
-# at a time with the freeze, both with each mode, and at 150 %; the visual checks say which of them leave wrong
-# pixels. A removal (nolog, emptylist, ...) shows what costs in a layout only with +off: in the freeze and snapshot
-# modes every step after the drag's first is the same frozen step.
+# The app's defaults (base: freeze, both, the first-step rule) against a plain Tk window (bare), the layout on every
+# step (off, both+off), the classes as Tk has them (keep+freeze), the first step not told apart
+# (both+freeze+nofirststep), and at 150 % (scale150: the defaults; +off); the visual checks say which of them leave
+# wrong pixels. ('freeze' is the defaults too with this app, and the same mode with one whose defaults differ.) A
+# removal (nolog, emptylist, ...) shows what costs in a layout only with +off: in the freeze mode every step after
+# the drag's first is the same frozen step.
 REMOVALS = ["nolog", "emptylist", "noimages", "nobisect", "noheader", "nodetails", "nolist", "noinfo", "fewwidgets",
             "options", "conflicts", "files"]
-ALL = ["bare", "off", "freeze", "snapshot", "snapshot+unmap", "top+freeze", "child+freeze", "both+freeze", "both+off",
-       "both+snapshot", "scale150+both+freeze"]
-QUICK = ["bare", "base", "off", "freeze", "snapshot+fakecapture", "both+freeze"]
+ALL = ["bare", "base", "off", "freeze", "keep+freeze", "both+off", "both+freeze+nofirststep", "scale150",
+       "scale150+off"]
+QUICK = ["bare", "base", "off", "keep+freeze", "both+freeze+nofirststep"]
+# the parts that need the app's snapshot mode (taken out of the app after it was measured)
+SNAPSHOT_PARTS = ("snapshot", "unmap", "fakecapture")
 MODE_PARTS = {"snapshot": "snapshot", "freeze": "freeze", "off": "off", "nofreeze": "off"}
 # gui.RESIZE_CLASS_REDRAW of a part, and the classes ("top": TkTopLevel, "child": TkChild) each value changes
 CLASS_PARTS = {"keep": "keep", "top": "top", "child": "child", "both": "both", "noclassredraw": "both"}
@@ -194,6 +204,23 @@ def effective_mode(gui, fake: bool = False) -> str:
     if hasattr(gui, "RESIZE_FREEZE"):
         return "freeze" if gui.RESIZE_FREEZE else "off"
     return "layout"
+
+
+def has_snapshot(gui) -> bool:
+    """The gui has the snapshot mode (RESIZE_MODE 'snapshot': a picture of the content during a drag)."""
+    modes = getattr(gui, "RESIZE_MODES", None)
+    return hasattr(gui, "RESIZE_MODE") and hasattr(gui, "_capture_content") and (modes is None or "snapshot" in modes)
+
+
+def snapshot_skip(gui, parts: list[str]) -> str | None:
+    """Why a variant with snapshot parts cannot run with this gui (None: it can, or it has none)."""
+    named = [p for p in parts if p in SNAPSHOT_PARTS]
+    if not named or has_snapshot(gui):
+        return None
+    modes = getattr(gui, "RESIZE_MODES", None)
+    have = f"its modes: {', '.join(modes)}; the snapshot was taken out after it was measured" if modes else \
+        "no RESIZE_MODE: a gui from before the resize modes"
+    return f"the app has no snapshot mode ({have}), so {'+'.join(named)} cannot run"
 
 
 def parse_spec(spec: str) -> list[str]:
@@ -1238,8 +1265,14 @@ class Child:
         modes = {MODE_PARTS[p] for p in parts if p in MODE_PARTS}
         if len(modes) > 1:
             return f"more than one resize mode: {', '.join(sorted(modes))}"
+        skip = snapshot_skip(gui, parts)
+        if skip:
+            return skip
         if modes:
             mode = modes.pop()
+            known = getattr(gui, "RESIZE_MODES", None)
+            if known is not None and mode not in known:
+                return f"the app has no resize mode {mode!r} (its modes: {', '.join(known)})"
             if hasattr(gui, "RESIZE_MODE"):
                 gui.RESIZE_MODE = mode
                 if hasattr(gui, "RESIZE_FREEZE"):
@@ -1770,7 +1803,8 @@ class Child:
                     return
             root.after(20, poll)
 
-        before = self.screen_of_content() if win is root else None  # (what the snapshot's picture should show)
+        # (what the snapshot's picture should show: only in an app with that mode, on Windows)
+        before = self.screen_of_content() if win is root and self.result["env"].get("mode") == "snapshot" else None
         self.grabs.clear()
         rec.reset()
         self.timings_reset(win)
@@ -2329,7 +2363,7 @@ class Child:
                     self.visual["checks"].append({"what": "windows", "error": failed.get("error")})
                 self.visual_summary()
                 self.emit(PARTIAL_PREFIX)
-            if self.app is not None:
+            if self.app is not None and hasattr(gui_module(), "photo_from_bgrx"):  # (an app with the snapshot)
                 self.result["capture"] = self.guarded(self.capture_check, "capture")
             self.result["ok"] = bool((self.result["drag"] or {}).get("ok") or (self.result["steps"] or {}).get("ok"))
         except BaseException as exc:
@@ -2360,6 +2394,12 @@ class Child:
                 self.root.destroy()
         except Exception:
             pass
+
+
+def gui_module():
+    from mhwmm import gui
+
+    return gui
 
 
 def join_stats(parts: list[dict | None]) -> dict | None:
@@ -2519,17 +2559,33 @@ def mode_of(r: dict) -> str:
     return str(mode)[:9]
 
 
+def took_pictures(r: dict) -> bool:
+    """A result of an app with the snapshot mode that used it (or asked for it)."""
+    if mode_of(r) in ("snapshot", "snap-fake", "freeze*"):
+        return True
+    return any((r.get(part) or {}).get(key) for part in ("drag", "steps") for key in ("snapshots", "no_snapshot"))
+
+
 def print_picture_tables(results: list[dict]) -> None:
     print()
-    print("Resize mode and the content's picture (FreezeContent.timings; ms as median/max over the drags/step runs): "
-          "1st step = RESIZE_FIRST_STEP\n  (probe: Windows' mouse button read); 1st frz = runs whose first step was "
-          "frozen / runs; snaps = pictures taken; snapshot = taking and\n  showing the picture at the drag's start; "
-          "restore = bringing the content back at its end (laid out and drawn); no snap = frozen without a\n  "
-          "picture (capture failed or refused); pic=scr = share of the drag's first picture equal to the screen before "
-          "the drag\n  (Windows, worst run; 1.0: the picture showed the content)")
-    head = f"{'variant':<24} {'mode':<9} {'1st step':<9} | {'drag: 1st frz':>13} {'snaps':>5} {'snapshot':>9} " \
-           f"{'restore':>9} {'no snap':>7} {'pic=scr':>7} | {'steps: 1st frz':>14} {'snaps':>5} {'snapshot':>9} " \
-           f"{'restore':>9}"
+    pictures = any(took_pictures(r) for r in results if not r.get("skipped"))
+    if pictures:
+        print("Resize mode and the content's picture (FreezeContent.timings; ms as median/max over the drags/step "
+              "runs): 1st step = RESIZE_FIRST_STEP\n  (probe: Windows' mouse button read); 1st frz = runs whose first "
+              "step was frozen / runs; snaps = pictures taken; snapshot = taking and\n  showing the picture at the "
+              "drag's start; restore = bringing the content back at its end (laid out and drawn); no snap = frozen "
+              "without a\n  picture (capture failed or refused); pic=scr = share of the drag's first picture equal to "
+              "the screen before the drag\n  (Windows, worst run; 1.0: the picture showed the content)")
+        head = f"{'variant':<24} {'mode':<9} {'1st step':<9} | {'drag: 1st frz':>13} {'snaps':>5} {'snapshot':>9} " \
+               f"{'restore':>9} {'no snap':>7} {'pic=scr':>7} | {'steps: 1st frz':>14} {'snaps':>5} {'snapshot':>9} " \
+               f"{'restore':>9}"
+    else:
+        print("Resize mode and the drag's end (FreezeContent.timings; ms as median/max over the drags/step runs): "
+              "1st step = RESIZE_FIRST_STEP\n  (probe: Windows' mouse button read); 1st frz = runs whose first step "
+              "was frozen / runs; restore = laying the content out\n  again for the size the drag stopped at (and "
+              "drawing it)")
+        head = f"{'variant':<24} {'mode':<9} {'1st step':<9} | {'drag: 1st frz':>13} {'restore':>9} | " \
+               f"{'steps: 1st frz':>14} {'restore':>9}"
     print(head)
     print("-" * len(head))
     for r in results:
@@ -2547,6 +2603,9 @@ def print_picture_tables(results: list[dict]) -> None:
                           part.get("snapshots", "-") if runs else "-", fmt_mm(part.get("snapshot_ms")),
                           fmt_mm(part.get("restore_ms")), part.get("no_snapshot", "-") if runs else "-"))
         (df, ds, dsn, dr, dn), (sf, ss, ssn, sr, _sn) = cells
+        if not pictures:
+            print(f"{name:<24} {mode_of(r):<9} {first:<9} | {df:>13} {dr:>9} | {sf:>14} {sr:>9}")
+            continue
         share = (r.get("drag") or {}).get("picture_vs_screen")
         share = "-" if share is None else f"{share:.3f}"
         print(f"{name:<24} {mode_of(r):<9} {first:<9} | {df:>13} {ds!s:>5} {dsn:>9} {dr:>9} {dn!s:>7} {share:>7} | "
@@ -2713,10 +2772,11 @@ def print_visual_table(results: list[dict]) -> None:
 
 def print_tables(results: list[dict]) -> None:
     print()
-    print("Read: mode = what the window's content does during a drag (snapshot: its picture stands in for it and "
-          "the content is out of the\n  window; freeze: it keeps its size; off: laid out on every step; freeze*: "
-          "snapshot asked for, no capture here; snap-fake:\n  +fakecapture). snapshot/freeze vs off: what they save; "
-          "vs bare: what is left. +nofirststep: the drag's first step laid out at once.")
+    print("Read: mode = what the window's content does during a drag (freeze: it keeps its size; off: laid out on "
+          "every step; with an app\n  that has the snapshot mode: snapshot = its picture stands in for it, freeze* = "
+          "snapshot asked for, no capture here,\n  snap-fake = +fakecapture). base = the app's defaults; freeze vs "
+          "off: what the freeze saves; keep+freeze vs base: what Tk's\n  redraw styles cost (RESIZE_CLASS_REDRAW); vs "
+          "bare: what is left; +nofirststep: the drag's first step laid out at once.")
     print()
     print("Real edge drag (SendInput; ms as median/p95/max; cfg/moves = Configure events / mouse moves; coal = moves "
           "without their own Configure;\n  1st gap = from the drag's first Configure to the next (its layout; "

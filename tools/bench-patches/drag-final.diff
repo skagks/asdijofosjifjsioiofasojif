@@ -55,7 +55,7 @@ index b986986..154bcb4 100644
  
      def _bind_wheel(self, widget, canvas):
 diff --git a/mhwmm/gui.py b/mhwmm/gui.py
-index a3864cc..0a28865 100644
+index a3864cc..ed4f80c 100644
 --- a/mhwmm/gui.py
 +++ b/mhwmm/gui.py
 @@ -2,6 +2,7 @@
@@ -66,7 +66,7 @@ index a3864cc..0a28865 100644
  import gc
  import logging
  import os
-@@ -151,28 +152,509 @@ def autohide(scrollbar: ttk.Scrollbar, **pack_options):
+@@ -151,28 +152,403 @@ def autohide(scrollbar: ttk.Scrollbar, **pack_options):
  
  
  # While a window's edge is dragged, Tk gets a new size for every mouse step (on Windows each one is handled
@@ -83,16 +83,12 @@ index a3864cc..0a28865 100644
 +# On Windows only while the mouse drags (RESIZE_FIRST_STEP).
  RESIZE_FIRST_MS = 600
 +# What FreezeContent does while the window's edge is dragged (resize_mode()):
-+#   "snapshot": a picture of the content stands in for it (one Label) and the content is moved out of the window.
-+#               On Windows each step of the drag makes Windows repaint every child window of the toplevel, also
-+#               the ones whose size did not change (Tk's window classes have CS_HREDRAW|CS_VREDRAW: the resized
-+#               toplevel is invalidated with all its children; see RESIZE_CLASS_REDRAW), and Tk draws each of them
-+#               again: with the content out of the window only the picture is drawn. Needs _capture_content
-+#               (Windows only); elsewhere, or when taking the picture fails, it is "freeze".
-+#   "freeze":   the content keeps its size (nothing in it is laid out again; on Windows it is still drawn again).
-+#   "off":      the content is laid out again on every step (for comparing in the resize benchmark).
-+RESIZE_MODE = "snapshot"
-+RESIZE_MODES = ("snapshot", "freeze", "off")
++#   "freeze": the content keeps its size: nothing in it is laid out again until the drag stops (and on Windows,
++#             with RESIZE_CLASS_REDRAW, nothing in it is drawn again either).
++#   "off":    the content is laid out again on every step (as before the freeze; for the resize benchmark).
++# (Any other value is the freeze.)
++RESIZE_MODE = "freeze"
++RESIZE_MODES = ("freeze", "off")
 +# The older switch: False is RESIZE_MODE "off".
 +RESIZE_FREEZE = True
 +# Windows: the mouse tells a drag of the window's edge from the other size changes, already at the drag's first
@@ -109,12 +105,6 @@ index a3864cc..0a28865 100644
 +#     a snapped window's title bar gives it back its size from before the snap and moves it), or by the time rules.
 +# Only queries (no window message is sent); when one fails, the time rules decide as elsewhere.
 +RESIZE_FIRST_STEP = True
-+# How the content is kept from being drawn while its picture shows: "away" (placed left of the window, still
-+# mapped: Windows invalidates only the child windows that intersect the resized window) or "unmap" (place_forget;
-+# for comparing in the resize benchmark).
-+RESIZE_SNAPSHOT_HIDE = "away"
-+# No picture of a bigger content (it is copied a few times, 4 bytes a pixel, while the picture is made)
-+SNAPSHOT_MAX_PIXELS = 3840 * 2160
 +# Windows: Tk registers its window classes with CS_HREDRAW|CS_VREDRAW (TkTopLevel, a toplevel's outer window:
 +# tkWinWm.c; TkChild, every other Tk window, the toplevel's own one too: tkWinX.c), so on each step of a drag of
 +# the window's edge Windows has the resized windows repainted whole, with all their child windows, also the ones
@@ -126,9 +116,11 @@ index a3864cc..0a28865 100644
 +#   "child": the class of all the other windows only;
 +#   "both":  both classes.
 +# Without them Windows repaints only what a resize uncovered; Tk's widgets draw themselves again whole when their
-+# own size changes (their <Configure>). Combines with RESIZE_MODE. Chosen with the resize benchmark
-+# (tools/resize_bench.py: its visual checks look for stale pixels after a drag, a maximize and a theme switch).
-+RESIZE_CLASS_REDRAW = "keep"
++# own size changes (their <Configure>). Combines with RESIZE_MODE: "both" with the freeze took a step of a drag
++# of the main window from ~145 ms (everything laid out and drawn) to ~10 ms, as a plain Tk window, with no stale
++# pixel after a drag, a maximize, a theme switch or in the dialogs and 장비 외형 (tools/resize_bench.py on real
++# Windows; the freeze alone, ~50 ms, still had all the content drawn again).
++RESIZE_CLASS_REDRAW = "both"
 +RESIZE_CLASS_REDRAWS = ("keep", "top", "child", "both")
  _RESIZE_TAG = "MhwmmResize"
  
@@ -329,104 +321,6 @@ index a3864cc..0a28865 100644
 +        return by_last or by_alone
 +
 +
-+class _WinCapture:
-+    """What a window shows (its part of the toplevel's surface, child windows included), copied with GDI: BitBlt
-+    from the window's DC into a 32-bit top-down DIB. Under DWM the source is the toplevel's own surface, so other
-+    windows over it and other monitors do not matter, and it is in the window's pixels (Tk's: no DPI scaling)."""
-+
-+    SRCCOPY = 0x00CC0020
-+
-+    def __init__(self):
-+        import ctypes
-+        from ctypes import wintypes as wt
-+
-+        class BITMAPINFOHEADER(ctypes.Structure):
-+            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
-+                        ("biBitCount", wt.WORD), ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
-+                        ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
-+                        ("biClrImportant", wt.DWORD)]
-+
-+        if ctypes.sizeof(BITMAPINFOHEADER) != 40:
-+            raise RuntimeError("BITMAPINFOHEADER")
-+        self.ctypes, self.BITMAPINFOHEADER = ctypes, BITMAPINFOHEADER
-+        c_int = ctypes.c_int
-+        self.user32 = _win_functions("user32", {
-+            "GetDC": (wt.HDC, wt.HWND),
-+            "ReleaseDC": (c_int, wt.HWND, wt.HDC),
-+        })
-+        self.gdi32 = _win_functions("gdi32", {
-+            "CreateCompatibleDC": (wt.HDC, wt.HDC),
-+            "CreateDIBSection": (wt.HBITMAP, wt.HDC, ctypes.c_void_p, wt.UINT, ctypes.POINTER(ctypes.c_void_p),
-+                                 wt.HANDLE, wt.DWORD),
-+            "SelectObject": (wt.HGDIOBJ, wt.HDC, wt.HGDIOBJ),
-+            "BitBlt": (wt.BOOL, wt.HDC, c_int, c_int, c_int, c_int, wt.HDC, c_int, c_int, wt.DWORD),
-+            "GdiFlush": (wt.BOOL,),
-+            "DeleteObject": (wt.BOOL, wt.HGDIOBJ),
-+            "DeleteDC": (wt.BOOL, wt.HDC),
-+        })
-+
-+    def grab(self, hwnd: int, width: int, height: int) -> bytes:
-+        """The window's top-left width × height: B, G, R and an unused byte a pixel, rows from the top."""
-+        ctypes, u, g = self.ctypes, self.user32, self.gdi32
-+        header = self.BITMAPINFOHEADER(40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)  # (BI_RGB, top-down)
-+        window_dc = u["GetDC"](hwnd)
-+        if not window_dc:
-+            raise OSError("GetDC failed")
-+        try:
-+            memory_dc = g["CreateCompatibleDC"](window_dc)
-+            if not memory_dc:
-+                raise OSError("CreateCompatibleDC failed")
-+            try:
-+                bits = ctypes.c_void_p()
-+                bitmap = g["CreateDIBSection"](memory_dc, ctypes.byref(header), 0, ctypes.byref(bits), None, 0)
-+                if not bitmap or not bits.value:
-+                    raise OSError("CreateDIBSection failed")
-+                try:
-+                    old = g["SelectObject"](memory_dc, bitmap)
-+                    try:
-+                        if not g["BitBlt"](memory_dc, 0, 0, width, height, window_dc, 0, 0, self.SRCCOPY):
-+                            raise OSError(f"BitBlt failed (error {ctypes.get_last_error()})")
-+                        g["GdiFlush"]()
-+                        return ctypes.string_at(bits.value, width * height * 4)
-+                    finally:
-+                        g["SelectObject"](memory_dc, old)
-+                finally:
-+                    g["DeleteObject"](bitmap)
-+            finally:
-+                g["DeleteDC"](memory_dc)
-+        finally:
-+            u["ReleaseDC"](hwnd, window_dc)
-+
-+
-+def photo_from_bgrx(master: tk.Misc, data: bytes, width: int, height: int):
-+    """A PhotoImage of width × height pixels given as B, G, R and an unused byte each (rows from the top)."""
-+    if Image is not None:
-+        picture = Image.frombuffer("RGB", (width, height), data, "raw", "BGRX", 0, 1)
-+        return ImageTk.PhotoImage(picture, master=master)
-+    rgb = bytearray(width * height * 3)  # (without Pillow: a binary PPM, which Tk 8.6 reads from bytes)
-+    rgb[0::3], rgb[1::3], rgb[2::3] = data[2::4], data[1::4], data[0::4]
-+    return tk.PhotoImage(master=master, format="ppm", data=b"P6\n%d %d\n255\n" % (width, height) + bytes(rgb))
-+
-+
-+_CAPTURE: list = []  # [the _WinCapture, or None]
-+
-+
-+def _gdi_capture(frame: tk.Misc, width: int, height: int):
-+    """The top-left width × height of ``frame`` as it is on screen, as a PhotoImage (Windows)."""
-+    if not _CAPTURE:
-+        _CAPTURE.append(_WinCapture())  # (an error here: no picture, the content is frozen as it is)
-+    data = _CAPTURE[0].grab(frame.winfo_id(), width, height)
-+    step = 4 * max(1, width * height // 1000)  # (about a thousand pixels)
-+    if len({data[i:i + 3] for i in range(0, len(data), step)}) <= 1:
-+        raise ValueError("the picture is blank")  # (the window's pixels were not there: frozen instead)
-+    return photo_from_bgrx(frame, data, width, height)
-+
-+
-+# capture(frame, width, height) -> a PhotoImage of what the frame shows, for RESIZE_MODE "snapshot"; None: no way
-+# to take one here (the content is frozen instead)
-+_capture_content = _gdi_capture if sys.platform == "win32" else None
-+
-+
 +def _last_error(ctypes) -> int:
 +    """Windows' last error of a ctypes call made with use_last_error (0 elsewhere)."""
 +    get = getattr(ctypes, "get_last_error", None)
@@ -583,7 +477,7 @@ index a3864cc..0a28865 100644
          top._mhwmm_size, top._mhwmm_changed = size, now
          top._mhwmm_resized, top._mhwmm_alone = (now, alone) if drag else (None, now)
          for on_size in getattr(top, "_mhwmm_on_size", ()):
-@@ -181,7 +663,9 @@ def _note_resize(event):
+@@ -181,7 +557,9 @@ def _note_resize(event):
  
  def watch_resizing(top: tk.Misc, on_size=None):
      """Note when the toplevel ``top`` changes size (for ``resizing``) and then call ``on_size(event)``: before
@@ -594,7 +488,7 @@ index a3864cc..0a28865 100644
      if on_size is not None:
          top._mhwmm_on_size = getattr(top, "_mhwmm_on_size", ()) + (on_size,)
      tags = top.bindtags()
-@@ -195,185 +679,191 @@ def watch_resizing(top: tk.Misc, on_size=None):
+@@ -195,185 +573,106 @@ def watch_resizing(top: tk.Misc, on_size=None):
  def resizing(widget: tk.Misc) -> bool:
      """True while the window of ``widget`` is being resized by dragging its edge: its size changed less than
      RESIZE_SETTLE_MS ago, and less than RESIZE_SETTLE_MS after the change before (or soon after a change on its
@@ -610,77 +504,32 @@ index a3864cc..0a28865 100644
 -    is dragged the cards keep their width and are laid out once RESIZE_SETTLE_MS after the last change (doing
 -    it on every step of the drag makes resizing stutter); other width changes (the first one, the drag's first
 -    step, maximize or restore, the scrollbar showing up, another tab, the sash) are followed at once, as before."""
--
--    def __init__(self, canvas: tk.Canvas, item):
--        self.canvas, self.item = canvas, item
--        self.width: int | None = None  # what the item was given
 +class FreezeContent:
 +    """All of the toplevel ``top``'s content in one frame, ``frame`` (a child of ``top``), placed to fill the
-+    window. While the window's edge is dragged (``resizing``) the frame keeps the size it has, so Tk lays out and
-+    draws nothing in it on the steps of the drag (only the window's own background where it grew; where it got
++    window. While the window's edge is dragged (``resizing``) the frame keeps the size it has, so Tk lays out
++    nothing in it on the steps of the drag (only the window's own background shows where it grew; where it got
 +    smaller the content is cut off). RESIZE_SETTLE_MS after the last change the frame fills the window again and
 +    is laid out once. Other changes (maximize, restore, snapping to a screen edge, the drag's first step unless
 +    the mouse tells, see RESIZE_FIRST_STEP, and all changes within RESIZE_FIRST_MS of the window's first size:
 +    shown zoomed or moved to its monitor) are followed at once.
-+
-+    On Windows every widget is a window of its own and Tk lays out and draws all of them again for each step of
-+    the drag before the next mouse move, which made resizing stutter. In RESIZE_MODE "snapshot" a picture of the
-+    content (as it was on screen when the drag started) stands in for it during the drag, in one Label below the
-+    frame, and the frame is moved out of the window: Windows repaints the children of a resized window on every
-+    step even when their size does not change. When the drag stops the content comes back, is laid out and drawn
-+    over the picture, and the picture goes. Any failure: the content is frozen as it is (never left hidden).
-+
-+    Placing the frame does not give the window a requested size: the window's size is set with geometry()."""
-+
-+    AWAY = 64  # pixels between the window's left edge and the content moved out of it
-+
-+    def __init__(self, top: tk.Misc, frame: tk.Misc):
-+        self.top, self.frame = top, frame
-+        self.frozen = False
-+        self.hidden = False  # the content is out of the window and its picture shows
-+        self.picture: tk.Label | None = None  # (made at the first snapshot)
-+        self._image = None
-         self._after = None
+ 
+-    def __init__(self, canvas: tk.Canvas, item):
+-        self.canvas, self.item = canvas, item
+-        self.width: int | None = None  # what the item was given
+-        self._after = None
 -        watch_resizing(canvas.winfo_toplevel())
 -        canvas.bind("<Configure>", self._on_configure, add="+")
 -        canvas.bind("<Destroy>", self._on_destroy, add="+")
--
++    On Windows every widget is a window of its own and Tk laid out and drew all of them again for each step of
++    the drag before the next mouse move, which made resizing stutter. Frozen, nothing in the content is laid out;
++    with Tk's window classes without CS_HREDRAW|CS_VREDRAW (RESIZE_CLASS_REDRAW) nothing in it is drawn again
++    either, only the area the window gained.
+ 
 -    def _on_destroy(self, _event=None):
 -        if self._after is not None:
 -            self.canvas.after_cancel(self._after)
 -            self._after = None
-+        self._shown: float | None = None  # when the window got its first size
-+        # (what, ms): "snapshot" (the picture taken and shown), "no snapshot" (frozen instead), "restore" (the
-+        # content back, laid out and drawn) - for the resize benchmark
-+        self.timings: collections.deque = collections.deque(maxlen=64)
-+        frame.place(x=0, y=0, relwidth=1, relheight=1)
-+        watch_resizing(top, self._on_size)
-+        frame.bind("<Destroy>", self._on_destroy, add="+")
-+
-+    def _on_size(self, _event):
-+        """The window got a new size (before the frame is laid out for it)."""
-+        now = time.perf_counter()
-+        if self._shown is None:
-+            self._shown = now
-+        mode = resize_mode()
-+        if mode == "off" or not resizing(self.top) or now - self._shown < RESIZE_FIRST_MS / 1000:
-+            self.thaw()  # (a change on its own: followed at once)
-+            return
-+        try:
-+            if not self.frozen:
-+                width, height = self.frame.winfo_width(), self.frame.winfo_height()
-+                if width <= 1 or height <= 1:
-+                    return  # not laid out yet
-+                self.frame.place_configure(relwidth=0, relheight=0, width=width, height=height)
-+                self.frozen = True
-+                if mode == "snapshot":
-+                    self._snapshot(width, height)
-+            self._cancel()
-+            self._after = self.frame.after(RESIZE_SETTLE_MS, self._settled)
-+        except tk.TclError:  # closed meanwhile
-+            if self.hidden:  # (nothing would bring the content back)
-+                self.thaw()
- 
+-
 -    def _on_configure(self, event):
 -        if event.width == self.width and self._after is None:
 -            return  # moved, or only the height changed
@@ -690,81 +539,49 @@ index a3864cc..0a28865 100644
 -            self._after = self.canvas.after(RESIZE_SETTLE_MS, self._settled)
 -        else:
 -            self.apply(event.width)
-+    def _snapshot(self, width: int, height: int):
-+        """A picture of the content in its place, and the content (frozen at width × height) out of the window."""
-+        capture = _capture_content
-+        if capture is None:
-+            return
-+        started = time.perf_counter()
-+        try:
-+            frame, top = self.frame, self.top
-+            if not frame.winfo_ismapped() or frame.winfo_x() or frame.winfo_y():
-+                raise ValueError("the content is not where it shows")
-+            # only what is inside the window (where it just got smaller the content's pixels may be gone)
-+            shown_w, shown_h = min(width, top.winfo_width()), min(height, top.winfo_height())
-+            if shown_w <= 1 or shown_h <= 1 or shown_w * shown_h > SNAPSHOT_MAX_PIXELS:
-+                raise ValueError(f"no picture of {shown_w}x{shown_h}")
-+            image = capture(frame, shown_w, shown_h)
-+            if image is None:
-+                raise ValueError("no picture")
-+            label = self._label()
-+            label.configure(image=image, width=shown_w, height=shown_h)
-+            self._image = image
-+            label.place(x=0, y=0, width=shown_w, height=shown_h)
-+            label.lower(frame)  # (below the content once it is back)
-+            if RESIZE_SNAPSHOT_HIDE == "unmap":
-+                frame.place_forget()
-+            else:
-+                frame.place_configure(x=-(width + self.AWAY), y=0)
-+            self.hidden = True
-+            self.timings.append(("snapshot", (time.perf_counter() - started) * 1000))
-+        except Exception as exc:  # frozen as it is
-+            self.timings.append(("no snapshot", (time.perf_counter() - started) * 1000))
-+            log.debug("창 내용의 그림을 만들지 못해 내용을 그대로 둡니다: %s", exc)
-+            try:
-+                self.frame.place(x=0, y=0, relwidth=0, relheight=0, width=width, height=height)  # (in the window)
-+            except tk.TclError:  # closed meanwhile
-+                pass
-+            self.hidden = False
-+            self._drop_picture()
++    Placing the frame does not give the window a requested size: the window's size is set with geometry()."""
  
 -    def _settled(self):
--        self._after = None
++    def __init__(self, top: tk.Misc, frame: tk.Misc):
++        self.top, self.frame = top, frame
++        self.frozen = False
+         self._after = None
 -        self.apply()
-+    def _label(self) -> tk.Label:
-+        label = self.picture
-+        if label is not None:
-+            try:
-+                if label.winfo_exists():
-+                    return label
-+            except tk.TclError:
-+                pass
-+        parent = self.frame.master
-+        label = tk.Label(parent, borderwidth=0, highlightthickness=0, padx=0, pady=0, takefocus=0)
-+        try:
-+            label.configure(background=parent.cget("background"))  # (seen only if the picture does not load)
-+        except tk.TclError:
-+            pass
-+        self.picture = label
-+        return label
- 
+-
 -    def apply(self, width: int | None = None):
 -        """Give the item the canvas's width now."""
 -        if self._after is not None:
 -            self.canvas.after_cancel(self._after)
 -            self._after = None
-+    def _drop_picture(self):
-+        """The content's picture taken away (its image goes with it)."""
-+        image, self._image = self._image, None
-+        if image is None or self.picture is None:
++        self._shown: float | None = None  # when the window got its first size
++        # (what, ms): "restore" (the content laid out and drawn for the size a drag stopped at) - for the resize
++        # benchmark
++        self.timings: collections.deque = collections.deque(maxlen=64)
++        frame.place(x=0, y=0, relwidth=1, relheight=1)
++        watch_resizing(top, self._on_size)
++        frame.bind("<Destroy>", self._cancel, add="+")
++
++    def _on_size(self, _event):
++        """The window got a new size (before the frame is laid out for it)."""
++        now = time.perf_counter()
++        if self._shown is None:
++            self._shown = now
++        if resize_mode() == "off" or not resizing(self.top) or now - self._shown < RESIZE_FIRST_MS / 1000:
++            self.thaw()  # (a change on its own: followed at once)
 +            return
          try:
 -            width = width if width is not None else self.canvas.winfo_width()
 -            if width != self.width:
 -                self.width = width
 -                self.canvas.itemconfigure(self.item, width=width)
-+            self.picture.place_forget()
-+            self.picture.configure(image="")
++            if not self.frozen:
++                width, height = self.frame.winfo_width(), self.frame.winfo_height()
++                if width <= 1 or height <= 1:
++                    return  # not laid out yet
++                self.frame.place_configure(relwidth=0, relheight=0, width=width, height=height)
++                self.frozen = True
++            self._cancel()
++            self._after = self.frame.after(RESIZE_SETTLE_MS, self._settled)
          except tk.TclError:  # closed meanwhile
              pass
  
@@ -825,8 +642,8 @@ index a3864cc..0a28865 100644
 -    def finish(self):
 -        """Put the sash where it goes now (the drag stopped, or the window closes)."""
 +    def thaw(self, settled: bool = False) -> bool:
-+        """The frame fills the window again (laid out when Tk is idle; at once when the drag ``settled``) and the
-+        content's picture goes; False when it was not frozen."""
++        """The frame fills the window again (laid out when Tk is idle; at once when the drag ``settled``); False
++        when it was not frozen."""
          self._cancel()
 -        held, used = self.held, self.used
 -        self.used = False
@@ -841,21 +658,13 @@ index a3864cc..0a28865 100644
 -                target = self.share(self.width)
 -                if 1 <= target <= self.width - self.gap - 1:
 -                    self.paned.sashpos(0, target)
-+            self.frame.place(x=0, y=0, width="", height="", relwidth=1, relheight=1)  # (also after place_forget)
++            self.frame.place(x=0, y=0, width="", height="", relwidth=1, relheight=1)
 +            if settled:
-+                # laid out and drawn now (over the picture, which is below it), and timed for the benchmark
-+                self.frame.update_idletasks()
++                self.frame.update_idletasks()  # (laid out and drawn now, and timed for the benchmark)
 +                self.timings.append(("restore", (time.perf_counter() - started) * 1000))
          except tk.TclError:  # closed meanwhile
              pass
-+        self.hidden = False
-+        self._drop_picture()
 +        return True
-+
-+    def _on_destroy(self, _event=None):
-+        self._cancel()
-+        self.hidden = False
-+        self._drop_picture()
  
      def _cancel(self, _event=None):
          if self._after is not None:
@@ -939,7 +748,7 @@ index a3864cc..0a28865 100644
  
  
  class QueueLogHandler(logging.Handler):
-@@ -478,6 +968,10 @@ class RowTooltip(Tooltip):
+@@ -478,6 +777,10 @@ class RowTooltip(Tooltip):
  class Dialog(tk.Toplevel):
      """Small modal dialog base."""
  
@@ -950,7 +759,7 @@ index a3864cc..0a28865 100644
      def __init__(self, parent, theme: Theme, title: str):
          super().__init__(parent)
          self.withdraw()
-@@ -503,6 +997,8 @@ class Dialog(tk.Toplevel):
+@@ -503,6 +806,8 @@ class Dialog(tk.Toplevel):
      def show(self):
          self.update_idletasks()
          x, y = self._position()
@@ -959,7 +768,7 @@ index a3864cc..0a28865 100644
          self.geometry(f"+{x}+{y}")
          set_dark_titlebar(self, self.theme.name == "dark")
          self.deiconify()
-@@ -511,6 +1007,15 @@ class Dialog(tk.Toplevel):
+@@ -511,6 +816,15 @@ class Dialog(tk.Toplevel):
          self.wait_window()
          return self.result
  
@@ -975,7 +784,7 @@ index a3864cc..0a28865 100644
      def _position(self) -> tuple[int, int]:
          """Where show() puts the dialog: over its parent, centred and a third of the way down."""
          parent = self.master
-@@ -647,6 +1152,7 @@ class HelpDialog(Dialog):
+@@ -647,6 +961,7 @@ class HelpDialog(Dialog):
      """Usage guide: topics on the left, the whole guide as one scrolling page on the right."""
  
      INLINE = re.compile(r"\*\*(.+?)\*\*|\[\[(.+?)\]\]")
@@ -983,7 +792,7 @@ index a3864cc..0a28865 100644
  
      def __init__(self, parent, theme: Theme, topic: str | None = None):
          super().__init__(parent, theme, "사용법")
-@@ -785,6 +1291,8 @@ class HelpDialog(Dialog):
+@@ -785,6 +1100,8 @@ class HelpDialog(Dialog):
  class ConflictsDialog(Dialog):
      """Every two enabled mods that change the same files; result is a mod id to show in the list."""
  
@@ -992,7 +801,7 @@ index a3864cc..0a28865 100644
      def __init__(self, parent, theme: Theme, manager: ModManager):
          super().__init__(parent, theme, "충돌 한눈에 보기")
          px = theme.px
-@@ -2443,6 +2951,9 @@ class App:
+@@ -2443,6 +2760,9 @@ class App:
          self._restore_window()
          self._set_icon()
  
@@ -1002,7 +811,7 @@ index a3864cc..0a28865 100644
          self._build_header()
          self._build_toolbar()
          self._build_statusbar()
-@@ -2483,7 +2994,13 @@ class App:
+@@ -2483,7 +2803,13 @@ class App:
          s = self.manager.settings
          ratio = min(0.8, max(0.3, s.sash_ratio)) if s.remember_window else 0.58
          if width > 1:
@@ -1017,7 +826,7 @@ index a3864cc..0a28865 100644
  
      def _restore_window(self):
          s = self.manager.settings
-@@ -2508,7 +3025,8 @@ class App:
+@@ -2508,7 +2834,8 @@ class App:
      def _save_window_state(self):
          s = self.manager.settings
          try:
@@ -1027,7 +836,7 @@ index a3864cc..0a28865 100644
              changes: dict = {"log_visible": self._log_visible}
              if s.remember_window:
                  zoomed = self.root.state() == "zoomed"
-@@ -2531,9 +3049,9 @@ class App:
+@@ -2531,9 +2858,9 @@ class App:
  
      def _build_header(self):
          t, px = self.theme, self.theme.px
@@ -1039,7 +848,7 @@ index a3864cc..0a28865 100644
  
          ttk.Label(header, image=t.image("logo", 40), style="Header.TLabel").pack(side="left")
          titles = ttk.Frame(header, style="Header.TFrame")
-@@ -2611,7 +3129,7 @@ class App:
+@@ -2611,7 +2938,7 @@ class App:
  
      def _build_toolbar(self):
          t, px = self.theme, self.theme.px
@@ -1048,7 +857,7 @@ index a3864cc..0a28865 100644
          bar.pack(fill="x")
          self.buttons: dict[str, ttk.Button] = {}
  
-@@ -2654,9 +3172,9 @@ class App:
+@@ -2654,9 +2981,9 @@ class App:
  
      def _build_statusbar(self):
          px = self.theme.px
@@ -1060,7 +869,7 @@ index a3864cc..0a28865 100644
          self.status_sep.pack(side="bottom", fill="x")
          self.status_var = tk.StringVar(value="준비")
          ttk.Label(self.status_frame, textvariable=self.status_var, style="StatusMuted.TLabel").pack(side="left")
-@@ -2671,7 +3189,7 @@ class App:
+@@ -2671,7 +2998,7 @@ class App:
  
      def _build_log(self):
          t, px = self.theme, self.theme.px
@@ -1069,7 +878,7 @@ index a3864cc..0a28865 100644
          self.log_frame.pack(side="bottom", fill="x")
          card = t.mark(tk.Frame(self.log_frame), "card")
          card.pack(fill="x")
-@@ -2685,7 +3203,7 @@ class App:
+@@ -2685,7 +3012,7 @@ class App:
      def _build_notice(self):
          """A bar under the toolbar, shown when the last game ended in a crash (it does not block anything)."""
          t, px = self.theme, self.theme.px
@@ -1078,7 +887,7 @@ index a3864cc..0a28865 100644
          self.notice_title = ttk.Label(self.notice, text="", style="CalloutTitle.TLabel")
          self.notice_title.pack(side="left")
          self.notice_detail = ttk.Label(self.notice, text="", style="Callout.TLabel")
-@@ -2700,7 +3218,8 @@ class App:
+@@ -2700,7 +3027,8 @@ class App:
      def _build_bisect_bar(self):
          """The bar under the toolbar while 원인 모드 찾기 runs: the step, starting the game, stopping."""
          px = self.theme.px
@@ -1088,7 +897,7 @@ index a3864cc..0a28865 100644
          buttons = ttk.Frame(bar, style="Banner.TFrame")
          buttons.pack(side="right", padx=(px(12), 0))
          text = ttk.Frame(bar, style="Banner.TFrame")
-@@ -2725,7 +3244,7 @@ class App:
+@@ -2725,7 +3053,7 @@ class App:
  
      def _build_main(self):
          t, px = self.theme, self.theme.px
@@ -1097,7 +906,7 @@ index a3864cc..0a28865 100644
          paned.pack(fill="both", expand=True, padx=px(20), pady=(px(10), px(12)))
  
          # ---- mod list card
-@@ -2834,7 +3353,7 @@ class App:
+@@ -2834,7 +3162,7 @@ class App:
          window = self.options_canvas.create_window((0, 0), window=self.options_inner, anchor="nw")
          self.options_inner.bind("<Configure>", lambda e: self.options_canvas.configure(
              scrollregion=self.options_canvas.bbox("all")))
@@ -1106,7 +915,7 @@ index a3864cc..0a28865 100644
          self._option_vars: list[tuple[str, tk.BooleanVar]] = []
          self.notebook.add(self.options_tab, text="옵션", state="hidden")
  
-@@ -2857,8 +3376,6 @@ class App:
+@@ -2857,8 +3185,6 @@ class App:
          self.notebook.add(conflicts, text="충돌")
          self.conflicts_tab = conflicts
          paned.add(right, weight=2)

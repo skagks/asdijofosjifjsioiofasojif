@@ -50,14 +50,16 @@ def _pillow(bench):
 
 
 def test_variants_name_the_class_redraw_and_the_mode(bench, tmp_path):
-    """'all' compares the modes and Tk's window classes (RESIZE_CLASS_REDRAW) changed one at a time and both; a
-    variant sets gui.RESIZE_CLASS_REDRAW before the app is built, or, with a gui without it, leaves the change to
-    the benchmark; without a class part the app's default stays."""
-    assert bench.ALL == ["bare", "off", "freeze", "snapshot", "snapshot+unmap", "top+freeze", "child+freeze",
-                         "both+freeze", "both+off", "both+snapshot", "scale150+both+freeze"]
-    for spec in bench.ALL + bench.QUICK + ["noclassredraw+freeze", "keep+snapshot"]:
+    """'all' compares the app's defaults (base) with a plain window, the layout on every step, Tk's window classes
+    as they are (keep), the first step not told apart and 150 %; a variant sets gui.RESIZE_CLASS_REDRAW before the
+    app is built, or, with a gui without it, leaves the change to the benchmark; without a class part the app's
+    default stays."""
+    assert bench.ALL == ["bare", "base", "off", "freeze", "keep+freeze", "both+off", "both+freeze+nofirststep",
+                         "scale150", "scale150+off"]
+    for spec in bench.ALL + bench.QUICK + ["noclassredraw+freeze", "keep+snapshot", "snapshot+unmap",
+                                           "both+snapshot+fakecapture"]:
         bench.parse_spec(spec)
-    assert "both+freeze" in bench.QUICK
+    assert set(bench.QUICK) <= set(bench.ALL) and "base" in bench.QUICK and "bare" in bench.QUICK
 
     class Gui:
         RESIZE_CLASS_REDRAW = "keep"
@@ -86,6 +88,105 @@ def test_variants_name_the_class_redraw_and_the_mode(bench, tmp_path):
     result["env"]["class_styles"]["child"] = {"before": "0xb", "after": "0x8"}
     assert bench.redraw_of(result) == "both"
     assert bench.redraw_of({"env": {"class_redraw": "keep"}}) == "keep"
+
+
+def _guis():
+    """Stand-ins for gui modules: this app (freeze and off), one with the snapshot mode, one before the modes."""
+
+    class Modes:
+        @classmethod
+        def resize_mode(cls):  # (as gui.resize_mode)
+            if not cls.RESIZE_FREEZE:
+                return "off"
+            return cls.RESIZE_MODE if cls.RESIZE_MODE in cls.RESIZE_MODES else "freeze"
+
+    class New(Modes):
+        RESIZE_MODE, RESIZE_MODES, RESIZE_FREEZE, RESIZE_FIRST_STEP = "freeze", ("freeze", "off"), True, True
+
+    class Snap(Modes):
+        RESIZE_MODE, RESIZE_MODES, RESIZE_FREEZE, RESIZE_FIRST_STEP = "snapshot", ("snapshot", "freeze", "off"), True, True
+        RESIZE_SNAPSHOT_HIDE = "away"
+        _capture_content = None
+
+        @staticmethod
+        def photo_from_bgrx(master, data, width, height):
+            return ("picture", width, height)
+
+    class Old:
+        RESIZE_FREEZE = True
+
+    return New, Snap, Old
+
+
+def test_snapshot_variants_are_skipped_without_the_snapshot_mode(bench, tmp_path):
+    """The snapshot variants (snapshot, unmap, fakecapture) need an app with the snapshot mode: with this app (freeze
+    and off only) or one before the modes they are skipped with a note that says so, and nothing is changed; with an
+    app that has it they run as before. The other variants run with any app that has their switches."""
+    for spec in ("snapshot", "snapshot+unmap", "both+snapshot", "keep+snapshot+fakecapture", "freeze+unmap"):
+        new, snap, old = _guis()
+        for gui, why in ((new, "(its modes: freeze, off; the snapshot was taken out after it was measured)"),
+                         (old, "(no RESIZE_MODE: a gui from before the resize modes)")):
+            skip = _child(bench, spec, tmp_path).set_modes(gui)
+            assert "the app has no snapshot mode" in skip and why in skip, skip
+            assert gui.RESIZE_FREEZE is True and getattr(gui, "RESIZE_MODE", "freeze") == "freeze"
+            assert not hasattr(gui, "RESIZE_SNAPSHOT_HIDE") and not bench.has_snapshot(gui)
+        assert bench.has_snapshot(snap)
+        child = _child(bench, spec, tmp_path)
+        assert child.set_modes(snap) is None
+        assert snap.RESIZE_MODE == ("freeze" if spec == "freeze+unmap" else "snapshot")
+        assert snap.RESIZE_SNAPSHOT_HIDE == ("unmap" if "unmap" in spec else "away")
+        if "fakecapture" in spec:
+            assert snap._capture_content(None, 4, 3) == ("picture", 4, 3)
+            assert child.result["env"]["mode"] == "snap-fake"
+    for spec, mode in (("base", "freeze"), ("off", "off"), ("keep+freeze", "freeze"), ("both+off", "off"),
+                       ("both+freeze+nofirststep", "freeze")):
+        new, _snap, old = _guis()
+        child = _child(bench, spec, tmp_path)
+        assert child.set_modes(new) is None and child.result["env"]["mode"] == mode
+        assert new.RESIZE_FIRST_STEP is ("nofirststep" not in spec)
+        if spec != "both+freeze+nofirststep":  # (a gui before the modes has no first-step switch either)
+            assert _child(bench, spec, tmp_path).set_modes(old) is None and old.RESIZE_FREEZE is (mode == "freeze")
+
+
+def test_this_app_has_no_snapshot_mode(bench):
+    """The app as it is: its resize modes are freeze and off (the snapshot was taken out after it was measured), so
+    the snapshot variants are skipped with a note."""
+    pytest.importorskip("tkinter")
+    from mhwmm import gui
+
+    assert gui.RESIZE_MODES == ("freeze", "off") and not bench.has_snapshot(gui)
+    skip = bench.snapshot_skip(gui, ["both", "snapshot"])
+    assert skip == ("the app has no snapshot mode (its modes: freeze, off; the snapshot was taken out after it was "
+                    "measured), so snapshot cannot run")
+    assert bench.snapshot_skip(gui, ["both", "freeze"]) is None
+
+
+def test_the_mode_table_shows_the_picture_columns_only_with_pictures(bench, capsys):
+    """The resize mode table: the drag's end (restore) and the first step for this app; the snapshot's columns only
+    when a result has pictures (an app with the snapshot mode, or an older result file)."""
+
+    def result(variant, mode, **drag):
+        part = {"n_runs": 2, "first_frozen": 2, "restore_ms": {"n": 2, "median": 41.0, "p95": 50.0, "max": 50.0},
+                **drag}
+        return {"variant": variant, "env": {"mode": mode, "first_step": True, "first_step_probe": True},
+                "drag": part, "steps": dict(part, first_frozen=0)}
+
+    skipped = {"variant": "snapshot", "skipped": "the app has no snapshot mode (its modes: freeze, off)"}
+    bench.print_picture_tables([result("base", "freeze"), result("keep+freeze", "freeze"), skipped])
+    out = capsys.readouterr().out
+    assert "Resize mode and the drag's end" in out and "pic=scr" not in out and "Parts of a picture" not in out
+    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
+    assert lines["base"].split("|")[1].split() == ["2/2", "41/50"]
+    assert lines["base"].split("|")[2].split() == ["0/2", "41/50"]
+    assert "skipped: the app has no snapshot mode" in lines["snapshot"]
+
+    bench.print_picture_tables([result("base", "freeze"),
+                                result("both+snapshot", "snapshot", snapshots=2, picture_vs_screen=1.0,
+                                       snapshot_ms={"n": 2, "median": 30.0, "p95": 35.0, "max": 35.0})])
+    out = capsys.readouterr().out
+    assert "content's picture" in out and "pic=scr" in out
+    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
+    assert lines["both+snapshot"].split("|")[1].split() == ["2/2", "2", "30/35", "41/50", "-", "1.000"]
 
 
 @pytest.mark.parametrize("pillow", [True, False])
