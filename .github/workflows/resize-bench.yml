@@ -13,7 +13,7 @@ on:
         type: string
         default: ""
       patch:
-        description: "Optional: a change to measure before it is committed (git diff | gzip -9 | base64 -w0), applied with git apply"
+        description: "Optional: a change to measure before it is committed, applied with git apply: git diff | gzip -9 | base64 -w0, or file:<path> of a diff in the repository (tools/bench-patches/)"
         type: string
         default: ""
 
@@ -38,7 +38,12 @@ jobs:
         run: |
           import base64, gzip, os, subprocess
 
-          diff = gzip.decompress(base64.b64decode(os.environ["BENCH_PATCH"]))
+          spec = os.environ["BENCH_PATCH"].strip()
+          if spec.startswith("file:"):
+              with open(spec[5:], "rb") as f:
+                  diff = f.read()
+          else:
+              diff = gzip.decompress(base64.b64decode(spec))
           subprocess.run(["git", "apply", "--stat"], input=diff, check=True)
           subprocess.run(["git", "apply"], input=diff, check=True)
       - name: Desktop

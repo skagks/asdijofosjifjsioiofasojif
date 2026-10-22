@@ -1,0 +1,959 @@
+diff --git a/mhwmm/equipview.py b/mhwmm/equipview.py
+index b986986..154bcb4 100644
+--- a/mhwmm/equipview.py
++++ b/mhwmm/equipview.py
+@@ -15,7 +15,8 @@ from .equip import look as equip_look
+ from .equip import overview as ov
+ from .equip.model import (ARMOR_PARTS, BODIES, KIND_LABELS, PART_LABELS, Target, parse_armor_key,
+                           parse_weapon_key)
+-from .gui import Dialog, FollowWidth, Image, ImageTk, Tooltip, autohide, load_image, set_dark_titlebar
++from .gui import (Dialog, FreezeContent, Image, ImageTk, Tooltip, autohide, follow_width, load_image,
++                  set_dark_titlebar)
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -70,10 +71,13 @@ class EquipmentWindow(tk.Toplevel):
+         self._look_cv = threading.Condition()
+         threading.Thread(target=self._look_worker, daemon=True).start()
+ 
++        # everything in the window is in one frame: it keeps its size while the window's edge is dragged
++        self.content = ttk.Frame(self)
++        self.freeze = FreezeContent(self, self.content)
+         self._build_header()
+         self._build_body()
+         self.status_var = tk.StringVar(value="")
+-        status = ttk.Frame(self, padding=(px(22), 0, px(22), px(14)))
++        status = ttk.Frame(self.content, padding=(px(22), 0, px(22), px(14)))
+         status.pack(side="bottom", fill="x")
+         ttk.Label(status, textvariable=self.status_var, style="Muted.TLabel", font=t.fonts["small"]).pack(side="left")
+         self.more = ttk.Menubutton(status, text="⋯", style="Ghost.TMenubutton")
+@@ -93,7 +97,7 @@ class EquipmentWindow(tk.Toplevel):
+     # ------------------------------------------------------------------ layout
+     def _build_header(self):
+         t, px = self.theme, self.theme.px
+-        outer = ttk.Frame(self, padding=(px(22), px(18), px(22), px(12)))
++        outer = ttk.Frame(self.content, padding=(px(22), px(18), px(22), px(12)))
+         outer.pack(fill="x")
+         head = ttk.Frame(outer)
+         head.pack(fill="x")
+@@ -149,7 +153,7 @@ class EquipmentWindow(tk.Toplevel):
+ 
+     def _build_body(self):
+         t, px = self.theme, self.theme.px
+-        body = ttk.Frame(self, padding=(px(22), 0, px(22), px(10)))
++        body = ttk.Frame(self.content, padding=(px(22), 0, px(22), px(10)))
+         body.pack(fill="both", expand=True)
+         nav = ttk.Frame(body, width=px(180))
+         nav.pack(side="left", fill="y", padx=(0, px(14)))
+@@ -174,7 +178,7 @@ class EquipmentWindow(tk.Toplevel):
+         inner = ttk.Frame(canvas, style="TFrame" if plain else "Card.TFrame", padding=padding)
+         window = canvas.create_window((0, 0), window=inner, anchor="nw")
+         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+-        FollowWidth(canvas, window)  # (all the tiles are laid out again for a new width: not on every drag step)
++        follow_width(canvas, window)
+         return canvas, inner
+ 
+     def _bind_wheel(self, widget, canvas):
+diff --git a/mhwmm/gui.py b/mhwmm/gui.py
+index a3864cc..bc01c33 100644
+--- a/mhwmm/gui.py
++++ b/mhwmm/gui.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import collections
+ import gc
+ import logging
+ import os
+@@ -151,28 +152,362 @@ def autohide(scrollbar: ttk.Scrollbar, **pack_options):
+ 
+ 
+ # While a window's edge is dragged, Tk gets a new size for every mouse step (on Windows each one is handled
+-# before the next mouse move). Content that is costly to lay out again keeps its width during the drag and
+-# follows once the size has not changed for this long.
++# before the next mouse move). The window's content keeps its size during the drag (FreezeContent) and follows
++# once the size has not changed for this long.
+ RESIZE_SETTLE_MS = 120
+ # A change on its own (maximize, restore) is followed at once. If it was the first step of a drag, laying the
+ # window out for it can take longer than RESIZE_SETTLE_MS (all the tiles of 장비 외형 at 150%), so a change this
+-# soon after a change on its own is the drag's next step (else each step would be laid out at once again).
++# soon after a change on its own is the drag's next step (else each step would be laid out at once again). The
++# same after a frozen drag's content followed (a pause with the mouse button still down, FreezeContent._settled).
++# On Windows only while the mouse drags (RESIZE_FIRST_STEP).
+ RESIZE_FIRST_MS = 600
++# What FreezeContent does while the window's edge is dragged (resize_mode()):
++#   "snapshot": a picture of the content stands in for it (one Label) and the content is moved out of the window.
++#               On Windows each step of the drag makes Windows repaint every child window of the toplevel, also
++#               the ones whose size did not change (Tk's window classes have CS_HREDRAW|CS_VREDRAW: the resized
++#               toplevel is invalidated with all its children), and Tk draws each of them again: with the content
++#               out of the window only the picture is drawn. Needs _capture_content (Windows only); elsewhere, or
++#               when taking the picture fails, it is "freeze".
++#   "freeze":   the content keeps its size (nothing in it is laid out again; on Windows it is still drawn again).
++#   "off":      the content is laid out again on every step (for comparing in the resize benchmark).
++RESIZE_MODE = "snapshot"
++RESIZE_MODES = ("snapshot", "freeze", "off")
++# The older switch: False is RESIZE_MODE "off".
++RESIZE_FREEZE = True
++# Windows: the mouse tells a drag of the window's edge from the other size changes, already at the drag's first
++# step (_drag_step; else that step lays the whole window out):
++#   - a change of the wm state (maximize, restore) is never one: also a title-bar double-click (it acts on the
++#     button's press, so the button is down) and a maximized window dragged by its title bar; a zoomed window has
++#     no edge to drag, and snapping or a double-click on the top border keeps "normal";
++#   - with the primary button up and no move or size loop (Win+arrow keys, the maximize button), or with "show
++#     window contents while dragging" off (Windows sizes the window once, at the drag's end), a change is one only
++#     right after the last change (RESIZE_SETTLE_MS; RESIZE_FIRST_MS is for a drag the mouse does not show);
++#   - with the button down or in Windows' move or size loop (a pen or a finger) it is one when the cursor is on
++#     the window's sizing border, or when the frame kept at least two of its edges and was not as wide or as tall
++#     as the work area before or after the change (a drag of an edge keeps three edges, of a corner two; dragging
++#     a snapped window's title bar gives it back its size from before the snap and moves it), or by the time rules.
++# Only queries (no window message is sent); when one fails, the time rules decide as elsewhere.
++RESIZE_FIRST_STEP = True
++# How the content is kept from being drawn while its picture shows: "away" (placed left of the window, still
++# mapped: Windows invalidates only the child windows that intersect the resized window) or "unmap" (place_forget;
++# for comparing in the resize benchmark).
++RESIZE_SNAPSHOT_HIDE = "away"
++# No picture of a bigger content (it is copied a few times, 4 bytes a pixel, while the picture is made)
++SNAPSHOT_MAX_PIXELS = 3840 * 2160
+ _RESIZE_TAG = "MhwmmResize"
+ 
+ 
++def resize_mode() -> str:
++    """The resize mode in effect: RESIZE_MODE, or "off" when RESIZE_FREEZE is False."""
++    if not RESIZE_FREEZE:
++        return "off"
++    return RESIZE_MODE if RESIZE_MODE in RESIZE_MODES else "freeze"
++
++
++def _win_functions(dll: str, specs: dict) -> dict:
++    """ctypes functions of a Windows DLL with their argument and result types: {name: (restype, *argtypes)}."""
++    import ctypes
++
++    lib = ctypes.WinDLL(dll, use_last_error=True)  # type: ignore[attr-defined]
++    out = {}
++    for name, (restype, *argtypes) in specs.items():
++        fn = getattr(lib, name)
++        fn.restype, fn.argtypes = restype, list(argtypes)
++        out[name] = fn
++    return out
++
++
++class _WinPointer:
++    """The mouse button, Windows' move or size loop, where the cursor is on a toplevel's frame and where the frame
++    is, as Windows has them (RESIZE_FIRST_STEP). Only queries: no window message is sent (this runs inside Tk's
++    event handling, also in Windows' sizing loop)."""
++
++    VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
++    SM_SWAPBUTTON, SM_CYSIZEFRAME, SM_CXPADDEDBORDER = 23, 33, 92
++    MONITOR_DEFAULTTONEAREST = 2
++    GUI_INMOVESIZE = 0x00000002
++    SPI_GETDRAGFULLWINDOWS = 0x0026
++
++    def __init__(self):
++        import ctypes
++        from ctypes import wintypes as wt
++
++        class MONITORINFO(ctypes.Structure):
++            _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
++
++        class GUITHREADINFO(ctypes.Structure):
++            _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD), ("hwndActive", wt.HWND), ("hwndFocus", wt.HWND),
++                        ("hwndCapture", wt.HWND), ("hwndMenuOwner", wt.HWND), ("hwndMoveSize", wt.HWND),
++                        ("hwndCaret", wt.HWND), ("rcCaret", wt.RECT)]
++
++        self.ctypes, self.wt, self.MONITORINFO, self.GUITHREADINFO = ctypes, wt, MONITORINFO, GUITHREADINFO
++        rect, point = ctypes.POINTER(wt.RECT), ctypes.POINTER(wt.POINT)
++        self.f = _win_functions("user32", {
++            "GetAsyncKeyState": (ctypes.c_short, ctypes.c_int),
++            "GetSystemMetrics": (ctypes.c_int, ctypes.c_int),
++            "GetCursorPos": (wt.BOOL, point),
++            "GetWindowRect": (wt.BOOL, wt.HWND, rect),
++            "GetClientRect": (wt.BOOL, wt.HWND, rect),
++            "ClientToScreen": (wt.BOOL, wt.HWND, point),
++            "MonitorFromWindow": (wt.HMONITOR, wt.HWND, wt.DWORD),
++            "GetMonitorInfoW": (wt.BOOL, wt.HMONITOR, ctypes.POINTER(MONITORINFO)),
++            "GetWindowThreadProcessId": (wt.DWORD, wt.HWND, ctypes.POINTER(wt.DWORD)),
++            "GetGUIThreadInfo": (wt.BOOL, wt.DWORD, ctypes.POINTER(GUITHREADINFO)),
++            "SystemParametersInfoW": (wt.BOOL, wt.UINT, wt.UINT, ctypes.c_void_p, wt.UINT),
++        })
++
++    @staticmethod
++    def frame(top: tk.Misc) -> int:
++        """The toplevel's outer (wrapper) window."""
++        return int(str(top.wm_frame()), 16)
++
++    def button_down(self) -> bool:
++        """The primary mouse button is down (GetAsyncKeyState reads the physical buttons)."""
++        f = self.f
++        vk = self.VK_RBUTTON if f["GetSystemMetrics"](self.SM_SWAPBUTTON) else self.VK_LBUTTON
++        return bool(f["GetAsyncKeyState"](vk) & 0x8000)
++
++    def in_move_size(self, top: tk.Misc) -> bool:
++        """Windows' move or size loop runs in the toplevel's thread (its edge or title bar dragged, with the mouse,
++        a pen or a finger; or 크기 조정 of its system menu, with the arrow keys)."""
++        f, ctypes = self.f, self.ctypes
++        thread = f["GetWindowThreadProcessId"](self.frame(top), None)
++        if not thread:
++            return False
++        info = self.GUITHREADINFO()
++        info.cbSize = ctypes.sizeof(info)
++        if not f["GetGUIThreadInfo"](thread, ctypes.byref(info)):
++            return False
++        return bool(info.flags & self.GUI_INMOVESIZE)
++
++    def shows_contents(self) -> bool:
++        """Windows shows a window's contents while it is dragged (창을 끄는 동안 내용 표시, the default; else it
++        draws an outline and sizes the window once, when the drag ends)."""
++        value = self.wt.BOOL()
++        if not self.f["SystemParametersInfoW"](self.SPI_GETDRAGFULLWINDOWS, 0, self.ctypes.byref(value), 0):
++            return True
++        return bool(value.value)
++
++    def dragging(self, top: tk.Misc) -> bool:
++        """The window's size may be changing in steps of a drag: the primary button is down, or Windows' move or
++        size loop runs (a pen or a finger need not show as the mouse button); not with an outline drag."""
++        return self.shows_contents() and (self.button_down() or self.in_move_size(top))
++
++    def _window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
++        r = self.wt.RECT()
++        if not self.f["GetWindowRect"](hwnd, self.ctypes.byref(r)):
++            raise OSError("GetWindowRect failed")
++        return r.left, r.top, r.right, r.bottom
++
++    def on_sizing_border(self, top: tk.Misc) -> bool:
++        """The cursor is on the toplevel's frame (or just outside it) and not in its client area or title bar."""
++        f, byref, wt = self.f, self.ctypes.byref, self.wt
++        hwnd = self.frame(top)
++        cursor = wt.POINT()
++        client, origin = wt.RECT(), wt.POINT(0, 0)
++        if not (f["GetCursorPos"](byref(cursor)) and f["GetClientRect"](hwnd, byref(client))
++                and f["ClientToScreen"](hwnd, byref(origin))):
++            return False
++        left, top_, right, bottom = self._window_rect(hwnd)
++        border = max(1, f["GetSystemMetrics"](self.SM_CYSIZEFRAME) + f["GetSystemMetrics"](self.SM_CXPADDEDBORDER))
++        x, y = cursor.x, cursor.y
++        slack = 2 * border  # (the cursor can be ahead of the edge that follows it)
++        if not (left - slack <= x < right + slack and top_ - slack <= y < bottom + slack):
++            return False
++        inside_x = origin.x <= x < origin.x + client.right
++        if inside_x and origin.y <= y < origin.y + client.bottom:
++            return False  # the client area
++        return not (inside_x and top_ + border <= y < origin.y)  # (not the title bar)
++
++    def where(self, top: tk.Misc) -> tuple[tuple[int, int, int, int], bool]:
++        """The toplevel's frame on the screen (left, top, right, bottom), and whether it is as wide or as tall as
++        the work area of its monitor (maximized, or snapped)."""
++        f, byref = self.f, self.ctypes.byref
++        hwnd = self.frame(top)
++        rect = left, top_, right, bottom = self._window_rect(hwnd)
++        info = self.MONITORINFO()
++        info.cbSize = self.ctypes.sizeof(info)
++        monitor = f["MonitorFromWindow"](hwnd, self.MONITOR_DEFAULTTONEAREST)
++        if not monitor or not f["GetMonitorInfoW"](monitor, byref(info)):
++            return rect, False
++        work = info.rcWork
++        return rect, (left <= work.left and right >= work.right) or (top_ <= work.top and bottom >= work.bottom)
++
++
++_POINTER: list = []  # [the _WinPointer, or None], made the first time it is needed
++
++
++def _pointer():
++    """Windows' mouse button and frame queries (_WinPointer), or None (not Windows, or not usable here)."""
++    if not _POINTER:
++        probe = None
++        if sys.platform == "win32":
++            try:
++                probe = _WinPointer()
++            except Exception as exc:
++                log.debug("마우스 상태를 읽을 수 없습니다: %s", exc)
++        _POINTER.append(probe)
++    return _POINTER[0]
++
++
++def _place(top: tk.Misc, probe) -> tuple:
++    """(the toplevel's wm state, probe.where(top)), each None when it cannot be read: noted at each Configure
++    (moves too) for the next size change."""
++    try:
++        state = top.wm_state()
++    except tk.TclError:
++        state = None
++    try:
++        where = probe.where(top)
++    except Exception as exc:
++        log.debug("창의 자리를 알 수 없습니다: %s", exc)
++        where = None
++    return state, where
++
++
++def _resized_in_place(before, after) -> bool:
++    """The frame kept at least two of its edges and was not as big as the work area before or after the change
++    (``before``, ``after``: _place's): a drag of an edge keeps three edges, of a corner two."""
++    if before is None or before[1] is None or after[1] is None:
++        return False
++    (old, spanned), (new, spans) = before[1], after[1]
++    return not spanned and not spans and sum(a == b for a, b in zip(old, new)) >= 2
++
++
++def _drag_step(top: tk.Misc, probe, before, after, by_last: bool, by_alone: bool) -> bool:
++    """Is the size change a step of a drag of the window's edge (``resizing``)? ``by_last``: it came within
++    RESIZE_SETTLE_MS of the last change; ``by_alone``: within RESIZE_FIRST_MS of a change on its own. Without the
++    mouse (``probe`` None: not Windows, RESIZE_FIRST_STEP off) by these alone; with it see RESIZE_FIRST_STEP
++    (``before``, ``after``: _place's for the last Configure and this one)."""
++    if probe is None:
++        return by_last or by_alone
++    try:
++        old, new = (before or (None, None))[0], after[0]
++        if old is not None and new is not None and old != new:
++            return False  # a maximize or restore
++        if not probe.dragging(top):
++            return by_last  # (Win+arrow keys, the maximize button: soon after a drag or another snap too)
++        return by_last or by_alone or probe.on_sizing_border(top) or _resized_in_place(before, after)
++    except Exception as exc:  # (as without it)
++        log.debug("창 크기 바꾸기를 알 수 없습니다: %s", exc)
++        return by_last or by_alone
++
++
++class _WinCapture:
++    """What a window shows (its part of the toplevel's surface, child windows included), copied with GDI: BitBlt
++    from the window's DC into a 32-bit top-down DIB. Under DWM the source is the toplevel's own surface, so other
++    windows over it and other monitors do not matter, and it is in the window's pixels (Tk's: no DPI scaling)."""
++
++    SRCCOPY = 0x00CC0020
++
++    def __init__(self):
++        import ctypes
++        from ctypes import wintypes as wt
++
++        class BITMAPINFOHEADER(ctypes.Structure):
++            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
++                        ("biBitCount", wt.WORD), ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
++                        ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
++                        ("biClrImportant", wt.DWORD)]
++
++        if ctypes.sizeof(BITMAPINFOHEADER) != 40:
++            raise RuntimeError("BITMAPINFOHEADER")
++        self.ctypes, self.BITMAPINFOHEADER = ctypes, BITMAPINFOHEADER
++        c_int = ctypes.c_int
++        self.user32 = _win_functions("user32", {
++            "GetDC": (wt.HDC, wt.HWND),
++            "ReleaseDC": (c_int, wt.HWND, wt.HDC),
++        })
++        self.gdi32 = _win_functions("gdi32", {
++            "CreateCompatibleDC": (wt.HDC, wt.HDC),
++            "CreateDIBSection": (wt.HBITMAP, wt.HDC, ctypes.c_void_p, wt.UINT, ctypes.POINTER(ctypes.c_void_p),
++                                 wt.HANDLE, wt.DWORD),
++            "SelectObject": (wt.HGDIOBJ, wt.HDC, wt.HGDIOBJ),
++            "BitBlt": (wt.BOOL, wt.HDC, c_int, c_int, c_int, c_int, wt.HDC, c_int, c_int, wt.DWORD),
++            "GdiFlush": (wt.BOOL,),
++            "DeleteObject": (wt.BOOL, wt.HGDIOBJ),
++            "DeleteDC": (wt.BOOL, wt.HDC),
++        })
++
++    def grab(self, hwnd: int, width: int, height: int) -> bytes:
++        """The window's top-left width × height: B, G, R and an unused byte a pixel, rows from the top."""
++        ctypes, u, g = self.ctypes, self.user32, self.gdi32
++        header = self.BITMAPINFOHEADER(40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)  # (BI_RGB, top-down)
++        window_dc = u["GetDC"](hwnd)
++        if not window_dc:
++            raise OSError("GetDC failed")
++        try:
++            memory_dc = g["CreateCompatibleDC"](window_dc)
++            if not memory_dc:
++                raise OSError("CreateCompatibleDC failed")
++            try:
++                bits = ctypes.c_void_p()
++                bitmap = g["CreateDIBSection"](memory_dc, ctypes.byref(header), 0, ctypes.byref(bits), None, 0)
++                if not bitmap or not bits.value:
++                    raise OSError("CreateDIBSection failed")
++                try:
++                    old = g["SelectObject"](memory_dc, bitmap)
++                    try:
++                        if not g["BitBlt"](memory_dc, 0, 0, width, height, window_dc, 0, 0, self.SRCCOPY):
++                            raise OSError(f"BitBlt failed (error {ctypes.get_last_error()})")
++                        g["GdiFlush"]()
++                        return ctypes.string_at(bits.value, width * height * 4)
++                    finally:
++                        g["SelectObject"](memory_dc, old)
++                finally:
++                    g["DeleteObject"](bitmap)
++            finally:
++                g["DeleteDC"](memory_dc)
++        finally:
++            u["ReleaseDC"](hwnd, window_dc)
++
++
++def photo_from_bgrx(master: tk.Misc, data: bytes, width: int, height: int):
++    """A PhotoImage of width × height pixels given as B, G, R and an unused byte each (rows from the top)."""
++    if Image is not None:
++        picture = Image.frombuffer("RGB", (width, height), data, "raw", "BGRX", 0, 1)
++        return ImageTk.PhotoImage(picture, master=master)
++    rgb = bytearray(width * height * 3)  # (without Pillow: a binary PPM, which Tk 8.6 reads from bytes)
++    rgb[0::3], rgb[1::3], rgb[2::3] = data[2::4], data[1::4], data[0::4]
++    return tk.PhotoImage(master=master, format="ppm", data=b"P6\n%d %d\n255\n" % (width, height) + bytes(rgb))
++
++
++_CAPTURE: list = []  # [the _WinCapture, or None]
++
++
++def _gdi_capture(frame: tk.Misc, width: int, height: int):
++    """The top-left width × height of ``frame`` as it is on screen, as a PhotoImage (Windows)."""
++    if not _CAPTURE:
++        _CAPTURE.append(_WinCapture())  # (an error here: no picture, the content is frozen as it is)
++    data = _CAPTURE[0].grab(frame.winfo_id(), width, height)
++    step = 4 * max(1, width * height // 1000)  # (about a thousand pixels)
++    if len({data[i:i + 3] for i in range(0, len(data), step)}) <= 1:
++        raise ValueError("the picture is blank")  # (the window's pixels were not there: frozen instead)
++    return photo_from_bgrx(frame, data, width, height)
++
++
++# capture(frame, width, height) -> a PhotoImage of what the frame shows, for RESIZE_MODE "snapshot"; None: no way
++# to take one here (the content is frozen instead)
++_capture_content = _gdi_capture if sys.platform == "win32" else None
++
++
+ def _note_resize(event):
+     top = event.widget
+     if isinstance(top, str):  # (a toplevel tkinter does not know)
+         return
++    probe = _pointer() if RESIZE_FIRST_STEP else None
++    before = getattr(top, "_mhwmm_place", None)
++    top._mhwmm_place = after = _place(top, probe) if probe is not None else None  # (Windows: also when moved)
+     size = (event.width, event.height)
+     if getattr(top, "_mhwmm_size", None) != size:  # (moving the window is not resizing it)
+         now = time.perf_counter()  # (time.monotonic() is in 15.6 ms steps on Windows before Python 3.13)
+         last, alone = getattr(top, "_mhwmm_changed", None), getattr(top, "_mhwmm_alone", None)
+-        # a drag from its second step on: a change on its own (maximize, restore, snapping to a screen edge, a
+-        # drag with "show window contents while dragging" off) is followed at once
+-        drag = (last is not None and now - last < RESIZE_SETTLE_MS / 1000) or \
+-            (alone is not None and now - alone < RESIZE_FIRST_MS / 1000)
++        # a drag from its second step on (on Windows from its first, when the mouse tells): a change on its own
++        # (maximize, restore, snapping to a screen edge, a drag with "show window contents while dragging" off)
++        # is followed at once
++        drag = _drag_step(top, probe, before, after,
++                          last is not None and now - last < RESIZE_SETTLE_MS / 1000,
++                          alone is not None and now - alone < RESIZE_FIRST_MS / 1000)
+         top._mhwmm_size, top._mhwmm_changed = size, now
+         top._mhwmm_resized, top._mhwmm_alone = (now, alone) if drag else (None, now)
+         for on_size in getattr(top, "_mhwmm_on_size", ()):
+@@ -195,185 +530,191 @@ def watch_resizing(top: tk.Misc, on_size=None):
+ def resizing(widget: tk.Misc) -> bool:
+     """True while the window of ``widget`` is being resized by dragging its edge: its size changed less than
+     RESIZE_SETTLE_MS ago, and less than RESIZE_SETTLE_MS after the change before (or soon after a change on its
+-    own, see RESIZE_FIRST_MS)."""
++    own, see RESIZE_FIRST_MS; or on Windows from the first step, see RESIZE_FIRST_STEP)."""
+     top = widget.winfo_toplevel()
+     at = getattr(top, "_mhwmm_resized", None)
+     return at is not None and time.perf_counter() - at < RESIZE_SETTLE_MS / 1000
+ 
+ 
+-class FollowWidth:
+-    """Keeps the canvas window ``item`` (a scrolled frame of cards) as wide as ``canvas``. While the window's edge
+-    is dragged the cards keep their width and are laid out once RESIZE_SETTLE_MS after the last change (doing
+-    it on every step of the drag makes resizing stutter); other width changes (the first one, the drag's first
+-    step, maximize or restore, the scrollbar showing up, another tab, the sash) are followed at once, as before."""
+-
+-    def __init__(self, canvas: tk.Canvas, item):
+-        self.canvas, self.item = canvas, item
+-        self.width: int | None = None  # what the item was given
++class FreezeContent:
++    """All of the toplevel ``top``'s content in one frame, ``frame`` (a child of ``top``), placed to fill the
++    window. While the window's edge is dragged (``resizing``) the frame keeps the size it has, so Tk lays out and
++    draws nothing in it on the steps of the drag (only the window's own background where it grew; where it got
++    smaller the content is cut off). RESIZE_SETTLE_MS after the last change the frame fills the window again and
++    is laid out once. Other changes (maximize, restore, snapping to a screen edge, the drag's first step unless
++    the mouse tells, see RESIZE_FIRST_STEP, and all changes within RESIZE_FIRST_MS of the window's first size:
++    shown zoomed or moved to its monitor) are followed at once.
++
++    On Windows every widget is a window of its own and Tk lays out and draws all of them again for each step of
++    the drag before the next mouse move, which made resizing stutter. In RESIZE_MODE "snapshot" a picture of the
++    content (as it was on screen when the drag started) stands in for it during the drag, in one Label below the
++    frame, and the frame is moved out of the window: Windows repaints the children of a resized window on every
++    step even when their size does not change. When the drag stops the content comes back, is laid out and drawn
++    over the picture, and the picture goes. Any failure: the content is frozen as it is (never left hidden).
++
++    Placing the frame does not give the window a requested size: the window's size is set with geometry()."""
++
++    AWAY = 64  # pixels between the window's left edge and the content moved out of it
++
++    def __init__(self, top: tk.Misc, frame: tk.Misc):
++        self.top, self.frame = top, frame
++        self.frozen = False
++        self.hidden = False  # the content is out of the window and its picture shows
++        self.picture: tk.Label | None = None  # (made at the first snapshot)
++        self._image = None
+         self._after = None
+-        watch_resizing(canvas.winfo_toplevel())
+-        canvas.bind("<Configure>", self._on_configure, add="+")
+-        canvas.bind("<Destroy>", self._on_destroy, add="+")
+-
+-    def _on_destroy(self, _event=None):
+-        if self._after is not None:
+-            self.canvas.after_cancel(self._after)
+-            self._after = None
++        self._shown: float | None = None  # when the window got its first size
++        # (what, ms): "snapshot" (the picture taken and shown), "no snapshot" (frozen instead), "restore" (the
++        # content back, laid out and drawn) - for the resize benchmark
++        self.timings: collections.deque = collections.deque(maxlen=64)
++        frame.place(x=0, y=0, relwidth=1, relheight=1)
++        watch_resizing(top, self._on_size)
++        frame.bind("<Destroy>", self._on_destroy, add="+")
++
++    def _on_size(self, _event):
++        """The window got a new size (before the frame is laid out for it)."""
++        now = time.perf_counter()
++        if self._shown is None:
++            self._shown = now
++        mode = resize_mode()
++        if mode == "off" or not resizing(self.top) or now - self._shown < RESIZE_FIRST_MS / 1000:
++            self.thaw()  # (a change on its own: followed at once)
++            return
++        try:
++            if not self.frozen:
++                width, height = self.frame.winfo_width(), self.frame.winfo_height()
++                if width <= 1 or height <= 1:
++                    return  # not laid out yet
++                self.frame.place_configure(relwidth=0, relheight=0, width=width, height=height)
++                self.frozen = True
++                if mode == "snapshot":
++                    self._snapshot(width, height)
++            self._cancel()
++            self._after = self.frame.after(RESIZE_SETTLE_MS, self._settled)
++        except tk.TclError:  # closed meanwhile
++            if self.hidden:  # (nothing would bring the content back)
++                self.thaw()
+ 
+-    def _on_configure(self, event):
+-        if event.width == self.width and self._after is None:
+-            return  # moved, or only the height changed
+-        if self.width is not None and resizing(self.canvas):
+-            if self._after is not None:
+-                self.canvas.after_cancel(self._after)
+-            self._after = self.canvas.after(RESIZE_SETTLE_MS, self._settled)
+-        else:
+-            self.apply(event.width)
++    def _snapshot(self, width: int, height: int):
++        """A picture of the content in its place, and the content (frozen at width × height) out of the window."""
++        capture = _capture_content
++        if capture is None:
++            return
++        started = time.perf_counter()
++        try:
++            frame, top = self.frame, self.top
++            if not frame.winfo_ismapped() or frame.winfo_x() or frame.winfo_y():
++                raise ValueError("the content is not where it shows")
++            # only what is inside the window (where it just got smaller the content's pixels may be gone)
++            shown_w, shown_h = min(width, top.winfo_width()), min(height, top.winfo_height())
++            if shown_w <= 1 or shown_h <= 1 or shown_w * shown_h > SNAPSHOT_MAX_PIXELS:
++                raise ValueError(f"no picture of {shown_w}x{shown_h}")
++            image = capture(frame, shown_w, shown_h)
++            if image is None:
++                raise ValueError("no picture")
++            label = self._label()
++            label.configure(image=image, width=shown_w, height=shown_h)
++            self._image = image
++            label.place(x=0, y=0, width=shown_w, height=shown_h)
++            label.lower(frame)  # (below the content once it is back)
++            if RESIZE_SNAPSHOT_HIDE == "unmap":
++                frame.place_forget()
++            else:
++                frame.place_configure(x=-(width + self.AWAY), y=0)
++            self.hidden = True
++            self.timings.append(("snapshot", (time.perf_counter() - started) * 1000))
++        except Exception as exc:  # frozen as it is
++            self.timings.append(("no snapshot", (time.perf_counter() - started) * 1000))
++            log.debug("창 내용의 그림을 만들지 못해 내용을 그대로 둡니다: %s", exc)
++            try:
++                self.frame.place(x=0, y=0, relwidth=0, relheight=0, width=width, height=height)  # (in the window)
++            except tk.TclError:  # closed meanwhile
++                pass
++            self.hidden = False
++            self._drop_picture()
+ 
+-    def _settled(self):
+-        self._after = None
+-        self.apply()
++    def _label(self) -> tk.Label:
++        label = self.picture
++        if label is not None:
++            try:
++                if label.winfo_exists():
++                    return label
++            except tk.TclError:
++                pass
++        parent = self.frame.master
++        label = tk.Label(parent, borderwidth=0, highlightthickness=0, padx=0, pady=0, takefocus=0)
++        try:
++            label.configure(background=parent.cget("background"))  # (seen only if the picture does not load)
++        except tk.TclError:
++            pass
++        self.picture = label
++        return label
+ 
+-    def apply(self, width: int | None = None):
+-        """Give the item the canvas's width now."""
+-        if self._after is not None:
+-            self.canvas.after_cancel(self._after)
+-            self._after = None
++    def _drop_picture(self):
++        """The content's picture taken away (its image goes with it)."""
++        image, self._image = self._image, None
++        if image is None or self.picture is None:
++            return
+         try:
+-            width = width if width is not None else self.canvas.winfo_width()
+-            if width != self.width:
+-                self.width = width
+-                self.canvas.itemconfigure(self.item, width=width)
++            self.picture.place_forget()
++            self.picture.configure(image="")
+         except tk.TclError:  # closed meanwhile
+             pass
+ 
+-
+-class HoldPane:
+-    """While the window's edge is dragged, the first pane of the horizontal ttk.Panedwindow ``paned`` (the mod
+-    list: drawing all of it again on every step of the drag made resizing stutter) keeps its width and the second
+-    pane takes the change. RESIZE_SETTLE_MS after the drag the sash goes where it would be without the hold (ttk
+-    shares a change in width out by the panes' weights, from where the sash was put). During the drag the first
+-    pane catches up at once when it is more than ``lag`` pixels off, or when holding it would make the second pane
+-    narrower than ``room`` and than it would be without the hold.
+-
+-    It works from the window's own size change: ttk lays the panes out as soon as the paned window gets its new
+-    size (before a <Configure> binding of the paned window runs), and that happens once the window's content is
+-    packed again, after the window's <Configure>."""
+-
+-    SLACK = 3  # pixels ttk's rounding can leave the sash off its share (further off: the sash was moved)
+-
+-    def __init__(self, paned: ttk.Panedwindow, lag: int, room: int):
+-        self.paned, self.lag, self.room = paned, lag, room
+-        self.first, self.second = (str(p) for p in paned.panes())
+-        self.weights = tuple(int(paned.pane(p, "weight")) for p in (self.first, self.second))
+-        self.width: int | None = None  # the paned window's width as laid out
+-        self.offset: int | None = None  # how much narrower than its window it is
+-        self.base: tuple[int, int] | None = None  # (sash, width) where the sash was put
+-        self.held: int | None = None  # the first pane's width while it is held
+-        self.gap = 0  # the sash's thickness
+-        self.used = False  # held during this drag: the sash goes to its share when the drag stops
++    def _settled(self):
++        """The size has not changed for RESIZE_SETTLE_MS: the content follows. The mouse button may still be down
++        (a pause in the drag), so a change soon after this goes on with the drag and is frozen, as a step soon
++        after the drag's first step is (else the step that resumes the drag would be laid out at once: the whole
++        window laid out twice for one pause, the second time just as the mouse moves again)."""
+         self._after = None
+-        watch_resizing(paned.winfo_toplevel(), self._on_window_size)
+-        paned.bind("<Configure>", self._on_configure, add="+")
+-        paned.bind("<Destroy>", self._cancel, add="+")
+-
+-    def share(self, width: int) -> int:
+-        """Where the sash goes at ``width`` without the hold."""
+-        sash, base = self.base
+-        first, total = self.weights[0], sum(self.weights)
+-        if not total:
+-            return sash
+-        delta, rest = divmod(width - base, total)  # (as ttk::panedwindow: the first pane gets the rest first)
+-        return sash + first * delta + min(first, rest)
+-
+-    def place(self, sash: int):
+-        """Put the sash at ``sash``; changes in width are shared out by weight from there."""
+-        self._cancel()
+-        self._let_go()
+-        self.used = False
+-        self.paned.sashpos(0, sash)
+-        self.base = (self.paned.sashpos(0), self.paned.winfo_width())
++        self.top._mhwmm_alone = time.perf_counter()  # (see _note_resize)
++        self.thaw(settled=True)
+ 
+-    def finish(self):
+-        """Put the sash where it goes now (the drag stopped, or the window closes)."""
++    def thaw(self, settled: bool = False) -> bool:
++        """The frame fills the window again (laid out when Tk is idle; at once when the drag ``settled``) and the
++        content's picture goes; False when it was not frozen."""
+         self._cancel()
+-        held, used = self.held, self.used
+-        self.used = False
++        if not self.frozen:
++            return False
++        self.frozen = False
++        started = time.perf_counter()
+         try:
+-            moved = held is not None and self.paned.sashpos(0) != held
+-            self._let_go()
+-            if used and not moved and self.width:
+-                target = self.share(self.width)
+-                if 1 <= target <= self.width - self.gap - 1:
+-                    self.paned.sashpos(0, target)
++            self.frame.place(x=0, y=0, width="", height="", relwidth=1, relheight=1)  # (also after place_forget)
++            if settled:
++                # laid out and drawn now (over the picture, which is below it), and timed for the benchmark
++                self.frame.update_idletasks()
++                self.timings.append(("restore", (time.perf_counter() - started) * 1000))
+         except tk.TclError:  # closed meanwhile
+             pass
++        self.hidden = False
++        self._drop_picture()
++        return True
++
++    def _on_destroy(self, _event=None):
++        self._cancel()
++        self.hidden = False
++        self._drop_picture()
+ 
+     def _cancel(self, _event=None):
+         if self._after is not None:
+-            self.paned.after_cancel(self._after)
++            try:
++                self.frame.after_cancel(self._after)
++            except tk.TclError:
++                pass
+             self._after = None
+ 
+-    def _let_go(self):
+-        if self.held is not None:
+-            self.held = None
+-            self.paned.pane(self.first, weight=self.weights[0])
+-            self.paned.pane(self.second, weight=self.weights[1])
+ 
+-    def _on_configure(self, event):  # the paned window was laid out for its new size
+-        self.width = event.width
+-        try:
+-            self.offset = self.paned.winfo_toplevel().winfo_width() - event.width
+-        except tk.TclError:
+-            pass
++def follow_width(canvas: tk.Canvas, item):
++    """Keep the canvas window ``item`` (a scrolled frame of cards) as wide as ``canvas``: only when the width
++    changed (a new width lays all the cards out again)."""
++    given = [None]
+ 
+-    def _on_window_size(self, event):
+-        """The window got a new size; the paned window gets its share of it next."""
+-        last, offset = self.width, self.offset
+-        if last is None or offset is None:
+-            return
+-        width = event.width - offset
+-        if width == last:
+-            return  # only the height changed
+-        try:
+-            if self.held is None and not resizing(self.paned):
+-                return  # shared out by weight as ttk does (a change on its own: maximize, restore)
+-            self._step(last, width)
+-        except tk.TclError:  # closed meanwhile
+-            return
+-        if self.held is not None or self.used:
+-            self._cancel()
+-            self._after = self.paned.after(RESIZE_SETTLE_MS, self.finish)
+-
+-    def _step(self, last: int, width: int):
+-        """The paned window (``last`` wide as laid out now) gets ``width``: hold the first pane, or let it catch
+-        up."""
+-        paned = self.paned
+-        sash = paned.sashpos(0)
+-        if self.held is None:  # hold it from here
+-            second = paned.nametowidget(self.second)
+-            gap = second.winfo_x() - sash
+-            if not second.winfo_ismapped() or gap < 0 or sash < 1 or last - sash - gap < 1:
+-                return  # (a pane folded away: as without the hold)
+-            if self.base is None or abs(self.share(last) - sash) > self.SLACK:
+-                self.base = (sash, last)  # the sash was moved (by hand): shared out from where it is
+-            paned.sashpos(0, sash)  # (ttk takes the panes' widths as they are, then the second one gets it all)
+-            paned.pane(self.first, weight=0)
+-            paned.pane(self.second, weight=1)
+-            self.held, self.gap, self.used = sash, gap, True
+-        elif sash != self.held:  # the sash was moved meanwhile: from where it is
+-            self._let_go()
+-            self.base, self.used = None, False
+-            return
+-        target = self.share(width)
+-        held_room, free_room = width - self.held - self.gap, width - target - self.gap
+-        if abs(target - self.held) <= self.lag and (held_room >= free_room or held_room >= self.room):
+-            return  # held
+-        if 1 <= target <= last - self.gap - 1 and free_room >= 1:
+-            paned.sashpos(0, target)  # caught up, held from there
+-            self.held = target
+-        else:
+-            self._let_go()  # (a pane would fold away: as without the hold)
++    def on_configure(event):
++        if event.width != given[0]:
++            given[0] = event.width
++            canvas.itemconfigure(item, width=event.width)
++
++    canvas.bind("<Configure>", on_configure, add="+")
+ 
+ 
+ class QueueLogHandler(logging.Handler):
+@@ -478,6 +819,10 @@ class RowTooltip(Tooltip):
+ class Dialog(tk.Toplevel):
+     """Small modal dialog base."""
+ 
++    # a window meant to be made bigger (its content does not change size once it is shown): the body keeps its
++    # size while the window's edge is dragged (FreezeContent)
++    FREEZE = False
++
+     def __init__(self, parent, theme: Theme, title: str):
+         super().__init__(parent)
+         self.withdraw()
+@@ -503,6 +848,8 @@ class Dialog(tk.Toplevel):
+     def show(self):
+         self.update_idletasks()
+         x, y = self._position()
++        if self.FREEZE:
++            self._freeze_body()
+         self.geometry(f"+{x}+{y}")
+         set_dark_titlebar(self, self.theme.name == "dark")
+         self.deiconify()
+@@ -511,6 +858,15 @@ class Dialog(tk.Toplevel):
+         self.wait_window()
+         return self.result
+ 
++    def _freeze_body(self):
++        """The body placed instead of packed (FreezeContent) and the window given the size the packed body asked
++        for (a placed body does not ask the window for a size)."""
++        min_w, min_h = self.minsize()
++        width, height = max(self.winfo_reqwidth(), min_w), max(self.winfo_reqheight(), min_h)
++        self.body.pack_forget()
++        self.freeze = FreezeContent(self, self.body)
++        self.geometry(f"{width}x{height}")
++
+     def _position(self) -> tuple[int, int]:
+         """Where show() puts the dialog: over its parent, centred and a third of the way down."""
+         parent = self.master
+@@ -647,6 +1003,7 @@ class HelpDialog(Dialog):
+     """Usage guide: topics on the left, the whole guide as one scrolling page on the right."""
+ 
+     INLINE = re.compile(r"\*\*(.+?)\*\*|\[\[(.+?)\]\]")
++    FREEZE = True  # (the whole guide is wrapped again for each new width)
+ 
+     def __init__(self, parent, theme: Theme, topic: str | None = None):
+         super().__init__(parent, theme, "사용법")
+@@ -785,6 +1142,8 @@ class HelpDialog(Dialog):
+ class ConflictsDialog(Dialog):
+     """Every two enabled mods that change the same files; result is a mod id to show in the list."""
+ 
++    FREEZE = True
++
+     def __init__(self, parent, theme: Theme, manager: ModManager):
+         super().__init__(parent, theme, "충돌 한눈에 보기")
+         px = theme.px
+@@ -2443,6 +2802,9 @@ class App:
+         self._restore_window()
+         self._set_icon()
+ 
++        # everything in the window is in one frame: it keeps its size while the window's edge is dragged
++        self.content = ttk.Frame(root)
++        self.freeze = FreezeContent(root, self.content)
+         self._build_header()
+         self._build_toolbar()
+         self._build_statusbar()
+@@ -2483,7 +2845,13 @@ class App:
+         s = self.manager.settings
+         ratio = min(0.8, max(0.3, s.sash_ratio)) if s.remember_window else 0.58
+         if width > 1:
+-            self.list_hold.place(int(width * ratio))
++            self.paned.sashpos(0, int(width * ratio))
++            # The mod list's columns fit the list from here on. ttk keeps a change of the list's width as "slack"
++            # until the list is wider or narrower than its columns, so the columns depended on the widths the list
++            # went through (a frozen drag skips them: wider and back left 파일/충돌 cut off); setting a column's
++            # width on a laid out list zeroes the slack, and each layout after that fits the columns.
++            self.root.update_idletasks()
++            self.tree.column("name", width=self.tree.column("name", "width"))
+ 
+     def _restore_window(self):
+         s = self.manager.settings
+@@ -2508,7 +2876,8 @@ class App:
+     def _save_window_state(self):
+         s = self.manager.settings
+         try:
+-            self.list_hold.finish()  # (closed right after a drag: the sash where it goes)
++            if self.freeze.thaw():  # (closed right after a drag: the panes as they are for the window's size)
++                self.root.update_idletasks()
+             changes: dict = {"log_visible": self._log_visible}
+             if s.remember_window:
+                 zoomed = self.root.state() == "zoomed"
+@@ -2531,9 +2900,9 @@ class App:
+ 
+     def _build_header(self):
+         t, px = self.theme, self.theme.px
+-        header = ttk.Frame(self.root, style="Header.TFrame", padding=(px(20), px(12)))
++        header = ttk.Frame(self.content, style="Header.TFrame", padding=(px(20), px(12)))
+         header.pack(fill="x")
+-        ttk.Separator(self.root).pack(fill="x")
++        ttk.Separator(self.content).pack(fill="x")
+ 
+         ttk.Label(header, image=t.image("logo", 40), style="Header.TLabel").pack(side="left")
+         titles = ttk.Frame(header, style="Header.TFrame")
+@@ -2611,7 +2980,7 @@ class App:
+ 
+     def _build_toolbar(self):
+         t, px = self.theme, self.theme.px
+-        bar = self.toolbar = ttk.Frame(self.root, padding=(px(20), px(14), px(20), px(2)))
++        bar = self.toolbar = ttk.Frame(self.content, padding=(px(20), px(14), px(20), px(2)))
+         bar.pack(fill="x")
+         self.buttons: dict[str, ttk.Button] = {}
+ 
+@@ -2654,9 +3023,9 @@ class App:
+ 
+     def _build_statusbar(self):
+         px = self.theme.px
+-        self.status_frame = ttk.Frame(self.root, style="Status.TFrame", padding=(px(20), px(7)))
++        self.status_frame = ttk.Frame(self.content, style="Status.TFrame", padding=(px(20), px(7)))
+         self.status_frame.pack(side="bottom", fill="x")
+-        self.status_sep = ttk.Separator(self.root)
++        self.status_sep = ttk.Separator(self.content)
+         self.status_sep.pack(side="bottom", fill="x")
+         self.status_var = tk.StringVar(value="준비")
+         ttk.Label(self.status_frame, textvariable=self.status_var, style="StatusMuted.TLabel").pack(side="left")
+@@ -2671,7 +3040,7 @@ class App:
+ 
+     def _build_log(self):
+         t, px = self.theme, self.theme.px
+-        self.log_frame = ttk.Frame(self.root, padding=(px(20), 0, px(20), px(12)))
++        self.log_frame = ttk.Frame(self.content, padding=(px(20), 0, px(20), px(12)))
+         self.log_frame.pack(side="bottom", fill="x")
+         card = t.mark(tk.Frame(self.log_frame), "card")
+         card.pack(fill="x")
+@@ -2685,7 +3054,7 @@ class App:
+     def _build_notice(self):
+         """A bar under the toolbar, shown when the last game ended in a crash (it does not block anything)."""
+         t, px = self.theme, self.theme.px
+-        self.notice = ttk.Frame(self.root, style="Callout.TFrame", padding=(px(16), px(8), px(8), px(8)))
++        self.notice = ttk.Frame(self.content, style="Callout.TFrame", padding=(px(16), px(8), px(8), px(8)))
+         self.notice_title = ttk.Label(self.notice, text="", style="CalloutTitle.TLabel")
+         self.notice_title.pack(side="left")
+         self.notice_detail = ttk.Label(self.notice, text="", style="Callout.TLabel")
+@@ -2700,7 +3069,8 @@ class App:
+     def _build_bisect_bar(self):
+         """The bar under the toolbar while 원인 모드 찾기 runs: the step, starting the game, stopping."""
+         px = self.theme.px
+-        bar = self.bisect_bar = ttk.Frame(self.root, style="Banner.TFrame", padding=(px(16), px(10), px(10), px(10)))
++        bar = self.bisect_bar = ttk.Frame(self.content, style="Banner.TFrame",
++                                          padding=(px(16), px(10), px(10), px(10)))
+         buttons = ttk.Frame(bar, style="Banner.TFrame")
+         buttons.pack(side="right", padx=(px(12), 0))
+         text = ttk.Frame(bar, style="Banner.TFrame")
+@@ -2725,7 +3095,7 @@ class App:
+ 
+     def _build_main(self):
+         t, px = self.theme, self.theme.px
+-        paned = self.paned = ttk.Panedwindow(self.root, orient="horizontal")
++        paned = self.paned = ttk.Panedwindow(self.content, orient="horizontal")
+         paned.pack(fill="both", expand=True, padx=px(20), pady=(px(10), px(12)))
+ 
+         # ---- mod list card
+@@ -2834,7 +3204,7 @@ class App:
+         window = self.options_canvas.create_window((0, 0), window=self.options_inner, anchor="nw")
+         self.options_inner.bind("<Configure>", lambda e: self.options_canvas.configure(
+             scrollregion=self.options_canvas.bbox("all")))
+-        self.options_width = FollowWidth(self.options_canvas, window)  # the cards as wide as the tab
++        follow_width(self.options_canvas, window)  # the cards as wide as the tab
+         self._option_vars: list[tuple[str, tk.BooleanVar]] = []
+         self.notebook.add(self.options_tab, text="옵션", state="hidden")
+ 
+@@ -2857,8 +3227,6 @@ class App:
+         self.notebook.add(conflicts, text="충돌")
+         self.conflicts_tab = conflicts
+         paned.add(right, weight=2)
+-        # the mod list keeps its width while the window's edge is dragged (the details card takes the change)
+-        self.list_hold = HoldPane(paned, lag=px(120), room=px(300))
+ 
+         self.context_menu = t.mark(tk.Menu(self.tree, tearoff=False), "menu")
+ 
