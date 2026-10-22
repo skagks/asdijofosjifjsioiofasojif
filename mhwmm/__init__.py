@@ -1,3 +1,3 @@
 """Monster Hunter Wilds mod manager."""
 
-__version__ = "2.2.7"
+__version__ = "2.2.8"

@@ -161,6 +161,33 @@ def test_this_app_has_no_snapshot_mode(bench):
     assert bench.snapshot_skip(gui, ["both", "freeze"]) is None
 
 
+def test_the_workflow_example_measures_different_setups(bench, tmp_path):
+    """The example in the Resize bench workflow's args input names variants that run with this app (no snapshot
+    part: those are skipped, and a run of only them measures nothing and fails the step), each a setup of its own
+    (not the app's defaults twice under two names)."""
+    import re
+    import shlex
+
+    text = (ROOT / ".github" / "workflows" / "resize-bench.yml").read_text(encoding="utf-8")
+    found = re.search(r"e\.g\. (--variant [^(]*?) \(", text)
+    assert found, "the args input has no example"
+    args = shlex.split(found.group(1))
+    specs = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--variant"]
+    assert len(specs) >= 2
+    setups = set()
+    for spec in specs:
+        parts = bench.parse_spec(spec)
+        assert not set(parts) & set(bench.SNAPSHOT_PARTS), spec
+        new, _snap, _old = _guis()  # (this app's switches and defaults)
+        new.RESIZE_CLASS_REDRAW = "both"
+        child = _child(bench, spec, tmp_path)
+        assert child.set_modes(new) is None, spec
+        child.set_class_redraw(new)
+        env = child.result["env"]
+        setups.add((env["mode"], env["class_redraw"], new.RESIZE_FIRST_STEP))
+    assert len(setups) == len(specs), specs
+
+
 def test_the_mode_table_shows_the_picture_columns_only_with_pictures(bench, capsys):
     """The resize mode table: the drag's end (restore) and the first step for this app; the snapshot's columns only
     when a result has pictures (an app with the snapshot mode, or an older result file)."""

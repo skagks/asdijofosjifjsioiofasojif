@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       args:
-        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant both+freeze --variant freeze --variant snapshot --repeat 3 (--no-visual: no pixel checks; --no-windows: none of the other windows)"
+        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant base --variant keep+freeze --variant off --repeat 3 (base: the app's defaults; --list: print the variants and stop; --no-visual: no pixel checks; --no-windows: none of the other windows). snapshot, unmap and fakecapture run only with a gui that has the snapshot mode (taken out of the app: only an older diff given as patch, e.g. git show 2da3b8c:tools/bench-patches/drag-classredraw.diff | gzip -9 | base64 -w0); else they are skipped"
         type: string
         default: ""
       patch:

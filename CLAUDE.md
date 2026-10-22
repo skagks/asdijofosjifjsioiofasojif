@@ -101,12 +101,45 @@
     게임 폴더는 바꾸지 않고, REFramework 설정만 사용자가 동의했을 때 게임이 꺼져 있을 때 `set_refw_option`으로 한 줄 바꾼다.
     느린 점검의 결과가 달라지는 변경을 하면 `precheck.BACKGROUND_FORMAT`을 올린다. 원인 모드 찾기 중에는 묻지 않는다.
     창은 gui.py의 PrecheckDialog(게임 실행 직전, ☰ → 실행 전 점검), 명령줄은 `check`
-  - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마. 창 크기를 바꿀 때 버벅이지 않게: 창 가장자리를 끄는 중인지는
-    `resizing`(크기가 `RESIZE_SETTLE_MS` 안에 연달아 바뀔 때만. 최대화·복원처럼 한 번 바뀌면 바로 따라감. 한 번 바뀐 뒤
-    `RESIZE_FIRST_MS` 안의 변경도 끌기로 봄: 첫 단계의 배치가 느리면 매 단계를 바로 다시 배치하게 되므로), 스크롤되는 카드
-    목록의 폭은 `FollowWidth`(끄는 동안은 그대로, 멈추고 한 번), 모드 목록 칸은 `HoldPane`(끄는 동안 폭을 두고 오른쪽 칸이
-    받음, 멈추면 무게대로의 자리. ttk가 칸을 paned window의 `<Configure>`보다 먼저 배치하므로 창의 크기 변경에서 처리),
-    로그 창은 `LOG_LINES`줄만(전체는 manager.log), `<Configure>` 처리기는 값이 바뀔 때만 일하고, 막대 오른쪽 위젯들은 한
-    프레임에 묶는다(왼쪽 위젯들 다음에 만들어야 Tab 순서가 그대로). 창 크기 시험은 `maxsize`를 크게 준다(Windows는 화면보다
-    크게 만들지 않음)
+  - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마. 창 크기를 바꿀 때 버벅이지 않게(Windows는 위젯마다 창이고 Tk의 창
+    클래스 TkTopLevel·TkChild가 CS_HREDRAW|CS_VREDRAW라, 끄는 단계마다 모든 자식 창을 다시 배치하고 그린 뒤에야 다음 마우스 움직임을
+    받았음): `RESIZE_CLASS_REDRAW`('both' 기본, `class_redraw`)로 두 클래스의 그 스타일을 프로세스에서 한 번 끄고(클래스 이름은
+    GetClassNameW로 toplevel의 창과 그 GetParent(`wm frame`)에서 읽음. 자식 클래스는 창 크기를 지켜보기 시작할 때, 바깥 창은 창이 보인
+    뒤 첫 `<Configure>`에서. 실패하면 그대로 두고 `_CLASS_REDRAW`에 기록, Windows 밖에서는 아무것도 하지 않음), 창의 내용 전체를 한
+    프레임(메인 창 `App.content`, 장비 외형 창 `content`, 사용법·충돌 창은 `Dialog.FREEZE`로 `body`)에 넣어 place로 창을 채운 뒤
+    `FreezeContent`가 끄는 동안 그 크기를 그대로 둔다(늘어난 곳은 창 배경, 줄어든 쪽은 잘림. 멈추고 `RESIZE_SETTLE_MS` 뒤에 한 번
+    배치). `RESIZE_MODE`는 'freeze'(기본)와 벤치마크 비교용 'off'(매 단계 배치, 예전 `RESIZE_FREEZE = False`도 'off'). 실제
+    Windows에서 `tools/resize_bench.py`와 `Resize bench` 워크플로로 잼: 끄는 한 단계 ~145 ms → ~10 ms(맨 Tk 창과 같음), 화면 점검에서
+    달라진 화소 없음(얼리기만 하면 ~50 ms. 끄는 동안 내용의 그림을 대신 보여 주는 'snapshot'도 ~10 ms였지만 코드가 많아 뺐음).
+    끄는 중인지는 `resizing`(크기가 `RESIZE_SETTLE_MS` 안에 연달아 바뀔 때. 최대화·복원처럼 한 번 바뀌면 바로 따라감. 한 번 바뀐 뒤
+    `RESIZE_FIRST_MS` 안의 변경과, 끄다가 멈춰 한 번 배치한 뒤(`FreezeContent._settled`) 그 안의 변경도 끌기. 이것이 시간 규칙).
+    Windows에서는 `RESIZE_FIRST_STEP`(`_drag_step`, 마우스·창 조회 `_WinPointer`/`_pointer`)으로 첫 단계부터 끌기로 본다: wm
+    state가 바뀐 변경(최대화·복원, 제목 표시줄 더블클릭)은 끌기가 아니고, 주 마우스 버튼이 떼어져 있고 이동·크기 조절 루프도
+    아니면(또는 '창을 끄는 동안 내용 표시'가 꺼져 있으면) 바로 앞 변경의 `RESIZE_SETTLE_MS` 안일 때만(Windows에서 `RESIZE_FIRST_MS`와
+    `_settled` 뒤의 규칙은 버튼이 눌려 있거나 루프 중일 때만), 버튼이 눌려 있거나 루프 중이면 시간 규칙(`RESIZE_SETTLE_MS`·
+    `RESIZE_FIRST_MS`·`_settled`)에 맞거나, 커서가 크기 조절 테두리에 있거나, 창 틀의 두 변 이상이 그대로이고 바뀌기 전후 모두 작업
+    영역만큼 넓거나 높지 않으면 끌기(시간 규칙을 빼면 끌다가 멈춘 뒤 다시 끄는 단계가, 커서가 화면에 붙인 창의 가장자리보다 앞서
+    있을 때 창 전체를 다시 배치함. 창 메시지를 보내지 않는 조회만, 조회가 실패하면 시간 규칙). place는 창에 크기를 요청하지
+    않으므로 창 크기는 geometry()로 정하고(대화 상자는 show()에서 pack으로
+    잰 크기), 메인 창에 새로 넣는 위젯은 root가 아니라 `self.content`에 둔다. 모드 목록의 열은 `_place_sash`에서 열 너비를 한 번 다시
+    줘서 ttk의 slack을 0으로 만든다(얼린 끌기는 중간 폭을 건너뛰어 파일/충돌 열이 잘렸음). 스크롤되는 카드 목록의 폭은 `follow_width`,
+    로그 창은 `LOG_LINES`줄만(전체는 manager.log), `<Configure>` 처리기는 값이 바뀔 때만 일하고, 막대 오른쪽 위젯들은 한 프레임에
+    묶는다(왼쪽 위젯들 다음에 만들어야 Tab 순서가 그대로). 창 크기 시험은 `maxsize`를 크게 주고(Windows는 화면보다 크게 만들지 않음),
+    첫 단계는 가짜 마우스(`_pointer`, 시간 규칙 시험은 None)로, `_WinPointer`·`_WinClasses`는 가짜 user32(`_win_functions`)로 본다
+    (Windows CI에서는 앱의 기본값대로 실제 클래스도 바뀌고, 시험은 클래스 이름과 스타일을 읽을 수 있는지만 확인)
+    - 창 크기 벤치마크: `tools/resize_bench.py`(가짜 모드 150개로 실제 App을 열고, Windows에서는 SendInput으로 창 모서리를 끌어
+      Configure 간격·지연을 잼, 그 밖에서는 geometry 단계만. 가짜 단계는 버튼을 누르지 않으므로 `RESIZE_FIRST_STEP`을 끄고 잰다).
+      Windows 측정은 GitHub Actions `Resize bench` 워크플로를 수동 실행(`args` 입력, 결과는 작업 요약과 `resize-bench` 아티팩트, 화면
+      점검 그림은 `resize-bench-frames/<변형>/`. `patch` 입력 `file:tools/bench-patches/<이름>.diff`로 커밋 전 변경도 잼). 'all'은
+      bare, base(앱의 기본값), off, freeze, keep+freeze, both+off, both+freeze+nofirststep, scale150, scale150+off
+      (`keep`/`top`/`child`/`both`는 `RESIZE_CLASS_REDRAW`, 스위치가 없는 gui면 벤치마크가 직접 바꿈). 그림 변형(snapshot, unmap,
+      fakecapture)은 그 모드가 있는 gui에서만 돌고 없으면 이유를 적고 건너뜀. 위젯을 뺀 변형(nolog 등)은 `+off`일 때만 배치에서
+      무엇이 비싼지 보여 줌. 화면 점검(Windows, GDI로 창 클라이언트 영역, `--no-visual`로 끔): 끌기·단계·최대화/복원·테마 전환 뒤
+      강제로 다시 그린(RedrawWindow ALLCHILDREN|UPDATENOW) 창과 같은지(달라지면 stale), 끄는 동안 마우스 스레드가 잡은 몇 단계가 끌기
+      전과 같은지(mid, 늘어난 곳은 창 배경), 끌기 뒤 같은 크기로 바로 바꾼 창과 같은지(direct), 창 클래스는 프로세스 전체에 걸리므로
+      사용법·충돌 한눈에 보기 대화 상자와 장비 외형 창도(`--no-windows`로 끔). 화소는 그대로 비교(한 화소만 달라도 실패, 끄는 동안의
+      프레임은 `SHARE_TOL`까지 minor). 그동안 자동 가비지 수집은 끄고 창을 닫을 때마다 주 스레드에서 수집(장비 외형 창의 작업
+      스레드에서 Tk 객체가 풀리면 프로세스가 죽음). 리눅스 시험은 가짜 Windows API(tests/test_resize_bench.py), 리눅스에서는
+      `xvfb-run -a python tools/resize_bench.py --quick`로 도구만 점검(CI에서는 돌리지 않음)
+    - `tools/bench-patches/`: 커밋하기 전에 워크플로로 잰 변경의 diff(임시). 그 변경을 커밋하거나 버리면 지운다
   - `mhwmm/cli.py`: 명령줄

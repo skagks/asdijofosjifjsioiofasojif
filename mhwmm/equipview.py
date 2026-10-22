@@ -15,7 +15,8 @@ from .equip import look as equip_look
 from .equip import overview as ov
 from .equip.model import (ARMOR_PARTS, BODIES, KIND_LABELS, PART_LABELS, Target, parse_armor_key,
                           parse_weapon_key)
-from .gui import Dialog, FollowWidth, Image, ImageTk, Tooltip, autohide, load_image, set_dark_titlebar
+from .gui import (Dialog, FreezeContent, Image, ImageTk, Tooltip, autohide, follow_width, load_image,
+                  set_dark_titlebar)
 
 log = logging.getLogger(__name__)
 
@@ -70,10 +71,13 @@ class EquipmentWindow(tk.Toplevel):
         self._look_cv = threading.Condition()
         threading.Thread(target=self._look_worker, daemon=True).start()
 
+        # everything in the window is in one frame: it keeps its size while the window's edge is dragged
+        self.content = ttk.Frame(self)
+        self.freeze = FreezeContent(self, self.content)
         self._build_header()
         self._build_body()
         self.status_var = tk.StringVar(value="")
-        status = ttk.Frame(self, padding=(px(22), 0, px(22), px(14)))
+        status = ttk.Frame(self.content, padding=(px(22), 0, px(22), px(14)))
         status.pack(side="bottom", fill="x")
         ttk.Label(status, textvariable=self.status_var, style="Muted.TLabel", font=t.fonts["small"]).pack(side="left")
         self.more = ttk.Menubutton(status, text="⋯", style="Ghost.TMenubutton")
@@ -93,7 +97,7 @@ class EquipmentWindow(tk.Toplevel):
     # ------------------------------------------------------------------ layout
     def _build_header(self):
         t, px = self.theme, self.theme.px
-        outer = ttk.Frame(self, padding=(px(22), px(18), px(22), px(12)))
+        outer = ttk.Frame(self.content, padding=(px(22), px(18), px(22), px(12)))
         outer.pack(fill="x")
         head = ttk.Frame(outer)
         head.pack(fill="x")
@@ -149,7 +153,7 @@ class EquipmentWindow(tk.Toplevel):
 
     def _build_body(self):
         t, px = self.theme, self.theme.px
-        body = ttk.Frame(self, padding=(px(22), 0, px(22), px(10)))
+        body = ttk.Frame(self.content, padding=(px(22), 0, px(22), px(10)))
         body.pack(fill="both", expand=True)
         nav = ttk.Frame(body, width=px(180))
         nav.pack(side="left", fill="y", padx=(0, px(14)))
@@ -174,7 +178,7 @@ class EquipmentWindow(tk.Toplevel):
         inner = ttk.Frame(canvas, style="TFrame" if plain else "Card.TFrame", padding=padding)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        FollowWidth(canvas, window)  # (all the tiles are laid out again for a new width: not on every drag step)
+        follow_width(canvas, window)
         return canvas, inner
 
     def _bind_wheel(self, widget, canvas):

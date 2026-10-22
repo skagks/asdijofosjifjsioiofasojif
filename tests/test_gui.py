@@ -1,5 +1,6 @@
 import gc
 import queue
+import sys
 import time
 
 import pytest
@@ -176,126 +177,850 @@ def test_gui_options_show_pictures(root, manager, tmp_path, monkeypatch):
     assert len(shown) == 2
 
 
-def test_follow_width_waits_while_the_window_is_resized(root, monkeypatch):
-    """Cards in a scrolled canvas keep their width while the window's edge is dragged (laying them out on
-    every step made resizing stutter) and follow once it stops; other width changes are followed at once."""
+def _quiet(root, seconds=0.8):
+    """Let the window settle (the next change is one on its own, not a step of a drag)."""
+    end = time.time() + seconds
+    while time.time() < end:
+        root.update()
+        time.sleep(0.02)
+
+
+def _configures(widget):
+    """Counts the <Configure> events of ``widget`` (each one is a new layout of what is in it)."""
+    seen = []
+    widget.bind("<Configure>", lambda e: seen.append((e.width, e.height)), add="+")
+    return seen
+
+
+def test_freeze_content_while_the_window_is_dragged(root, monkeypatch):
+    """The window's content keeps its size while the window's edge is dragged (laying all of it out and drawing
+    it again on every step made resizing stutter) and fills the window once the drag stops, laid out once; the
+    drag's first step and a change on its own (maximize, restore) are followed at once."""
     from tkinter import ttk
 
     from mhwmm import gui
 
     monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 600)  # (a slow machine must not make the drag look finished)
     monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 600)
+    root.maxsize(4000, 3000)  # (Windows keeps a window within the screen unless told otherwise)
     root.geometry("600x400")
-    canvas = tk.Canvas(root, width=1, height=1)
-    canvas.pack(side="left", fill="both", expand=True)
-    inner = ttk.Frame(canvas, height=50)
-    item = canvas.create_window((0, 0), window=inner, anchor="nw")
-    follow = gui.FollowWidth(canvas, item)
+    content = ttk.Frame(root)
+    freeze = gui.FreezeContent(root, content)
+    inside = ttk.Frame(content)
+    inside.pack(fill="both", expand=True)
+    laid_out = _configures(inside)
 
-    def given():
-        return int(float(canvas.itemcget(item, "width")))
+    def size(widget):
+        return widget.winfo_width(), widget.winfo_height()
 
-    def quiet():  # (the next change is one on its own, not a step of a drag)
-        end = time.time() + 0.8
-        while time.time() < end:
-            root.update()
-            time.sleep(0.02)
-
-    pump(root, lambda: canvas.winfo_width() > 500 and given() == canvas.winfo_width())  # the first width at once
-    quiet()
-    root.geometry("640x400")  # the drag's first step (or a change on its own): at once
-    root.update()
-    start = given()
-    assert start == canvas.winfo_width() and not gui.resizing(canvas)
-    for width in (680, 720, 700):  # the window's edge dragged on: the cards wait
+    pump(root, lambda: size(inside) == size(root) == (600, 400))  # the first layout at once
+    assert content.winfo_manager() == "place" and not freeze.frozen
+    for width in (620, 630):  # changes right after the window is shown (zoomed, moved to its monitor): at once
         root.geometry(f"{width}x400")
         root.update()
-        assert canvas.winfo_width() > start and given() == start and gui.resizing(canvas)
-    pump(root, lambda: given() == canvas.winfo_width())  # ... and follow once it stopped
-    assert given() > start and follow.width == given()
-    root.geometry("700x500")  # taller only: nothing to do
+        assert size(inside) == (width, 400) and not freeze.frozen
+    _quiet(root)
+    root.geometry("640x400")  # the drag's first step (or a change on its own): at once
     root.update()
-    assert given() == canvas.winfo_width()
-
-    quiet()
-    for width in (900, 700, 860):  # maximize, restore (one change each): followed in the same frame
-        root.geometry(f"{width}x500")
+    assert size(inside) == (640, 400) and not freeze.frozen and not gui.resizing(root)
+    laid_out.clear()
+    for width, height in ((680, 400), (720, 430), (700, 460), (610, 380)):  # dragged on: the content waits
+        root.geometry(f"{width}x{height}")
         root.update()
-        assert given() == canvas.winfo_width() and not gui.resizing(canvas)
-        quiet()
+        assert size(root) == (width, height) and gui.resizing(root) and freeze.frozen
+        assert size(content) == size(inside) == (640, 400)  # (cut off where the window got smaller)
+    assert laid_out == []
+    pump(root, lambda: size(inside) == (610, 380))  # ... and follows once it stopped: laid out once
+    assert laid_out == [(610, 380)] and not freeze.frozen and freeze._after is None
+    assert content.place_info()["relwidth"] == "1" and content.place_info()["width"] == ""
 
-    side = ttk.Frame(root, width=60)  # the canvas narrower while the window keeps its size: at once
-    side.pack(side="right", fill="y", before=canvas)
-    root.update()
-    assert given() == canvas.winfo_width() < 860 - 50
-    root.geometry("760x500")
-    root.update()
-    root.geometry("780x500")
-    root.update()
-    assert follow._after is not None
+    for width, height in ((900, 600), (700, 500), (860, 560)):  # maximize, restore (one change each): at once
+        _quiet(root)
+        root.geometry(f"{width}x{height}")
+        root.update()
+        assert size(inside) == (width, height) and not freeze.frozen
+
+    monkeypatch.setattr(gui, "RESIZE_FREEZE", False)  # (switched off: every step is followed, as before)
+    _quiet(root)
+    for width in (880, 900, 920):
+        root.geometry(f"{width}x560")
+        root.update()
+        assert size(inside) == (width, 560) and not freeze.frozen
+    monkeypatch.setattr(gui, "RESIZE_FREEZE", True)
+
+    _quiet(root)
+    for width in (940, 960):
+        root.geometry(f"{width}x560")
+        root.update()
+    assert freeze.frozen and freeze._after is not None
     errors = []
     root.report_callback_exception = lambda *exc: errors.append(exc)
-    canvas.destroy()  # a change still waiting when the canvas goes is dropped
-    assert follow._after is None
-    end = time.time() + 0.8
-    while time.time() < end:
-        root.update()
-        time.sleep(0.02)
+    content.destroy()  # a drag still settling when the window closes
+    assert freeze._after is None
+    _quiet(root)
     assert not errors
 
 
-def test_follow_width_a_slow_first_step_is_not_a_pause(root, monkeypatch):
-    """The drag's first step is followed at once; when laying the cards out for it takes longer than
-    RESIZE_SETTLE_MS (all the tiles of 장비 외형 at 150%), the next steps still wait (each one laid out at once
-    again made the drag stutter worse than before)."""
+def test_freeze_content_a_slow_first_step_is_not_a_pause(root, monkeypatch):
+    """The drag's first step is followed at once; when laying the window out for it takes longer than
+    RESIZE_SETTLE_MS (all the tiles of 장비 외형 at 150%), the next steps are still frozen (each one laid out at
+    once again would make the drag stutter)."""
     from tkinter import ttk
 
     from mhwmm import gui
 
     monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 200)
     monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 1500)
+    monkeypatch.setattr(gui, "_pointer", lambda: None)  # (the time rule; on Windows the mouse would say "up")
+    root.maxsize(4000, 3000)
     root.geometry("600x400")
-    canvas = tk.Canvas(root, width=1, height=1)
-    canvas.pack(fill="both", expand=True)
-    inner = ttk.Frame(canvas, height=50)
-    item = canvas.create_window((0, 0), window=inner, anchor="nw")
-    gui.FollowWidth(canvas, item)
+    content = ttk.Frame(root)
+    gui.FreezeContent(root, content)
+    inside = ttk.Frame(content)
+    inside.pack(fill="both", expand=True)
     laid_out = []
 
     def slow(event):  # a layout that takes longer than RESIZE_SETTLE_MS
         laid_out.append(event.width)
         time.sleep(0.35)
 
-    inner.bind("<Configure>", slow)
+    inside.bind("<Configure>", slow)
+    pump(root, lambda: inside.winfo_width() == 600)
+    _quiet(root, 1.6)
+    laid_out.clear()
+    root.geometry("640x400")  # the first step: at once (and slow)
+    root.update()
+    assert laid_out == [640]
+    for width in (660, 680, 700):  # (the second step comes more than RESIZE_SETTLE_MS after the first)
+        root.geometry(f"{width}x400")
+        root.update()
+        assert inside.winfo_width() == 640 and gui.resizing(root)
+    pump(root, lambda: inside.winfo_width() == 700)
+    assert laid_out == [640, 700]  # once more, when the drag stopped
+
+
+class _FakePointer:
+    """A stand-in for Windows' mouse and frame queries (gui._pointer): ``down`` the mouse button down (or Windows'
+    move or size loop), ``border`` the cursor on the window's sizing border, ``origin`` the frame's top-left corner
+    on the screen (its size is the window's), ``spans`` as big as the work area; ``fail`` the mouse not readable."""
+
+    def __init__(self, **setup):
+        self.set(**setup)
+
+    def set(self, down=False, border=False, spans=False, fail=False, origin=(0, 0)):
+        self.down, self.border, self.spans, self.fail, self.origin = down, border, spans, fail, origin
+
+    def dragging(self, top):
+        if self.fail:
+            raise OSError("no mouse")
+        return self.down
+
+    def on_sizing_border(self, top):
+        return self.border
+
+    def where(self, top):
+        x, y = self.origin
+        return (x, y, x + top.winfo_width(), y + top.winfo_height()), self.spans
+
+
+def _size(widget):
+    return widget.winfo_width(), widget.winfo_height()
+
+
+def _content(root, monkeypatch, settle_ms=600):
+    """A 600×400 window with its content in a FreezeContent, laid out and quiet (the next change is one on its
+    own): (content, freeze, a frame filling the content)."""
+    from tkinter import ttk
+
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", settle_ms)  # (a slow machine must not make the drag look finished)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 600)
+    root.maxsize(4000, 3000)  # (Windows keeps a window within the screen unless told otherwise)
+    root.geometry("600x400")
+    content = ttk.Frame(root)
+    freeze = gui.FreezeContent(root, content)
+    inside = ttk.Frame(content)
+    inside.pack(fill="both", expand=True)
+    pump(root, lambda: _size(inside) == (600, 400))
+    _quiet(root, 1.3)  # (longer than RESIZE_SETTLE_MS + RESIZE_FIRST_MS)
+    return content, freeze, inside
+
+
+def test_resize_modes(root, monkeypatch):
+    """gui.RESIZE_MODE picks what the content does during a drag (RESIZE_FREEZE = False, the older switch, is
+    "off"; any other value is the freeze): off lays it out on every step, freeze keeps it as it is."""
+    from mhwmm import gui
+
+    for mode, freeze_on, expected in (("freeze", True, "freeze"), ("off", True, "off"), ("freeze", False, "off"),
+                                      ("off", False, "off"), ("snapshot", True, "freeze"), ("other", True, "freeze")):
+        monkeypatch.setattr(gui, "RESIZE_MODE", mode)
+        monkeypatch.setattr(gui, "RESIZE_FREEZE", freeze_on)
+        assert gui.resize_mode() == expected
+    monkeypatch.setattr(gui, "RESIZE_FREEZE", True)
+    monkeypatch.setattr(gui, "_pointer", lambda: None)  # (the drag's first step is one on its own)
+    content, freeze, inside = _content(root, monkeypatch)
+    laid_out = _configures(inside)
+    for mode in ("off", "freeze"):
+        monkeypatch.setattr(gui, "RESIZE_MODE", mode)
+        _quiet(root, 1.3)
+        laid_out.clear()
+        width = root.winfo_width()
+        for k in (1, 2, 3):
+            root.geometry(f"{width + 20 * k}x400")
+            root.update()
+        assert freeze.frozen == (mode != "off")
+        assert len(laid_out) == (3 if mode == "off" else 1)  # (the first step at once)
+        pump(root, lambda: not freeze.frozen and _size(inside) == (width + 60, 400))
+
+
+def test_resize_defaults_freeze_the_content_in_place(root, monkeypatch):
+    """The defaults: the content is frozen during a drag (it stays in the window, mapped, at its size), Tk's
+    window classes lose CS_HREDRAW|CS_VREDRAW (Windows) and the mouse tells the drag's first step (Windows). Once
+    the drag stops the content is laid out once (timed for the resize benchmark)."""
+    from mhwmm import gui
+
+    assert gui.RESIZE_MODE == "freeze" and gui.RESIZE_FREEZE and gui.resize_mode() == "freeze"
+    assert gui.RESIZE_CLASS_REDRAW == "both" and gui.RESIZE_FIRST_STEP is True
+    monkeypatch.setattr(gui, "_pointer", lambda: None)  # (the time rules: on Windows the mouse would say "up")
+    content, freeze, inside = _content(root, monkeypatch)
+    laid_out = _configures(inside)
+    for width in (620, 640, 660):
+        root.geometry(f"{width}x400")
+        root.update()
+    assert freeze.frozen and _size(content) == (620, 400) and laid_out == [(620, 400)]  # (the first step at once)
+    assert content.place_info()["x"] == "0" and content.winfo_x() == 0 and content.winfo_y() == 0
+    assert content.winfo_viewable() and inside.winfo_viewable()
+    assert [what for what, _ in freeze.timings] == []
+    pump(root, lambda: not freeze.frozen and _size(inside) == (660, 400))
+    assert laid_out == [(620, 400), (660, 400)] and [what for what, _ in freeze.timings] == ["restore"]
+    assert content.place_info()["relwidth"] == "1" and content.place_info()["width"] == ""
+
+
+def test_freeze_window_closed_or_thawed_mid_drag(root, monkeypatch):
+    """The content follows the window at once when that is asked for during a drag (the main window saves its
+    state when it closes), and a content destroyed or a window closed during a drag leaves no callback behind."""
+    from tkinter import ttk
+
+    from mhwmm import gui
+
+    errors = []
+    root.report_callback_exception = lambda *exc: errors.append(exc)
+    monkeypatch.setattr(gui, "_pointer", lambda: None)
+    content, freeze, inside = _content(root, monkeypatch)
+
+    def drag(top, start):
+        for k in (1, 2, 3):
+            top.geometry(f"{start + 20 * k}x400")
+            top.update()
+
+    drag(root, 600)
+    assert freeze.frozen and freeze._after is not None
+    assert freeze.thaw() and not freeze.thaw()  # (False: no longer frozen)
+    assert not freeze.frozen and freeze._after is None
+    assert content.place_info()["x"] == "0" and content.place_info()["relwidth"] == "1"
+    root.update()
+    assert _size(inside) == (660, 400)
+    _quiet(root, 1.3)
+    drag(root, 660)
+    assert freeze.frozen
+    content.destroy()
+    assert freeze._after is None
+    _quiet(root)
+
+    top = tk.Toplevel(root)
+    top.maxsize(4000, 3000)
+    top.geometry("500x400")
+    other = ttk.Frame(top)
+    other_freeze = gui.FreezeContent(top, other)
+    ttk.Frame(other).pack(fill="both", expand=True)
+    pump(top, lambda: _size(other) == (500, 400))
+    _quiet(root, 1.3)
+    drag(top, 500)
+    assert other_freeze.frozen
+    top.destroy()  # closed during the drag
+    assert other_freeze._after is None
+    _quiet(root)
+    assert not errors
+
+
+def test_first_step_of_a_drag_is_frozen_when_the_mouse_says_so(root, monkeypatch):
+    """Windows (RESIZE_FIRST_STEP): a size change while the mouse button is down (or in Windows' move or size
+    loop) with the cursor on the window's sizing border, or one that kept at least two of the frame's edges and
+    is not as big as the work area before or after, is a drag step from the drag's first step on: frozen at once
+    A change of the wm state (maximize, restore: also a title-bar double-click, while the
+    button is down, with the cursor where the restored window's top border is), unsnapping by dragging the title
+    bar (the window moves), the button up, the switch off or the mouse not readable: followed at once."""
+    from mhwmm import gui
+
+    pointer = _FakePointer()
+    monkeypatch.setattr(gui, "_pointer", lambda: pointer)
+    state = ["normal"]
+    root.wm_state = lambda *a: state[0]  # (what Tk would say: "zoomed" after a maximize)
+    content, freeze, inside = _content(root, monkeypatch)
+    laid_out = _configures(inside)
+
+    def first_step(before=None, grow=(20, 0), **setup):
+        """Is a change after a quiet while frozen at once? ``setup``: the pointer and the wm state (``state``) at
+        the change; ``before``: at the Configure before it (a move; by default the state and ``spans`` of the
+        change, at the origin)."""
+        _quiet(root, 1.3)
+        pump(root, lambda: not freeze.frozen)
+        width, height = _size(root)
+        prior = {"state": setup.get("state", "normal"), "spans": setup.get("spans", False), **(before or {})}
+        state[0] = prior.pop("state")
+        pointer.set(**prior)
+        root.event_generate("<Configure>", width=width, height=height)  # (moved: where it is, is noted)
+        state[0] = setup.pop("state", "normal")
+        pointer.set(**setup)
+        laid_out.clear()
+        size = (width + grow[0], height + grow[1])
+        root.geometry("%dx%d" % size)
+        root.update()
+        assert _size(root) == size
+        frozen = freeze.frozen
+        if frozen:
+            assert laid_out == [] and _size(content) == (width, height)
+            pump(root, lambda: not freeze.frozen)  # (and followed once the drag stops)
+            assert _size(inside) == size and len(laid_out) == 1
+        else:
+            assert len(laid_out) == 1 and _size(inside) == size
+        return frozen
+
+    assert not first_step()  # the button up: Win+arrow keys, the maximize button, a change made by the app
+    assert first_step(down=True, border=True)  # on the sizing border (also a double-click on it: frozen a while)
+    assert first_step(down=True)  # not on the border (the cursor ahead of the edge): the right edge moved
+    assert first_step(down=True, grow=(20, -10))  # ... a corner: two edges kept
+    assert first_step(down=True, border=True, spans=True)  # the free edge of a window snapped to half the screen
+    assert not first_step(down=True, spans=True)  # ... not on the border: as big as the work area
+    # a snapped window's title bar dragged: it gets its size from before the snap (as big as the work area before;
+    # a quarter of the screen: not, but it moved)
+    assert not first_step(down=True, before=dict(spans=True), grow=(30, -20))
+    assert not first_step(down=True, origin=(-100, 0), grow=(30, -20))
+    # a title-bar double-click restore (it acts on the button's press) with the restored window near the top of
+    # the screen: the cursor is where the restored window's top border is, but the state changed
+    assert not first_step(down=True, border=True, before=dict(state="zoomed", spans=True), grow=(-20, -20))
+    # a title-bar double-click maximize, also with the cursor on where the border was
+    assert not first_step(down=True, border=True, state="zoomed", spans=True, before=dict(state="normal"))
+    assert not first_step(down=True, border=True, fail=True)  # the mouse not readable
+    monkeypatch.setattr(gui, "RESIZE_FIRST_STEP", False)
+    assert not first_step(down=True, border=True)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_STEP", True)
+    assert first_step(down=True, border=True, state="zoomed")  # (the state as before: on the border, a drag)
+
+
+class _FakeUser32:
+    """user32 for gui._WinPointer (gui._win_functions patched; no Windows needed): one window, 0x1a2b, on one
+    monitor whose work area is 1920×1040; a byref'd structure is filled through its ``_obj``."""
+
+    HWND, THREAD = 0x1A2B, 77
+
+    def __init__(self):
+        self.left = self.right = self.swapped = self.loop = False
+        self.contents = True  # ("show window contents while dragging")
+        self.cursor, self.work = (0, 0), (0, 0, 1920, 1040)
+        self.normal(100, 300, 900, 700)
+
+    def normal(self, left, top, width, height):
+        """A normal window: the frame's invisible 8 px resize border left, right and below, a 31 px title bar."""
+        self.rect = (left, top, left + width, top + height)
+        self.origin, self.client = (left + 8, top + 31), (width - 16, height - 39)
+
+    def zoomed(self):
+        """Maximized: the frame 8 px beyond the work area, a 23 px title bar at the top of the screen."""
+        self.rect, self.origin, self.client = (-8, -8, 1928, 1048), (0, 23), (1920, 1017)
+
+    def functions(self, dll, specs):
+        assert dll == "user32"
+        return {name: getattr(self, name) for name in specs}
+
+    @staticmethod
+    def _fill(arg, **values):
+        target = getattr(arg, "_obj", arg)
+        for name, value in values.items():
+            setattr(target, name, value)
+        return 1
+
+    def _rect(self, arg, rect):
+        left, top, right, bottom = rect
+        return self._fill(arg, left=left, top=top, right=right, bottom=bottom)
+
+    def GetAsyncKeyState(self, vk):
+        return -32768 if (vk, True) in ((1, self.left), (2, self.right)) else 0
+
+    def GetSystemMetrics(self, index):
+        return {23: int(self.swapped), 33: 4, 92: 4}[index]
+
+    def GetCursorPos(self, point):
+        return self._fill(point, x=self.cursor[0], y=self.cursor[1])
+
+    def GetWindowRect(self, hwnd, rect):
+        assert hwnd == self.HWND
+        return self._rect(rect, self.rect)
+
+    def GetClientRect(self, hwnd, rect):
+        assert hwnd == self.HWND
+        return self._rect(rect, (0, 0) + self.client)
+
+    def ClientToScreen(self, hwnd, point):
+        assert hwnd == self.HWND
+        point = getattr(point, "_obj", point)
+        return self._fill(point, x=point.x + self.origin[0], y=point.y + self.origin[1])
+
+    def MonitorFromWindow(self, hwnd, flags):
+        assert hwnd == self.HWND and flags == 2
+        return 5
+
+    def GetMonitorInfoW(self, monitor, info):
+        import ctypes
+
+        target = getattr(info, "_obj", info)
+        assert monitor == 5 and target.cbSize == ctypes.sizeof(target)
+        return self._rect(target.rcWork, self.work)
+
+    def GetWindowThreadProcessId(self, hwnd, process):
+        assert hwnd == self.HWND and process is None
+        return self.THREAD
+
+    def GetGUIThreadInfo(self, thread, info):
+        import ctypes
+
+        target = getattr(info, "_obj", info)
+        assert thread == self.THREAD and target.cbSize == ctypes.sizeof(target)
+        return self._fill(target, flags=0x2 if self.loop else 0)
+
+    def SystemParametersInfoW(self, action, param, value, ini):
+        assert action == 0x26 and param == ini == 0
+        return self._fill(value, value=int(self.contents))
+
+
+class _StubTop:
+    """The toplevel _WinPointer is asked about: its frame's handle and its wm state."""
+
+    state = "normal"
+
+    def wm_frame(self):
+        return "0x1a2b"
+
+    def wm_state(self):
+        return self.state
+
+
+def test_win_pointer_reads_the_frame_and_the_mouse(monkeypatch):
+    """_WinPointer (RESIZE_FIRST_STEP) over a fake user32: where the cursor is on the frame (the sizing border
+    and just outside it, not the client area or the title bar), whether the frame is as big as the work area,
+    the primary button (also swapped), Windows' move or size loop and an outline drag; and _drag_step for a drag
+    of the edge, a title-bar double-click restore near the top of the screen, unsnapping and the button up."""
+    from mhwmm import gui
+
+    user32 = _FakeUser32()
+    monkeypatch.setattr(gui, "_win_functions", user32.functions)
+    pointer, top = gui._WinPointer(), _StubTop()
+
+    def border(x, y):
+        user32.cursor = (x, y)
+        return pointer.on_sizing_border(top)
+
+    # a normal window at (100, 300), 900×700: the client area from (108, 331) to (992, 992)
+    for x, y in ((1003, 600), (1012, 600), (101, 600), (90, 600), (500, 995), (500, 303), (500, 290), (995, 995)):
+        assert border(x, y), (x, y)  # the right, left and bottom edges, the top band, and up to 16 px outside
+    for x, y in ((500, 600), (500, 315), (1020, 600), (500, 280), (1300, 600)):
+        assert not border(x, y), (x, y)  # the client area, the title bar, further away
+    assert pointer.where(top) == ((100, 300, 1000, 1000), False)
+    user32.zoomed()
+    assert not border(900, 10)  # a maximized window's title bar
+    assert pointer.where(top) == ((-8, -8, 1928, 1048), True)
+    user32.rect = (-8, 0, 968, 1048)  # snapped to the left half: as tall as the work area
+    assert pointer.where(top)[1]
+    user32.rect = (-8, 0, 968, 528)  # a quarter of the screen
+    assert not pointer.where(top)[1]
+
+    assert not pointer.dragging(top)
+    user32.left = True
+    assert pointer.button_down() and pointer.dragging(top)
+    user32.swapped = True  # (the buttons swapped: the primary one is the right one)
+    assert not pointer.button_down()
+    user32.right = True
+    assert pointer.button_down()
+    user32.left = user32.right = user32.swapped = False
+    user32.loop = True  # (a pen or a finger: the button not seen, but Windows' move or size loop runs)
+    assert not pointer.button_down() and pointer.in_move_size(top) and pointer.dragging(top)
+    user32.left = True
+    user32.contents = False  # (an outline drag: Windows sizes the window once, when the drag ends)
+    assert not pointer.dragging(top)
+    user32.left = user32.loop = False
+    user32.contents = True
+
+    def drag_step(change, by_last=False, by_alone=False, state="normal", **mouse):
+        """_drag_step for ``change`` (it changes user32's window) from the window as it is now."""
+        before = gui._place(top, pointer)
+        change()
+        top.state = state
+        user32.__dict__.update(mouse)
+        try:
+            return gui._drag_step(top, pointer, before, gui._place(top, pointer), by_last, by_alone)
+        finally:
+            user32.left = user32.loop = False
+
+    user32.normal(100, 300, 900, 700)
+    wider = lambda: user32.normal(100, 300, 920, 700)  # noqa: E731
+    assert drag_step(wider, left=True, cursor=(1010, 600))  # the right edge dragged: on the border
+    user32.normal(100, 300, 900, 700)
+    assert drag_step(wider, left=True, cursor=(1040, 600))  # ... the cursor ahead of it: three edges kept
+    user32.normal(100, 300, 900, 700)
+    assert drag_step(wider, loop=True, cursor=(1010, 600))  # (with a finger)
+    user32.normal(100, 300, 900, 700)
+    assert not drag_step(wider, cursor=(1010, 600), by_alone=True)  # the button up: on its own, unless ...
+    user32.normal(100, 300, 900, 700)
+    assert drag_step(wider, cursor=(1010, 600), by_last=True)  # ... right after the last change
+    # the free edge of a window snapped to the left half (as tall as the work area) dragged, the cursor ahead of it:
+    # neither on the border nor resized in place, so with the button down by the time rules (a step right after the
+    # last change, or soon after a change on its own or after a pause in the drag, FreezeContent._settled)
+    snapped_wider = lambda: user32.__dict__.update(rect=(-8, 0, 988, 1048), client=(972, 1009))  # noqa: E731
+    for down in (dict(left=True), dict(loop=True)):
+        for by_last, by_alone in ((False, False), (True, False), (False, True)):
+            user32.rect, user32.origin, user32.client = (-8, 0, 968, 1048), (0, 31), (952, 1009)
+            assert drag_step(snapped_wider, by_last, by_alone, cursor=(1030, 600), **down) is (by_last or by_alone)
+            assert not pointer.on_sizing_border(top) and pointer.where(top)[1]
+    user32.zoomed()
+    top.state = "zoomed"
+    # a title-bar double-click on the maximized window at (900, 15), restored to 1240×800 at (200, 10): the cursor
+    # is in the restored window's top band, but the state changed
+    restore = lambda: user32.normal(200, 10, 1240, 800)  # noqa: E731
+    assert not drag_step(restore, left=True, cursor=(900, 15))
+    assert border(900, 15)
+    user32.rect, user32.origin, user32.client = (-8, 0, 968, 1048), (0, 31), (952, 1009)  # snapped to the left
+    # its title bar dragged: its size from before the snap, under the cursor
+    assert not drag_step(lambda: user32.normal(-120, 0, 1240, 800), left=True, cursor=(500, 15))
+    user32.rect, user32.origin, user32.client = (-8, 0, 968, 528), (0, 31), (952, 489)  # a quarter of the screen
+    assert not drag_step(lambda: user32.normal(-120, 0, 1240, 800), left=True, cursor=(500, 15))
+    user32.normal(100, 300, 900, 700)
+
+    def broken(*args):
+        raise OSError("no mouse")
+
+    monkeypatch.setattr(user32, "GetAsyncKeyState", broken)
+    pointer = gui._WinPointer()
+    assert not drag_step(wider, cursor=(1010, 600))  # the mouse not readable: the time rules
+    user32.normal(100, 300, 900, 700)
+    assert drag_step(wider, cursor=(1010, 600), by_alone=True)
+
+
+class _FakeClassUser32:
+    """user32 for gui._WinClasses (gui._win_functions patched): windows {handle: [class name, parent, process]} and
+    class styles by name. ``wide``: GetClassLongPtrW/SetClassLongPtrW exist (64-bit), else only the ...Long ones."""
+
+    INNER, OUTER = 0x501, 0x777
+
+    def __init__(self, wide=True, child="TkChild", top="TkTopLevel"):
+        import os
+
+        self.wide = wide
+        self.windows = {self.INNER: [child, self.OUTER, os.getpid()], self.OUTER: [top, 0, os.getpid()]}
+        self.styles = {child: 0x0003 | 0x0008, top: 0x0003}  # (CS_DBLCLKS too: the other bits stay)
+        self.calls: list = []
+        self.stuck = False  # SetClassLong... changes nothing
+
+    def functions(self, dll, specs):
+        assert dll == "user32"
+        wide = {"GetClassLongPtrW", "SetClassLongPtrW"}
+        if not self.wide and wide & set(specs):
+            raise AttributeError("GetClassLongPtrW")  # (as a 32-bit user32)
+        return {name: getattr(self, name) for name in specs}
+
+    def GetClassNameW(self, hwnd, buf, size):
+        self.calls.append(("name", hwnd))
+        name = self.windows[hwnd][0]
+        buf.value = name
+        return len(name)
+
+    def GetParent(self, hwnd):
+        return self.windows[hwnd][1] or None
+
+    def GetWindowThreadProcessId(self, hwnd, process):
+        getattr(process, "_obj", process).value = self.windows[hwnd][2]
+        return 9
+
+    def _get(self, hwnd, index):
+        assert index == -26  # GCL_STYLE
+        return self.styles[self.windows[hwnd][0]]
+
+    def _set(self, hwnd, index, value):
+        assert index == -26
+        name = self.windows[hwnd][0]
+        self.calls.append(("set", name, value))
+        old = self.styles[name]
+        if not self.stuck:
+            self.styles[name] = value
+        return old
+
+    GetClassLongPtrW = GetClassLongW = _get
+    SetClassLongPtrW = SetClassLongW = _set
+
+
+class _ClassTop:
+    """A toplevel for class_redraw: its own window's handle and `wm frame` (its own handle until it is shown)."""
+
+    def __init__(self, shown=True):
+        self.shown = shown
+
+    def winfo_id(self):
+        return _FakeClassUser32.INNER
+
+    def wm_frame(self):
+        return hex(_FakeClassUser32.OUTER if self.shown else _FakeClassUser32.INNER)
+
+
+def _classes(monkeypatch, value, **user32):
+    """gui's RESIZE_CLASS_REDRAW set to ``value`` over a fake user32, nothing done yet: the fake."""
+    from mhwmm import gui
+
+    fake = _FakeClassUser32(**user32)
+    monkeypatch.setattr(gui, "_win_functions", fake.functions)
+    monkeypatch.setattr(gui, "_CLASSES", [gui._WinClasses()])
+    monkeypatch.setattr(gui, "_CLASS_REDRAW", {})
+    monkeypatch.setattr(gui, "RESIZE_CLASS_REDRAW", value)
+    return fake
+
+
+def test_class_redraw_takes_the_styles_off_the_classes_it_finds(monkeypatch):
+    """RESIZE_CLASS_REDRAW (Windows, over a fake user32): the classes are those GetClassNameW names for the
+    toplevel's own window (child) and for its parent that `wm frame` names (top, once the toplevel has been
+    shown); only CS_HREDRAW|CS_VREDRAW go, once; "keep" changes nothing; 32-bit user32 has only ...ClassLongW."""
+    from mhwmm import gui
+
+    fake = _classes(monkeypatch, "keep")
+    gui.class_redraw(_ClassTop())
+    assert fake.calls == [] and gui._CLASS_REDRAW == {}
+
+    fake = _classes(monkeypatch, "child", child="TkChild86", top="TkTopLevel86")  # (names read, not assumed)
+    gui.class_redraw(_ClassTop())
+    assert fake.styles == {"TkChild86": 0x0008, "TkTopLevel86": 0x0003}
+    assert gui._CLASS_REDRAW == {"child": {"class": "TkChild86", "before": 0x000B, "after": 0x0008}}
+    gui.class_redraw(_ClassTop())  # (once)
+    assert [c for c in fake.calls if c[0] == "set"] == [("set", "TkChild86", 0x0008)]
+
+    fake = _classes(monkeypatch, "top")
+    top = _ClassTop(shown=False)
+    gui.class_redraw(top)  # no outer window yet: nothing, and tried again later
+    assert fake.styles["TkTopLevel"] == 0x0003 and gui._CLASS_REDRAW == {}
+    top.shown = True
+    gui.class_redraw(top)
+    assert fake.styles == {"TkChild": 0x000B, "TkTopLevel": 0}
+    assert gui._CLASS_REDRAW == {"top": {"class": "TkTopLevel", "before": 3, "after": 0}}
+
+    for wide in (True, False):
+        fake = _classes(monkeypatch, "both", wide=wide)
+        gui.class_redraw(_ClassTop())
+        assert fake.styles == {"TkChild": 0x0008, "TkTopLevel": 0}
+        assert set(gui._CLASS_REDRAW) == {"top", "child"}
+
+
+def test_class_redraw_leaves_what_is_not_tks_own_and_never_raises(monkeypatch):
+    """RESIZE_CLASS_REDRAW: a parent of another process, or of the same class as the toplevel's own window, is not
+    its outer window; a style that does not change and a failing call are noted (not tried again) and never
+    raise."""
+    import os
+
+    from mhwmm import gui
+
+    fake = _classes(monkeypatch, "both")
+    fake.windows[fake.OUTER][2] = os.getpid() + 1
+    gui.class_redraw(_ClassTop())
+    assert fake.styles["TkTopLevel"] == 0x0003 and set(gui._CLASS_REDRAW) == {"child"}
+
+    fake = _classes(monkeypatch, "both")
+    fake.windows[fake.OUTER][0] = "TkChild"
+    gui.class_redraw(_ClassTop())
+    assert set(gui._CLASS_REDRAW) == {"child"}
+    assert [c for c in fake.calls if c[0] == "set"] == [("set", "TkChild", 0x0008)]
+
+    fake = _classes(monkeypatch, "both")
+    fake.stuck = True
+    gui.class_redraw(_ClassTop())
+    assert all("still" in gui._CLASS_REDRAW[kind]["error"] for kind in ("top", "child"))
+    calls = len(fake.calls)
+    gui.class_redraw(_ClassTop())
+    assert len(fake.calls) == calls  # (not tried again)
+
+    fake = _classes(monkeypatch, "child")
+
+    def broken(*args):
+        raise OSError("no class")
+
+    monkeypatch.setattr(fake, "GetClassNameW", broken)
+    monkeypatch.setattr(gui, "_CLASSES", [gui._WinClasses()])
+    gui.class_redraw(_ClassTop())
+    assert "no class" in gui._CLASS_REDRAW["child"]["error"] and fake.styles["TkChild"] == 0x000B
+
+    monkeypatch.setattr(gui, "_CLASSES", [None])  # (not Windows, or user32 not usable)
+    monkeypatch.setattr(gui, "_CLASS_REDRAW", {})
+    gui.class_redraw(_ClassTop())
+    assert gui._CLASS_REDRAW == {}
+
+
+def test_class_redraw_runs_when_the_window_is_watched_and_shown(root, monkeypatch):
+    """RESIZE_CLASS_REDRAW is applied by the windows that watch their size (FreezeContent): the child class when
+    the toplevel is watched, the outer window's class at a <Configure> once it has been shown; then not again."""
+    from mhwmm import gui
+
+    class Classes:
+        def __init__(self):
+            self.shown, self.dropped = False, []
+
+        def windows(self, top):
+            assert top is root
+            found = {"child": ("TkChild", 1)}
+            if self.shown:
+                found["top"] = ("TkTopLevel", 2)
+            return found
+
+        def drop_redraw(self, hwnd):
+            self.dropped.append(hwnd)
+            return 3, 0
+
+    classes = Classes()
+    monkeypatch.setattr(gui, "_CLASSES", [classes])
+    monkeypatch.setattr(gui, "_CLASS_REDRAW", {})
+    monkeypatch.setattr(gui, "RESIZE_CLASS_REDRAW", "both")
+    root.geometry("400x300")
+    gui.FreezeContent(root, tk.Frame(root))
+    assert classes.dropped == [1]
+    classes.shown = True
+    root.geometry("420x300")
+    pump(root, lambda: classes.dropped == [1, 2])
+    root.geometry("440x300")
+    _quiet(root, 0.3)
+    assert classes.dropped == [1, 2]
+    assert set(gui._CLASS_REDRAW) == {"top", "child"}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows changes the real classes")
+def test_class_redraw_is_nothing_off_windows(root, monkeypatch):
+    """Off Windows RESIZE_CLASS_REDRAW does nothing (there are no window classes)."""
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "_CLASSES", [])
+    monkeypatch.setattr(gui, "_CLASS_REDRAW", {})
+    monkeypatch.setattr(gui, "RESIZE_CLASS_REDRAW", "both")
+    root.geometry("400x300")
+    gui.FreezeContent(root, tk.Frame(root))
+    root.geometry("420x300")
+    _quiet(root, 0.3)
+    assert gui._CLASSES == [None] and gui._CLASS_REDRAW == {}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Tk's window classes are Windows'")
+def test_windows_tk_window_classes_are_found(root):
+    """On Windows the toplevel's own window has Tk's child class and its outer window Tk's toplevel class, read
+    with GetClassNameW, and their styles can be read (nothing is changed here; the app's windows in the tests
+    before may have taken CS_HREDRAW|CS_VREDRAW off, RESIZE_CLASS_REDRAW)."""
+    import ctypes
+
+    from mhwmm import gui
+
+    root.geometry("320x200+60+60")
+    root.update()
+    classes = gui._WinClasses()
+    found = classes.windows(root)
+    assert found["child"][0] == "TkChild" and found["child"][1] == root.winfo_id()
+    assert found["top"][0] == "TkTopLevel" and found["top"][1] == int(root.wm_frame(), 16)
+    for _name, hwnd in found.values():
+        ctypes.set_last_error(0)
+        style = classes.get_style(hwnd, classes.GCL_STYLE)
+        assert style or not ctypes.get_last_error()  # (read: a style of 0 only without an error)
+        assert not style & ~0xFFFF  # (class styles are CS_* bits)
+
+
+def test_windows_snaps_soon_after_a_change_are_followed(root, monkeypatch):
+    """Windows (RESIZE_FIRST_STEP): with the mouse button up (and no move or size loop) a change soon after a
+    change on its own or after a drag (Win+Left and then Win+Up, a maximize just after a drag) is followed at
+    once: RESIZE_FIRST_MS is for a drag the mouse does not show. Right after the last change (RESIZE_SETTLE_MS) it
+    is still a step; with the button down the time rules hold as without the mouse (a pause in the drag)."""
+    from mhwmm import gui
+
+    pointer = _FakePointer()
+    monkeypatch.setattr(gui, "_pointer", lambda: pointer)
+    state = ["normal"]
+    root.wm_state = lambda *a: state[0]
+    content, freeze, inside = _content(root, monkeypatch, settle_ms=200)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 1500)  # (a slow machine must not end the time rule too soon)
+    laid_out = _configures(inside)
+
+    def change(size, wait=0.3, **setup):
+        """The window changed to ``size`` ``wait`` seconds after the change before: frozen?"""
+        _quiet(root, wait)
+        state[0] = setup.pop("state", "normal")
+        pointer.set(**setup)
+        laid_out.clear()
+        root.geometry("%dx%d" % size)
+        root.update()
+        assert _size(root) == size
+        if not freeze.frozen:
+            assert laid_out == [size] and _size(inside) == size
+        return freeze.frozen
+
+    assert not change((700, 500), wait=2.0)  # Win+Left (on its own)
+    assert not change((700, 260))  # Win+Up: a quarter of the screen (the state stays "normal")
+    assert not change((1200, 800), state="zoomed", spans=True)  # maximized
+    assert not change((700, 260))  # restored
+    for width in (720, 740, 760):  # a drag of the edge ...
+        assert change((width, 260), wait=0.05, down=True, border=True)
+    pump(root, lambda: not freeze.frozen)  # (it stops, the button let go)
+    assert not change((1200, 800), wait=0.05, state="zoomed", spans=True)  # ... and a maximize just after it
+    assert not change((760, 260))  # restored
+    assert change((780, 260), wait=0.01)  # (right after the last change: a step whatever the mouse says)
+    pump(root, lambda: not freeze.frozen)
+    assert not change((800, 300), wait=0.05)  # a snap with the keys just after the content followed
+    # the button down soon after a change on its own: the time rule (here the free edge of a snapped window with
+    # the cursor ahead of it: neither on the border nor resized in place)
+    assert change((820, 300), down=True, spans=True)
+    pump(root, lambda: not freeze.frozen)
+    assert not change((840, 300), wait=2.0, down=True, spans=True)  # (long after: on its own)
+
+
+def test_follow_width_gives_the_cards_the_canvas_width(root):
+    """Cards in a scrolled canvas are as wide as the canvas, at once; a change of height alone leaves them."""
+    from tkinter import ttk
+
+    from mhwmm import gui
+
+    root.geometry("600x400")
+    canvas = tk.Canvas(root, width=1, height=1)
+    canvas.pack(side="left", fill="both", expand=True)
+    inner = ttk.Frame(canvas, height=50)
+    item = canvas.create_window((0, 0), window=inner, anchor="nw")
+    gui.follow_width(canvas, item)
+    laid_out = _configures(inner)
 
     def given():
         return int(float(canvas.itemcget(item, "width")))
 
-    pump(root, lambda: given() == canvas.winfo_width() > 500)
-    end = time.time() + 1.6
-    while time.time() < end:
+    pump(root, lambda: canvas.winfo_width() > 500 and given() == canvas.winfo_width() == inner.winfo_width())
+    for geometry in ("640x400", "700x400", "620x400"):
+        root.geometry(geometry)
         root.update()
-        time.sleep(0.02)
+        assert given() == canvas.winfo_width() == inner.winfo_width()
     laid_out.clear()
-    root.geometry("640x400")  # the first step: at once (and slow)
+    root.geometry("620x500")  # taller only: the cards stay as they are
     root.update()
-    first = given()
-    assert first == canvas.winfo_width() and laid_out == [first]
-    for width in (660, 680, 700):  # (the second step comes more than RESIZE_SETTLE_MS after the first)
-        root.geometry(f"{width}x400")
-        root.update()
-        assert given() == first and gui.resizing(canvas)
-    pump(root, lambda: given() == canvas.winfo_width() == 700)
-    assert laid_out == [first, 700]  # once more, when the drag stopped
+    assert canvas.winfo_height() > 450 and laid_out == []
+    side = ttk.Frame(root, width=60)  # the canvas narrower while the window keeps its size
+    side.pack(side="right", fill="y", before=canvas)
+    root.update()
+    assert given() == canvas.winfo_width() == inner.winfo_width() < 620 - 50
 
 
-def test_gui_follows_the_window_size_once_resizing_stops(root, manager, tmp_path, monkeypatch):
-    """옵션 cards, the 원인 찾기 bar's text and the log after the window was dragged bigger and smaller."""
+def test_gui_content_waits_for_the_drag_to_stop(root, manager, tmp_path, monkeypatch):
+    """Nothing in the main window is laid out again while its edge is dragged (the whole content keeps its size);
+    once the drag stops the content fills the window, laid out once, and the 옵션 cards, the 원인 찾기 bar's text
+    and the log follow the new size."""
     import logging
 
     from mhwmm import gui
 
     monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 400)
+    monkeypatch.setattr(gui, "_pointer", lambda: None)  # (the drag's first step is one on its own)
     with manager.prepare_install(make_zip(tmp_path / "Pack.zip", {
             "Pack/One/natives/STM/a.tex": "1", "Pack/Two/natives/STM/a.tex": "2"})) as s:
         mod = manager.install_package(s, s.variants)
@@ -316,25 +1041,38 @@ def test_gui_follows_the_window_size_once_resizing_stops(root, manager, tmp_path
     def wrapped():
         return int(float(str(app.bisect_text.cget("wraplength")))) == max(px(200), text.winfo_width() - px(4))
 
+    def settled():
+        return (app.content.winfo_width(), app.content.winfo_height()) == (root.winfo_width(), root.winfo_height()) \
+            and inner.winfo_width() == canvas.winfo_width() and wrapped()
+
     pump(root, wrapped)
-    end = time.time() + 0.6  # (the sash placed at startup, and the drag's first step not part of an earlier one)
-    while time.time() < end:
-        root.update()
-        time.sleep(0.02)
+    _quiet(root)  # (the sash placed at startup, and the drag's first step not part of an earlier one)
 
     width, height = root.winfo_width(), root.winfo_height()
-    assert width == px(1240)
-    for step in (40, 80, 120, 160, 120, 60):  # dragged wider, then back a little
-        root.geometry(f"{width + px(step)}x{height}")
+    assert width == px(1240) and app.content.winfo_width() == width
+    seen = {name: _configures(widget) for name, widget in (
+        ("panes", app.paned), ("list", app.tree), ("cards", inner), ("log", app.log_text), ("bar", text),
+        ("toolbar", app.toolbar), ("status", app.status_frame))}
+    root.geometry(f"{width + px(40)}x{height}")  # the drag's first step: at once
+    root.update()
+    assert app.content.winfo_width() == width + px(40) and not app.freeze.frozen
+    assert inner.winfo_width() == canvas.winfo_width() and wrapped()
+    for widget in seen.values():
+        widget.clear()
+    for step, taller in ((80, 0), (120, 30), (160, 60), (120, 30), (60, 0)):  # dragged on, then back a little
+        root.geometry(f"{width + px(step)}x{height + px(taller)}")
         root.update()
+        assert app.freeze.frozen and app.content.winfo_width() == width + px(40)
+        assert app.content.winfo_height() == height and app.content.winfo_x() == 0
     assert root.winfo_width() == width + px(60)
-    assert inner.winfo_width() < canvas.winfo_width()  # the cards wait for the drag to stop
-    pump(root, lambda: inner.winfo_width() == canvas.winfo_width() and wrapped())
+    assert all(not events for events in seen.values())  # nothing in the window was laid out on these steps
+    pump(root, settled)
+    assert len(seen["panes"]) == 1 and len(seen["toolbar"]) == 1  # laid out once, for the size it stopped at
+    assert not app.freeze.frozen and app.content.winfo_x() == 0
     for step in (40, 80, 120):  # ... and narrower
         root.geometry(f"{width + px(60) - px(step)}x{height}")
         root.update()
-    pump(root, lambda: root.winfo_width() == width + px(60) - px(120) and inner.winfo_width() == canvas.winfo_width()
-         and wrapped())
+    pump(root, lambda: root.winfo_width() == width + px(60) - px(120) and settled())
 
     # the log keeps its last lines (all of them are in manager.log)
     for i in range(gui.LOG_LINES + 40):
@@ -346,11 +1084,10 @@ def test_gui_follows_the_window_size_once_resizing_stops(root, manager, tmp_path
     assert app.log_text.yview()[1] == 1.0  # still at the end
 
 
-def test_gui_list_keeps_its_width_while_the_window_is_dragged(root, manager, tmp_path, monkeypatch):
-    """The mod list keeps its width while the window's edge is dragged (drawing all of it again on every step made
-    resizing stutter) and the details card takes the change. Once the drag stops the sash is where it is without
-    the hold; during the drag the list is never far behind and the details card is never narrower than without
-    the hold (or than px(300))."""
+def test_gui_sash_after_a_drag_is_where_the_weights_put_it(root, manager, tmp_path, monkeypatch):
+    """While the window's edge is dragged the mod list and the details card keep their widths (the content is
+    frozen); once the drag stops the sash is where ttk's pane weights put it, the same as when every step of the
+    drag is laid out."""
     from mhwmm import gui
 
     for n in range(3):
@@ -363,7 +1100,7 @@ def test_gui_list_keeps_its_width_while_the_window_is_dragged(root, manager, tmp
     app = gui.App(root, manager, queue.Queue())
     px = app.theme.px
     root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
-    paned, hold = app.paned, app.list_hold
+    paned = app.paned
     left, right = (paned.nametowidget(str(p)) for p in paned.panes())
     height = px(800)
     start = px(1240)
@@ -376,12 +1113,9 @@ def test_gui_list_keeps_its_width_while_the_window_is_dragged(root, manager, tmp
     def drag(settle_ms):
         monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", settle_ms)
         monkeypatch.setattr(gui, "RESIZE_FIRST_MS", settle_ms)
-        root.geometry(f"{start}x{height}")
-        end = time.time() + 0.8
-        while time.time() < end:
-            root.update()
-            time.sleep(0.02)
-        pump(root, lambda: root.winfo_width() == start)
+        root.geometry(f"{start}x{height}")  # (may be a step of the drag before: then settled within 2 × settle_ms)
+        _quiet(root, 1.5)
+        pump(root, lambda: root.winfo_width() == start == app.content.winfo_width())
         app._place_sash()  # (the saved ratio: the same sash both times)
         root.update()
         steps = []
@@ -390,20 +1124,221 @@ def test_gui_list_keeps_its_width_while_the_window_is_dragged(root, manager, tmp
             root.update()
             assert root.winfo_width() == width
             steps.append((left.winfo_width(), right.winfo_width()))
-        pump(root, lambda: hold.held is None and hold._after is None)
+        pump(root, lambda: not app.freeze.frozen and app.content.winfo_width() == root.winfo_width() == sizes[-1])
         root.update()
         return steps, paned.sashpos(0)
 
-    free, free_sash = drag(0)  # (0: no change is a drag step, as before the hold)
+    free, free_sash = drag(0)  # (0: no change is a drag step: every step laid out)
     held, held_sash = drag(600)
-    assert held_sash == free_sash  # where the sash goes without the hold
+    assert held_sash == free_sash  # where ttk's weights put the sash
     assert left.winfo_width() == free_sash
-    kept = sum(1 for (a, _), (b, _) in zip(held[:24], held[1:24]) if a == b)
-    assert kept >= 10 and all(a != b for (a, _), (b, _) in zip(free[:24], free[1:24]))  # it held while wider
-    for (held_list, held_card), (free_list, free_card) in zip(held, free):
-        assert abs(held_list - free_list) <= px(120) + hold.SLACK
-        assert held_card >= min(free_card, px(300))
-    assert min(card for _, card in held) >= min(card for _, card in free)
+    assert all(a != b for (a, _), (b, _) in zip(free[:24], free[1:24]))  # every step laid out
+    assert all(step == held[0] for step in held)  # frozen from the drag's second step on
+    assert held[0] == free[0]  # (the first step laid out at once)
+
+
+@pytest.mark.parametrize("mouse", [None, "border", "ahead"], ids=["time", "mouse", "ahead"])
+def test_gui_a_pause_in_the_drag_lays_the_window_out_once(root, manager, monkeypatch, mouse):
+    """A pause in the drag (the mouse button still down) lays the window out once, for the size it paused at; the
+    step that goes on with the drag is frozen again (laid out at once, the whole window would be laid out a second
+    time for the pause, just as the mouse moves again). A change long after the pause is one on its own. By the
+    time rules (``mouse`` None), and on Windows by the mouse (RESIZE_FIRST_STEP): the button down on the border
+    ("border"), frozen from the drag's first step on; the button down with the cursor ahead of a snapped window's
+    free edge ("ahead": neither on the border nor resized in place), by the time rules as without the mouse; a
+    change with the button up is on its own."""
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 300)  # (a slow machine must not make the drag look finished)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 600)
+    pointer = {None: None, "border": _FakePointer(down=True, border=True),
+               "ahead": _FakePointer(down=True, spans=True)}[mouse]
+    monkeypatch.setattr(gui, "_pointer", lambda: pointer)  # (without it, on Windows the mouse would say "up")
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = False
+    app = gui.App(root, manager, queue.Queue())
+    px = app.theme.px
+    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+    pump(root, lambda: root.winfo_width() > 1 and app.content.winfo_width() == root.winfo_width())
+    _quiet(root, 1.2)
+    width, height = root.winfo_width(), root.winfo_height()
+    panes = _configures(app.paned)
+    steps = [0]
+
+    def step():
+        steps[0] += 1
+        root.geometry(f"{width + px(4) * steps[0]}x{height}")
+        root.update()
+
+    def drag(seconds):  # a step every 50 ms, each one frozen
+        end = time.perf_counter() + seconds
+        while True:
+            step()
+            assert app.freeze.frozen and gui.resizing(root)
+            if time.perf_counter() >= end:
+                return
+            time.sleep(0.05)
+
+    def laid_out():
+        return not app.freeze.frozen and app.paned.winfo_width() == root.winfo_width() - 2 * px(20)
+
+    root.event_generate("<Configure>", width=width, height=height)  # (moved: noted in its state now, not X11's
+    # "iconic" of the window's first Configure)
+    step()  # the drag's first step: at once (by the mouse on the border: frozen too)
+    on_border = mouse == "border"
+    assert app.freeze.frozen == on_border and len(panes) == (0 if on_border else 1)
+    first = len(panes)
+    time.sleep(0.05)
+    drag(0.9)  # (longer than RESIZE_FIRST_MS: the pause does not come soon after the first step)
+    assert len(panes) == first
+    pump(root, laid_out)  # the pause: laid out once
+    assert len(panes) == first + 1 and panes[-1][0] == app.paned.winfo_width()
+    panes.clear()
+    drag(0.3)  # the drag goes on: frozen from its first step
+    assert panes == []
+    pump(root, laid_out)  # and stops: laid out once more
+    assert len(panes) == 1
+    _quiet(root, 1.2)  # (longer than RESIZE_SETTLE_MS + RESIZE_FIRST_MS)
+    panes.clear()
+    if pointer is not None:
+        pointer.set()  # (the button let go)
+    step()  # a change on its own (maximize, restore): at once
+    assert not app.freeze.frozen and len(panes) == 1 and app.content.winfo_width() == root.winfo_width()
+
+
+def test_gui_mod_list_columns_fit_the_list(root, manager, tmp_path, monkeypatch):
+    """The mod list's columns fit the list (no column cut off at its right edge while the name column can give
+    way), at the start and after a frozen drag wider and back: ttk keeps a change of the list's width as slack
+    until the list is wider or narrower than its columns, so the columns kept their widths from the start."""
+    from mhwmm import gui
+
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 400)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 600)
+    for n in range(40):  # (the list's scroll bar shows)
+        with manager.prepare_install(make_zip(tmp_path / f"M{n}.zip", {f"natives/STM/m{n}.tex": "x"})) as s:
+            manager.install_variant(s, s.variants[0])
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = False
+    app = gui.App(root, manager, queue.Queue())
+    px = app.theme.px
+    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+    tree = app.tree
+    columns = ("#0",) + tuple(tree["columns"])
+
+    def fits():
+        root.update()
+        total = sum(int(tree.column(c, "width")) for c in columns)
+        return tree.xview() == (0.0, 1.0) and total == tree.winfo_width()
+
+    pump(root, lambda: root.winfo_width() > 1 and app.paned.winfo_width() > 1)
+    _quiet(root, 1.0)  # (the sash and the columns placed 60 ms after the start)
+    assert fits()
+    name = int(tree.column("name", "width"))
+    width, height = root.winfo_width(), root.winfo_height()
+    path = [width + px(10) * k for k in range(1, 33)] + [width + px(320) - px(10) * k for k in range(1, 45)]
+    for w in path:  # one drag, wider and back (frozen from its second step)
+        root.geometry(f"{w}x{height}")
+        root.update()
+    assert app.freeze.frozen
+    pump(root, lambda: not app.freeze.frozen and app.content.winfo_width() == root.winfo_width() == path[-1])
+    assert fits() and int(tree.column("name", "width")) < name  # (the name column gave the width back)
+
+
+def test_gui_window_size_and_sash_are_restored(root, manager):
+    """The main window's content is placed (it asks the window for no size): the window gets the saved size, or
+    1240×800, its minimum size keeps the toolbar whole, and the sash goes to the saved share, as before."""
+    from mhwmm import gui
+
+    scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+
+    def px(n):
+        return int(round(n * scale))
+
+    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = True
+    manager.settings.window_geometry = f"{px(1300)}x{px(850)}+10+20"
+    manager.settings.sash_ratio = 0.45
+    app = gui.App(root, manager, queue.Queue())
+    assert app.theme.px(1300) == px(1300)
+    pump(root, lambda: root.winfo_width() > 1 and app.paned.winfo_width() > 1)
+    _quiet(root, 0.4)
+    app._place_sash()  # (as 60 ms after the start: then the window may not be laid out yet on every system)
+    root.update()
+    assert root.minsize()[0] >= px(980) and root.minsize()[1] == px(620)  # (the toolbar as it is laid out first)
+    assert (root.winfo_width(), root.winfo_height()) == (px(1300), px(850))
+    assert (app.content.winfo_width(), app.content.winfo_height()) == (px(1300), px(850))
+    assert app.content.winfo_manager() == "place" and not app.freeze.frozen
+    assert app.paned.sashpos(0) == int(app.paned.winfo_width() * 0.45)
+    app._save_window_state()
+    assert manager.settings.window_geometry.startswith(f"{px(1300)}x{px(850)}+")
+    assert manager.settings.sash_ratio == round(app.paned.sashpos(0) / app.paned.winfo_width(), 3)
+    assert abs(manager.settings.sash_ratio - 0.45) < 0.005
+
+
+def test_gui_window_takes_its_minimum_and_default_size(root, manager):
+    from mhwmm import gui
+
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = True
+    manager.settings.window_geometry = "300x200+10+20"  # smaller than the window may be
+    app = gui.App(root, manager, queue.Queue())
+    px = app.theme.px
+    pump(root, lambda: root.winfo_width() > 1 and app.content.winfo_width() == root.winfo_width())
+    assert root.minsize()[0] >= px(980) and root.minsize()[1] == px(620)
+    assert (root.winfo_width(), root.winfo_height()) == root.minsize()
+    assert app.content.winfo_height() == root.winfo_height()
+
+
+def test_gui_window_default_size_and_sash(root, manager):
+    from mhwmm import gui
+
+    root.maxsize(4000, 3000)  # (Windows keeps a window within the screen unless told otherwise)
+    manager.settings.auto_apply = False
+    manager.settings.remember_window = False
+    app = gui.App(root, manager, queue.Queue())
+    px = app.theme.px
+    pump(root, lambda: root.winfo_width() > 1 and app.paned.winfo_width() > 1)
+    _quiet(root, 0.4)
+    app._place_sash()  # (as 60 ms after the start)
+    root.update()
+    assert (root.winfo_width(), root.winfo_height()) == (px(1240), px(800))
+    assert app.paned.sashpos(0) == int(app.paned.winfo_width() * 0.58)
+
+
+def test_resizable_dialogs_keep_their_size_and_freeze(root, manager, monkeypatch):
+    """사용법 and 충돌 한눈에 보기 (windows meant to be made bigger) are as big as their packed content asks for,
+    with the body placed instead: it keeps its size while the window's edge is dragged and follows once the drag
+    stops."""
+    from mhwmm import gui
+
+    manager.settings.auto_apply = False
+    app = gui.App(root, manager, queue.Queue())
+    monkeypatch.setattr(gui, "RESIZE_SETTLE_MS", 600)
+    monkeypatch.setattr(gui, "RESIZE_FIRST_MS", 600)
+    for cls, make in ((gui.HelpDialog, lambda: gui.HelpDialog(root, app.theme)),
+                      (gui.ConflictsDialog, lambda: gui.ConflictsDialog(root, app.theme, manager))):
+        shown = {}
+        for freeze in (False, True):
+            monkeypatch.setattr(cls, "FREEZE", freeze)
+            dialog = make()
+            dialog.maxsize(4000, 3000)
+            dialog.wait_window = lambda *a: None  # (show() returns at once)
+            dialog.show()
+            pump(root, lambda: dialog.winfo_ismapped() and dialog.body.winfo_width() > 1)
+            root.update()
+            assert dialog.body.winfo_manager() == ("place" if freeze else "pack")
+            shown[freeze] = (dialog.winfo_width(), dialog.winfo_height(), dialog.body.winfo_width(),
+                             dialog.body.winfo_height(), dialog.winfo_rootx(), dialog.winfo_rooty())
+            if freeze:
+                _quiet(root)
+                width, height = dialog.winfo_width(), dialog.winfo_height()
+                for k in (1, 2, 3, 4):
+                    dialog.geometry(f"{width + 20 * k}x{height + 10 * k}")
+                    dialog.update()
+                assert dialog.freeze.frozen and dialog.body.winfo_width() == width + 20
+                pump(root, lambda: (dialog.body.winfo_width(), dialog.body.winfo_height()) == (width + 80, height + 40))
+            dialog.destroy()
+        assert shown[True] == shown[False]
 
 
 def test_gui_keeps_the_picked_tab_and_reads_old_option_pictures(root, manager, tmp_path, monkeypatch):

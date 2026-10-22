@@ -139,8 +139,9 @@ def test_without_a_game_numbers_are_shown(tmp_path):
 
 
 def test_window_tiles_follow_the_width_once_resizing_stops(tmp_path, monkeypatch):
-    """The tiles keep their width while the window's edge is dragged (laying 120 of them out on every step made
-    it stutter), then the list, the mods' names and the part chips follow the new width."""
+    """The tiles keep their width while the window's edge is dragged (the window's content is frozen: laying 120
+    of them out on every step made it stutter), then the list, the mods' names and the part chips follow the new
+    width."""
     tk = pytest.importorskip("tkinter")
     try:
         root = tk.Tk()
@@ -199,13 +200,24 @@ def test_window_tiles_follow_the_width_once_resizing_stops(tmp_path, monkeypatch
 
         pump(laid_out)
         window.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
+        end = time.time() + 0.8  # (the drag's first step not part of an earlier change)
+        while time.time() < end:
+            root.update()
+            time.sleep(0.02)
         width, height = window.winfo_width(), window.winfo_height()
-        for step in (40, 80, 120, 160, 200):  # (the first step is followed at once, the others wait)
+        tiles = []
+        for tile in window.tiles.values():
+            tile.bind("<Configure>", lambda e: tiles.append(e.width), add="+")
+        window.geometry(f"{width + px(40)}x{height}")  # the drag's first step: at once
+        window.update()
+        assert window.content.winfo_width() == width + px(40) and not window.freeze.frozen
+        tiles.clear()
+        for step in (80, 120, 160, 200):  # the others wait: the window's content keeps its size
             window.geometry(f"{width + px(step)}x{height}")
             window.update()
-        assert window.winfo_width() == width + px(200)
-        assert window.list.winfo_width() < window.list_canvas.winfo_width()  # waits for the drag to stop
-        pump(laid_out)
+            assert window.freeze.frozen and window.content.winfo_width() == width + px(40)
+        assert window.winfo_width() == width + px(200) and not tiles
+        pump(lambda: window.content.winfo_width() == window.winfo_width() and laid_out())
         window.geometry(f"{px(1080)}x{height}")  # as narrow as it goes: the part chips may need two lines
         pump(lambda: window.winfo_width() == px(1080) and laid_out())
         window.close()
