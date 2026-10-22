@@ -1,0 +1,87 @@
+name: Resize bench
+
+# Measures how the main window keeps up while its edge is dragged, on real Windows: tools/resize_bench.py
+# drags the bottom-right corner with SendInput (needs the runner's interactive desktop) and also steps the
+# size with SetWindowPos (works without one). Results: the job log (one RESIZE_BENCH_JSON line per variant,
+# then a table), the job summary and the resize-bench artifact. Synthetic mods only, no game files.
+
+on:
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "Arguments for tools/resize_bench.py (empty: all variants), split like a shell does (quotes are optional; use / in paths), e.g. --variant base --variant nofreeze --variant nolog+scale150 --repeat 3"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Desktop
+        # Real mouse input needs an interactive session with an input desktop (the hosted runner logs on
+        # automatically). The bench reports the same again and falls back to SetWindowPos without it.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          "UserInteractive: $([Environment]::UserInteractive)"
+          "Session: $((Get-Process -Id $PID).SessionId), $env:SESSIONNAME, user $env:USERNAME"
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.Screen]::AllScreens | Format-List DeviceName, Bounds, WorkingArea, Primary
+          query session 2>&1 | Out-String
+      - name: Resize bench
+        timeout-minutes: 50
+        # (Python, not a shell: the input is split with shlex, so quotes in it are taken off and nothing in it
+        # is run. --budget keeps the whole run inside the step's time limit: variants that do not fit are
+        # reported as skipped, and the tables are printed either way.)
+        shell: python
+        env:
+          BENCH_ARGS: ${{ inputs.args }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          import os, shlex, subprocess, sys
+
+          args = shlex.split(os.environ.get("BENCH_ARGS", ""))
+          cmd = [sys.executable, "-u", "tools/resize_bench.py", "--screen", "1920x1080", "--budget", "2640",
+                 "--json-out", "resize-bench.json", *args]
+          print("+ " + subprocess.list2cmdline(cmd), flush=True)
+          with open("resize-bench.log", "w", encoding="utf-8") as log:
+              proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              for raw in proc.stdout:
+                  line = raw.decode("utf-8", "replace")
+                  sys.stdout.write(line)
+                  sys.stdout.flush()
+                  log.write(line)
+                  log.flush()
+          sys.exit(proc.wait())
+      - name: Summary
+        # (from the JSON, which is written after every variant: a run stopped before its own tables still has
+        # a summary)
+        if: always()
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          if [ -f resize-bench.json ]; then
+            { echo '```'; python tools/resize_bench.py --report resize-bench.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f resize-bench.log ]; then
+            { echo 'No results were written; the end of the log:'; echo '```'; tail -n 80 resize-bench.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resize-bench
+          path: |
+            resize-bench.json
+            resize-bench.log
+          if-no-files-found: warn
