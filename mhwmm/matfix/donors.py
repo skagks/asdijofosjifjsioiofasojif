@@ -18,6 +18,7 @@ import re
 
 _MH_SLOT_RE = re.compile(r"(?<![a-z0-9])mh(\d\d)", re.IGNORECASE)
 _VARIANT = "_NoMultiBlend"
+SAME_FILE_NAME = "같은 파일 · 이름 일치"  # how find_donor names a tier 1 match: the very material the mod copied
 
 
 def candidate_paths(base: str) -> list[str]:
@@ -105,12 +106,12 @@ def find_donor(mod_mat: dict, own: list[tuple[str, dict]], pool: list[tuple[str,
 
     same_name = next(((src, b) for src, b in own if b["name"] == mod_mat["name"]), None)
     if same_name is not None and same_name[1]["mmtr_path"] == mmtr:
-        return same_name[1], same_name[0], "같은 파일 · 이름 일치"
+        return same_name[1], same_name[0], SAME_FILE_NAME
     if same_name is not None:
         # The current file kept the name but moved the material to a narrower shader
         # (a "_NoMultiBlend" split). If the mod's own shader is still used anywhere,
         # rebuild from that instead of dropping the mod's MultiBlend slots.
         hit = search(True, True, True, [mmtr], "같은 셰이더")
-        return hit or (same_name[1], same_name[0], "같은 파일 · 이름 일치")
+        return hit or (same_name[1], same_name[0], SAME_FILE_NAME)
     return search(True, True, True, [mmtr], "같은 셰이더") or \
         search(True, True, True, mmtr_variants(mmtr), "비슷한 셰이더")

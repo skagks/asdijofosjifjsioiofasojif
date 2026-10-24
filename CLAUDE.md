@@ -32,6 +32,18 @@
     (타입 정보 `rsz_types.json.xz`는 `tools/make_rsz_types.py`로 REasy 덤프 기록에서 만듦). 테스트에 zstandard 필요
     - 점검·복구 결과가 달라질 수 있는 변경을 하면 `manager.MATFIX_FORMAT`을 올린다. 그래야 업데이트 후 기존 기록이 '점검 전'이
       되어 다시 점검하고 복구를 다시 묻는다 (올리지 않으면 예전 결과가 그대로 남음).
+    - 맞지 않는 재질(`repair.plan_entries`): 모드가 베낀 재질(모드 파일의 현재 버전에서 이름이 같은 것 `SAME_FILE_NAME`, 또는
+      후보 중 이름이 같은 것이 하나뿐일 때 그것)은 그것과 바로 비교한다(업데이트로 그 재질에 생긴 칸이 없으면 맞지 않음).
+      여러 후보에서 고른 donor는 그것만으로 정하지 않고, 매칭에 쓴 셰이더(`_NoMultiBlend` 형제로 맞췄으면 그 셰이더)를 쓰는
+      현재 게임 재질(모드 파일들의 현재 버전 + 게임 전체 색인, 같은 파일은 경로 해시로 한 번) 중 모드 재질에 없는 칸이 하나도
+      없는 것이 없을 때만 맞지 않음(재질마다 통째로 비교: 칸마다 따로 빼면 어느 재질에도 없는 조합을 받아들임,
+      `References.closest`, 노트는 가장 가까운 재질과 없는 칸 이름). 게임 전체 색인이 없으면 donor와 비교하고, donor만으로 맞으면
+      색인을 만들지 않는다. 복구는 고른 donor로. 이름이 정확히 'null'(대소문자 무시)인 재질은 숨김용이라 맞지 않음으로 치지
+      않는다(파일 형식 변경·버전 번호 규칙은 그대로). 테스트에서는 conftest가 게임 전체 색인의 경로 목록을 비운다(약 1만 개)
+    - 게임 pak(`game.discover_paks`): 체인마다 patch_001부터 빈 번호 앞까지만(게임이 거기서 멈춤), 예전 버전이 체인에 넣은
+      매니저의 PAK(`outdated_paks`)은 `GameIndex(exclude=)`로 뺀다(`ModManager._game_index`: 재질 점검·장비 외형·실행 전 점검).
+      `fingerprint`(게임 버전)는 게임이 읽는 pak 전부, 캐시 이름은 `key`(뺀 것이 있으면 쓴 pak의 지문). 다른 프로그램이 정품
+      번호 바로 뒤에 넣은 모드 PAK은 구별하지 못해 게임 파일로 친다(그 안의 예전 재질이 같은 셰이더 비교에 들어갈 수 있음)
   - `mhwmm/equip/`: 장비 외형. `model.py` 공통 정의(Target 키 형식), `paths.py` 게임 경로 → 장비, `pathlist.py`·
     `equip_paths.txt.xz` PAK 안 파일 이름 해시 찾기(`tools/make_equip_paths.py`로 REasy 목록에서 만듦), `scan.py` 모드 파일 살펴보기,
     `catalog.py`·`userdata.py` 게임 데이터 표·msg에서 이름·그림 경로, `msg.py` 텍스트, `tex.py`·`gdeflate.py` 텍스처,
@@ -99,7 +111,8 @@
     맞는 것만 씀). 목록의 ⚠ 문제(`ModManager.problems`)도 여기서 만든다. 게임 실행 직전에는 새로 생긴 높음·보통 항목만 묻고
     (`to_ask`, '같은 내용이면 다시 묻지 않기'는 데이터 폴더 `precheck.json`에 게임 버전마다) 실행은 막지 않는다(실패해도 실행).
     게임 폴더는 바꾸지 않고, REFramework 설정만 사용자가 동의했을 때 게임이 꺼져 있을 때 `set_refw_option`으로 한 줄 바꾼다.
-    느린 점검의 결과가 달라지는 변경을 하면 `precheck.BACKGROUND_FORMAT`을 올린다. 원인 모드 찾기 중에는 묻지 않는다.
+    느린 점검의 결과가 달라지는 변경을 하면 `precheck.BACKGROUND_FORMAT`을 올린다(`MATFIX_FORMAT`이 다른 재질 판정은
+    `check()`가 쓰지 않고 빠른 실행도 넘겨받지 않음). 원인 모드 찾기 중에는 묻지 않는다.
     창은 gui.py의 PrecheckDialog(게임 실행 직전, ☰ → 실행 전 점검), 명령줄은 `check`
   - `mhwmm/gui.py`, `mhwmm/theme.py`: tkinter GUI와 테마. 창 크기를 바꿀 때 버벅이지 않게(Windows는 위젯마다 창이고 Tk의 창
     클래스 TkTopLevel·TkChild가 CS_HREDRAW|CS_VREDRAW라, 끄는 단계마다 모든 자식 창을 다시 배치하고 그린 뒤에야 다음 마우스 움직임을

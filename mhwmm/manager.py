@@ -58,8 +58,10 @@ OPTION_PREVIEWS = "previews"  # per mod: the pictures of its options, named afte
 MAX_ARCHIVE_DIRS = 8
 # Version of the check/repair rules: records made with older rules count as unchecked, so every
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
-# can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3.
-MATFIX_FORMAT = 3
+# can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3;
+# 4: a donor picked from others no longer decides alone (stale when no current material of its shader has
+# all the mod's slots; the copied material still decides), "null" never; paks the game does not read left out.
+MATFIX_FORMAT = 4
 REPORT_SELFTEST_ITEMS = 6  # game parts the diagnostics zip's 3D preview self-test looks at
 REPORT_SELFTEST_SECONDS = 60.0  # ... and for at most this long
 REGISTRY_RETRY = 3 * 86400  # how long to wait before looking for newer .user/.pfb type data again
@@ -1288,7 +1290,7 @@ class ModManager:
             raise MatfixError("게임 폴더가 설정되지 않았습니다.")
         if not matfix.available():
             raise MatfixError("게임 파일의 압축(zstd)을 풀 수 있는 모듈이 없어 재질을 점검할 수 없습니다.")
-        game = GameIndex(self.game_dir, self.data_dir / "cache", progress)
+        game = self._game_index(progress)
         shaders = ShaderIndex(game, progress)
         run = MaterialRun(game.fingerprint, repair)
         verb = "복구" if repair else "점검"
@@ -1304,6 +1306,12 @@ class ModManager:
             rsz.TypeRegistry.release()
         progress(len(jobs), len(jobs), f"재질 {verb}을 마쳤습니다")
         return run
+
+    def _game_index(self, progress: ProgressFn | None = None) -> GameIndex:
+        """The game's pak index (재질 점검, the equipment window, 실행 전 점검): the paks the game reads, without
+        the PAKs an older version put into the patch chain (outdated_paks: mods' files, which the game does
+        not read either)."""
+        return GameIndex(self.game_dir, self.data_dir / "cache", progress, exclude=self.outdated_paks())
 
     def _update_registry(self, game: GameIndex, context: RszContext, run: MaterialRun, progress,
                          only_if_outdated: bool = False) -> None:
@@ -1360,7 +1368,7 @@ class ModManager:
             raise MatfixError("게임 폴더가 설정되지 않았습니다.")
         if not matfix.available():
             raise MatfixError("게임 파일의 압축(zstd)을 풀 수 있는 모듈이 없습니다.")
-        game = GameIndex(self.game_dir, self.data_dir / "cache", progress)
+        game = self._game_index(progress)
         record = fsutil.read_json(self.mod_dir(job.mod_id) / MATFIX_RECORD, {})
         registry_meta = {}
         try:
@@ -1385,7 +1393,8 @@ class ModManager:
                         zf.write(path, f"repaired/{rel}")
                 zf.writestr("report.json", json.dumps({
                     "app_version": __version__, "mod": job.name, "game": game.fingerprint,
-                    "game_paks": [p.name for p in game.paks], "registry": registry_meta, "record": record,
+                    "game_paks": [p.name for p in game.paks], "game_paks_left_out": sorted(game.exclude),
+                    "registry": registry_meta, "record": record,
                 }, ensure_ascii=False, indent=2))
             os.replace(partial, target)
         except BaseException:
@@ -1480,7 +1489,8 @@ class ModManager:
             version = self.game_version()
             index = self._equip_game_index
             if index is None or index.fingerprint != version or not fsutil.same_path(index.game_dir, self.game_dir):
-                self._equip_game_index = GameIndex(self.game_dir, self.data_dir / "cache", progress)
+                # (the PAKs left out change only with the paks themselves: moved out of the chain, or overwritten)
+                self._equip_game_index = self._game_index(progress)
                 self._equip_failed.clear()  # pictures read through the old index
             return self._equip_game_index
 

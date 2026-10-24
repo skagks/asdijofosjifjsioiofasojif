@@ -33,7 +33,8 @@ def material(name, textures, props, mmtr=SHADER, alpha=b"\x98\x00\x00\x88", gpbf
 
 
 def current_body():
-    """The game's material now: a new DetailMaskMap slot and a new shader parameter."""
+    """The game's material now: a new DetailMaskMap slot and a new shader parameter ('skin', on the same
+    shader, did not get them)."""
     return [material("body", [("BaseDielectricMap", "Art/ch03/body_ALBD.tex"), ("NormalRoughnessMap", "Art/ch03/body_NRRO.tex"),
                               ("DetailMaskMap", "Art/other/someone_MSK.tex")],
                      [("Color", (1.0, 1.0, 1.0, 1.0)), ("Roughness", (0.5,)), ("NewParam", (0.25,))]),
@@ -236,6 +237,236 @@ def test_compressed_mod_pak_entry_stays_compressed(game, tmp_path):
     assert len(Mdf2File(fixed.read(0), 45).materials[0].props) == 3
 
 
+# ---- which materials are stale: the copied material, or any same-shader one, not one picked donor ----
+# Nexus 4052 'Rossi - Hunter (LBS)' hides the other armour parts with one material each (named 'null')
+# and was reported stale against the hunter's base body, one of 121 game materials with that shader.
+HIDDEN = "natives/STM/Art/Model/Character/ch03/034/001/1/ch03_034_0011"
+HUNTER = "MaterialShader/Variation/Base_Hunter.mmtr"
+VARIANT = "MaterialShader/Variation/Base_Equip_NoMultiBlend.mmtr"
+BASE_BODY = "natives/stm/art/model/character/ch00/000/0000/ch00_000_0000.mdf2.45"
+ITEM = "natives/stm/art/model/item/it55/10/0008/it5510_0008_0.mdf2.45"
+OTHER = "natives/stm/art/model/character/ch04/0/02/00/00/ch04_002_0000.mdf2.45"
+
+
+def rich(name="skin", mmtr=HUNTER):
+    """A game material with more slots than the mod's: what an arbitrary donor can look like."""
+    return material(name, [("BaseDielectricMap", "Art/ch00/skin_ALBD.tex"), ("NormalRoughnessMap", "Art/ch00/skin_NRRO.tex"),
+                           ("DetailMaskMap", "Art/ch00/skin_MSK.tex")],
+                    [("Color", (1.0,) * 4), ("Roughness", (0.5,)), ("Fresnel", (0.04,))], mmtr=mmtr)
+
+
+def plain(name="eyeshadow", mmtr=HUNTER):
+    """A game material with only the slots the mod's has."""
+    return material(name, [("BaseDielectricMap", "Art/it55/shadow_ALBD.tex")], [("Color", (1.0,) * 4)], mmtr=mmtr)
+
+
+def hider(name="cover", mmtr=HUNTER):
+    return material(name, [("BaseDielectricMap", "Art/rossi/clear_ALBD.tex")], [("Color", (0.0,) * 4)], mmtr=mmtr)
+
+
+def with_slots(mat, textures=(), props=()):
+    for t in textures:
+        mat["textures"].append({"type": t, "path": f"Art/x/{t}.tex", "ukn": 0})
+    for name in props:
+        mat["props"].append({"name": name, "values": [0.5], "count_flags": 0})
+    return mat
+
+
+class Shaders:
+    """The whole-game index check_mod reads (ShaderIndex.find), with the lookups it was asked for."""
+
+    def __init__(self, by_mmtr):
+        self.by_mmtr, self.asked = by_mmtr, []
+
+    def find(self, mmtr):
+        self.asked.append(mmtr)
+        return list(self.by_mmtr.get(mmtr, []))
+
+
+def armour_game(game, current):
+    """The game with the current version of the hidden part's file in a newer patch."""
+    write_game_pak(game / "re_chunk_000.pak.patch_002.pak", {HIDDEN + ".mdf2.45": assemble_mdf2(current, 45)})
+    return GameIndex(game, game.parent / "cache")
+
+
+def test_a_slot_some_game_material_of_the_shader_lacks_is_not_stale(game, tmp_path):
+    index = armour_game(game, [material("body", [("BaseDielectricMap", "Art/ch03/body.tex")], [("Color", (1.0,) * 4)])])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider()], 45)})
+    shaders = Shaders({HUNTER: [(BASE_BODY, rich()), (OTHER, plain())]})  # the donor picked is the base body
+    (result,) = check_mod(files, index, shaders)
+    assert result.state == "current" and result.fixed == [] and result.notes == []  # (no "후보가 2개라 ...를 썼습니다")
+    assert set(shaders.asked) == {HUNTER}  # (to find the donor, then all of that shader's materials)
+
+
+def test_a_slot_every_game_material_of_the_shader_has_is_stale(game, tmp_path):
+    index = armour_game(game, [material("body", [("BaseDielectricMap", "Art/ch03/body.tex")], [("Color", (1.0,) * 4)])])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider()], 45)})
+    newer = with_slots(plain(), ["DetailMaskMap"])
+    shaders = Shaders({HUNTER: [(BASE_BODY, rich()), (OTHER, newer)]})
+    (result,) = check_mod(files, index, shaders, out=to(tmp_path))
+    assert result.state == "fixable" and result.fixed == ["cover"]
+    assert result.notes == [  # the closest one, not the donor: the slot every one of them has
+        f"재질 'cover': 같은 셰이더를 쓰는 후보가 2개라 {BASE_BODY}의 것을 썼습니다",
+        f"재질 'cover': 현재 게임의 같은 셰이더 재질 2개 중 가장 가까운 재질({OTHER}의 'eyeshadow')에도 있는 칸이 없습니다: "
+        "텍스처 DetailMaskMap"]
+    got = extract_material(Mdf2File(result.file.read_bytes(), 45), 0)  # rebuilt from the donor picked
+    assert {t["type"]: t["path"] for t in got["textures"]} == {
+        "BaseDielectricMap": "Art/rossi/clear_ALBD.tex", "NormalRoughnessMap": "Art/ch00/skin_NRRO.tex",
+        "DetailMaskMap": NULL_MASK}
+    assert [p["name"] for p in got["props"]] == ["Color", "Roughness", "Fresnel"]
+
+
+def test_slots_missing_from_different_materials_do_not_add_up(game, tmp_path):
+    """One current material lacks texture T, another parameter P: none lacks both, so a mod material
+    without either is not one the current game has (each material is compared as a whole)."""
+    index = armour_game(game, [material("body", [("BaseDielectricMap", "Art/ch03/body.tex")], [("Color", (1.0,) * 4)])])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider()], 45)})
+    g1, g2 = with_slots(plain("g1"), ["T"]), with_slots(plain("g2"), props=["P"])
+    (result,) = check_mod(files, index, Shaders({HUNTER: [(BASE_BODY, g1), (OTHER, g2)]}))
+    assert result.state == "fixable" and result.fixed == ["cover"]
+    assert f"재질 'cover': 현재 게임의 같은 셰이더 재질 2개 중 가장 가까운 재질({BASE_BODY}의 'g1')에도 있는 칸이 없습니다: " \
+           "텍스처 T" in result.notes  # (a tie: the donor's)
+
+    (result,) = check_mod(files, index, Shaders({HUNTER: [(BASE_BODY, g1), (OTHER, g2), (ITEM, plain())]}))
+    assert result.state == "current"  # ... unless one of them lacks both
+
+
+def test_the_mods_own_current_file_counts_and_without_the_index_the_donor_decides(game, tmp_path):
+    """The other materials of the current file are game materials too; without the whole-game index
+    (none given) the donor alone is compared, as before."""
+    index = armour_game(game, [rich(), plain()])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider()], 45)})
+    (result,) = check_mod(files, index, Shaders({}))
+    assert result.state == "current" and result.notes == []
+
+    (result,) = check_mod(files, index, None)
+    assert result.state == "fixable" and result.fixed == ["cover"]
+    assert result.notes == [
+        f"재질 'cover': 같은 셰이더를 쓰는 후보가 2개라 {HIDDEN}.mdf2.45의 것을 썼습니다",
+        f"재질 'cover': 현재 게임의 재질({HIDDEN}.mdf2.45의 'skin')에 있는 칸이 없습니다: "
+        "텍스처 DetailMaskMap, NormalRoughnessMap · 파라미터 Fresnel, Roughness"]
+
+
+@pytest.mark.parametrize("shaders", [None, "empty", "whole game"])
+def test_the_copied_material_decides_even_when_others_of_its_shader_lack_the_new_slot(game, tmp_path, shaders):
+    """The update case the check is for: the game's 'body' got DetailMaskMap and NewParam; 'skin' in the same
+    file and 'legs' of the set use the same shader without them. The mod's 'body' is a copy of the old 'body'."""
+    index = GameIndex(game, tmp_path / "cache")
+    files = stage(tmp_path, {
+        BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45),
+        LEGS + ".mdf2.45": assemble_mdf2([material("legs", [("BaseDielectricMap", "Art/mine/legs.tex")],
+                                                   [("Color", (0.1,) * 4)])], 45)})
+    whole = {None: None, "empty": Shaders({}), "whole game": Shaders({SHADER: [(ITEM, plain(mmtr=SHADER))]})}[shaders]
+    (body, legs) = check_mod(files, index, whole)
+    assert (body.state, body.fixed, legs.state) == ("fixable", ["body"], "current")
+    assert body.notes == [f"재질 'body': 현재 게임의 재질({BODY}.mdf2.45의 'body')에 있는 칸이 없습니다: "
+                          "텍스처 DetailMaskMap · 파라미터 NewParam"]
+    assert whole is None or whole.asked == []  # (no other material is looked at)
+
+
+def test_the_one_same_named_candidate_decides(game, tmp_path):
+    """No current file of its own: of the game's materials with the shader, the one with the mod's material
+    name is what the author copied, so a slot it has and the mod's lacks is stale even if others lack it."""
+    custom = "natives/STM/Art/Model/Character/ch00/000/rossi/ch00_000_0000"
+    index = GameIndex(game, tmp_path / "cache")
+    files = stage(tmp_path, {custom + ".mdf2.45": assemble_mdf2([hider("cover")], 45)})
+    copied = with_slots(plain("cover"), ["DetailMaskMap"])
+    (result,) = check_mod(files, index, Shaders({HUNTER: [(BASE_BODY, copied), (OTHER, plain())]}))
+    assert result.state == "fixable" and result.fixed == ["cover"]
+    assert result.notes == [f"재질 'cover': 현재 게임의 재질({BASE_BODY}의 'cover')에 있는 칸이 없습니다: 텍스처 DetailMaskMap"]
+
+    twice = Shaders({HUNTER: [(BASE_BODY, copied), (ITEM, with_slots(plain("cover"), ["DetailMaskMap"])), (OTHER, plain())]})
+    (result,) = check_mod(files, index, twice)
+    assert result.state == "current"  # two of that name: one picked of many, and 'eyeshadow' lacks the slot
+
+
+def test_a_variant_match_compares_with_the_variants_materials(game, tmp_path):
+    """The mod's shader is gone and the current file has a "_NoMultiBlend" sibling: the materials of the
+    sibling are the reference (the mod's own shader has none to compare with)."""
+    index = armour_game(game, [rich("trim", VARIANT)])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider(mmtr=SHADER)], 45)})
+    shaders = Shaders({VARIANT: [(ITEM, plain(mmtr=VARIANT))]})
+    (result,) = check_mod(files, index, shaders)
+    assert result.state == "current" and shaders.asked[-1] == VARIANT
+
+    shaders = Shaders({VARIANT: [(ITEM, rich("other", VARIANT))]})
+    (result,) = check_mod(files, index, shaders)
+    assert result.state == "fixable" and result.fixed == ["cover"]
+    assert f"재질 'cover': 현재 게임의 같은 셰이더 재질 2개 중 가장 가까운 재질({HIDDEN}.mdf2.45의 'trim')에도 있는 칸이 " \
+           "없습니다: 텍스처 DetailMaskMap, NormalRoughnessMap · 파라미터 Fresnel, Roughness" in result.notes
+
+
+def test_a_mod_pak_entry_and_its_game_file_count_once(game, tmp_path, monkeypatch):
+    """A mod PAK's current entry is labelled "<pak>#<hash>"; the whole-game index has the same file under its
+    path. It is one material, not two."""
+    from mhwmm.matfix import game as gamemod
+
+    monkeypatch.setattr(gamemod, "known_material_paths", lambda: [WEAPON + ".mdf2.45"])
+    index = GameIndex(game, tmp_path / "cache")
+    mod_pak = tmp_path / "mod" / "Weapon.pak"
+    mod_pak.parent.mkdir(parents=True)
+    h = pakmod.path_hash(WEAPON + ".mdf2.45")
+    data = assemble_mdf2([hider("blade", SHADER)], 45)
+    pakmod.write_pak([(h, data, len(data), 0)], mod_pak)
+    (result,) = check_mod([("Weapon.pak", "Weapon.pak", mod_pak)], index, gamemod.ShaderIndex(index))
+    assert result.state == "fixable" and result.fixed == ["blade"]
+    assert result.notes == [f"재질 'blade': 현재 게임에서 같은 셰이더를 쓰는 유일한 재질(Weapon.pak#{h:016X}의 'body')에 "
+                            "있는 칸이 없습니다: 텍스처 DetailMaskMap, NormalRoughnessMap · 파라미터 NewParam, Roughness"]
+
+
+@pytest.mark.parametrize("name", ["null", "Null", "NULL"])
+def test_a_hidden_parts_null_material_is_left_alone(game, tmp_path, name):
+    index = armour_game(game, [material("body", [("BaseDielectricMap", "Art/ch03/body.tex")], [("Color", (1.0,) * 4)])])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider(name)], 45)})
+    (result,) = check_mod(files, index, Shaders({HUNTER: [(BASE_BODY, rich())]}))  # every one has more slots
+    assert result.state == "current" and result.fixed == []
+    assert result.notes == [f"숨김용 재질 '{name}'은 그대로 둡니다"]
+
+
+def test_only_the_bare_name_null_is_a_placeholder(game, tmp_path):
+    index = armour_game(game, [material("body", [("BaseDielectricMap", "Art/ch03/body.tex")], [("Color", (1.0,) * 4)])])
+    files = stage(tmp_path, {HIDDEN + ".mdf2.45": assemble_mdf2([hider("null_mat"), hider("null")], 45)})
+    (result,) = check_mod(files, index, Shaders({HUNTER: [(BASE_BODY, rich())]}))
+    assert result.state == "fixable" and result.fixed == ["null_mat"]
+    assert "숨김용 재질 'null'은 그대로 둡니다" in result.notes
+
+
+def test_a_placeholder_in_an_old_version_file_is_still_renamed(game, tmp_path):
+    index = armour_game(game, [material("body", [("BaseDielectricMap", "Art/ch03/body.tex")], [("Color", (1.0,) * 4)])])
+    shipped = assemble_mdf2([hider("null")], 40)
+    files = stage(tmp_path, {HIDDEN + ".mdf2.40": shipped})
+    (result,) = check_mod(files, index, Shaders({HUNTER: [(BASE_BODY, rich())]}), out=to(tmp_path))
+    assert result.state == "fixable" and result.fixed == [] and result.new_rel == HIDDEN + ".mdf2.45"
+    assert result.file.read_bytes() == shipped  # same layout: only the version number the game reads
+
+
+def test_the_whole_game_index_is_read_only_when_the_donor_says_stale(game, tmp_path):
+    index = GameIndex(game, tmp_path / "cache")
+    shaders = Shaders({SHADER: [(BASE_BODY, plain(mmtr=SHADER))]})
+    current = current_body()
+    current[0]["textures"][0]["path"] = "Art/mine/body.tex"
+    (result,) = check_mod(stage(tmp_path, {BODY + ".mdf2.45": assemble_mdf2(current, 45)}), index, shaders)
+    assert result.state == "current" and shaders.asked == []  # (building it reads thousands of game files)
+
+
+def test_missing_slots_and_their_note():
+    from mhwmm.matfix import repair
+
+    mod = material("m", [("A", "a.tex")], [("P", (1.0,))], gpbf=(("MultiBlend_BAB", "e.gpbf"),))
+    wide = material("w", [("A", "a.tex"), ("B", "b.tex")], [("P", (1.0,)), ("Q", (1.0,))],
+                    gpbf=(("MultiBlend_BAB", "g.gpbf"), ("Extra", "x.gpbf")))
+    assert repair.missing_slots(mod, wide) == (["B"], ["Q"], ["Extra"])
+    assert repair.missing_slots(mod, repair.Slots.of(wide)) == (["B"], ["Q"], ["Extra"])
+    assert repair.needs_fix(mod, wide) and not repair.needs_fix(wide, mod)
+    same_split = material("s", [("A", "a.tex"), ("B", "b.tex")], [("P", (1.0,))], gpbf=(("Other", "o.gpbf"),))
+    assert repair.missing_slots(mod, same_split) == (["B"], [], [])  # (MHWmodfixer's rule)
+    refs = repair.References(2, tuple((repair.Slots.of(m), f"{m['name']}.mdf2", m["name"]) for m in (wide, same_split)))
+    assert refs.closest(mod) == ((["B"], [], []), "s.mdf2", "s")
+    assert refs.closest(mod, (repair.Slots.of(same_split), "donor.mdf2", "d")) == ((["B"], [], []), "donor.mdf2", "d")
+    assert repair.slot_list((list("ABCDEFGH"), ["P"], [])) == "텍스처 A, B, C, D, E, F 외 2개 · 파라미터 1개"
+    assert repair.slot_list((["A"], ["P", "Q"], ["X"])) == "텍스처 A · 파라미터 P, Q · gpbf 버퍼 X"
+
+
 # ---- installed mods --------------------------------------------------------------
 @pytest.fixture
 def library(game, tmp_path):
@@ -292,6 +523,65 @@ def test_installed_mod_is_checked_repaired_and_restored(library, game, tmp_path)
     assert library.mod_entries(mod.id)[BODY + ".mdf2.45"][1] == BODY + ".mdf2.45"
     library.deploy()
     assert (game / (BODY + ".mdf2.45")).read_bytes() == shipped
+
+
+def test_installed_hiding_mod_against_the_whole_game_index(library, game, tmp_path, monkeypatch):
+    """The reported mod end to end, with the real whole-game index made from the game's paks."""
+    from mhwmm.matfix import game as gamemod
+
+    write_game_pak(game / "re_chunk_000.pak.patch_002.pak", {
+        HIDDEN + ".mdf2.45": assemble_mdf2([material("body", [("BaseDielectricMap", "Art/ch03/body.tex")],
+                                                     [("Color", (1.0,) * 4)])], 45),
+        BASE_BODY: assemble_mdf2([rich()], 45), OTHER: assemble_mdf2([plain()], 45)})
+    monkeypatch.setattr(gamemod, "known_material_paths", lambda: [BASE_BODY, OTHER])
+    mod = install_tree(library, tmp_path / "Rossi", {HIDDEN + ".mdf2.45": assemble_mdf2([hider(), hider("null")], 45)})
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "current" and library.stale_material_mods() == []
+    (result,) = library.material_results(mod.id)
+    assert result.state == "current" and result.notes == []
+
+
+def test_a_pak_past_a_gap_in_the_patch_chain_is_not_the_game(game, tmp_path):
+    """The game reads a chain's patches up to the first missing number: an old copy another program left
+    at patch_003 (no patch_002) neither replaces the current file nor makes the mod's material current."""
+    from mhwmm.matfix.game import discover_paks, game_fingerprint
+
+    version = game_fingerprint(game)
+    write_game_pak(game / "re_chunk_000.pak.patch_003.pak", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    assert [p.name for p in discover_paks(game)] == ["re_chunk_000.pak", "re_chunk_000.pak.patch_001.pak"]
+    assert game_fingerprint(game) == version
+    index = GameIndex(game, tmp_path / "cache")
+    assert index.read(BODY + ".mdf2.45") == assemble_mdf2(current_body(), 45)
+    (body,) = check_mod(stage(tmp_path, {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)}), index, Shaders({}))
+    assert body.state == "fixable" and body.fixed == ["body"]
+
+    write_game_pak(game / "re_chunk_000.pak.patch_002.pak", {LEGS + ".mdf2.45": b"x"})  # the gap filled
+    assert [p.name for p in discover_paks(game)][-2:] == ["re_chunk_000.pak.patch_002.pak", "re_chunk_000.pak.patch_003.pak"]
+
+
+def test_the_managers_old_chain_paks_are_left_out(library, game, tmp_path):
+    """A PAK an older version renamed into the patch chain holds a mod's files, not the game's: with it the
+    mod's own old copy was its "current" material. Left out, the mod is stale against the real game file,
+    and the record is for this game version (the fingerprint still counts every pak the game reads)."""
+    import json
+
+    chain = "re_chunk_000.pak.patch_002.pak"
+    write_game_pak(game / chain, {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    st = (game / chain).stat()
+    deployer = library.deployer()
+    deployer.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    deployer.manifest_path.write_text(json.dumps({"version": 1, "game_dir": str(game), "backups": {}, "files": {
+        chain: {"path": chain, "mod": "old", "src": "x.pak", "size": st.st_size, "mtime": st.st_mtime_ns, "pak": True}}}))
+    assert library.outdated_paks() == [chain]
+    mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "stale"
+    assert GameIndex(game, tmp_path / "c2").read(BODY + ".mdf2.45") == assemble_mdf2(old_body_mod(), 45)  # (without)
+    index = library._equip_game()
+    assert chain not in [p.name for p in index.paks] and index.fingerprint == library.game_version()
+    assert index.read(BODY + ".mdf2.45") == assemble_mdf2(current_body(), 45)
+    assert sorted(p.name for p in (library.data_dir / "cache").glob("pakindex-*.bin")) == [f"pakindex-{index.key}.bin"]
+    assert index.key != index.fingerprint
 
 
 def test_game_update_and_reinstall_need_a_new_check(library, game, tmp_path):
@@ -582,7 +872,7 @@ def test_shader_index_cache_cut_short_is_made_again(tmp_path, monkeypatch):
     from mhwmm.matfix import game as gamemod
 
     raw = assemble_mdf2(current_body(), 45)
-    fake = types.SimpleNamespace(cache_dir=tmp_path, fingerprint="fp",
+    fake = types.SimpleNamespace(cache_dir=tmp_path, fingerprint="fp", key="fp",
                                  read_versioned=lambda base, ext, prefer=(): (f"{base}.mdf2.45", raw))
     monkeypatch.setattr(gamemod, "known_material_paths", lambda: [BODY + ".mdf2.45"])
     index = gamemod.ShaderIndex(fake)

@@ -1,13 +1,34 @@
 """Find a mod's stale materials and rebuild them against the current game.
 
-A material is stale when the current game's version of it has a texture slot,
-shader parameter or gpbf slot the mod's does not (MHWmodfixer's rule: any other
-difference - fewer fields on the donor's side, another shader spelling - is not
-a reason to touch a working file).  Rebuilt materials take their structure from the
-current file and everything the author chose from the mod: texture paths, shader
-parameter values, render state (alpha / two-sided), gpbf buffers and the material
-name.  A loose file whose version number is outdated only gets the new number when
-its content already fits the current layout.
+A material is stale when the current material it is compared with has a texture slot,
+shader parameter or gpbf slot the mod's lacks (MHWmodfixer's rule: any other difference -
+fewer fields on the game's side, another shader spelling - is not a reason to touch a
+working file).  What it is compared with depends on the match:
+
+* The very material the mod copied - the same name in the current version of the mod's
+  own file, or the one same-named candidate the donor search found - is compared
+  directly: a slot an update gave that material is what the mod lacks, whatever other
+  materials of its shader look like.
+* A donor picked from other materials is one of many sharing the shader (121 for the
+  hunter's base body), so it alone does not decide: the material is stale only when
+  every current material using that shader (the current versions of the mod's own files
+  and the whole-game index; a "_NoMultiBlend" sibling's when the match was one) has a
+  slot it lacks.  The note names the closest of them.  Each is compared as a whole, so
+  slots missing from different materials do not add up to a combination none has.
+* Without the whole-game index the donor alone is the reference, as in MHWmodfixer.
+
+What the game's paks hold counts as the current game (game.discover_paks: up to the first
+gap of a patch chain, without the PAKs an older version of the manager put in the chain),
+so a mod PAK another program numbered right after the game's own patches is read as a
+game file too.  A material
+named just "null" is what mods give the parts they hide and is left as shipped.  A stale
+material is rebuilt from the donor that was picked.
+
+Rebuilt materials take their structure from the current game's material and everything
+the author chose from the mod: texture paths, shader parameter values, render state
+(alpha / two-sided), gpbf buffers and the material name.  A loose file whose version
+number is outdated only gets the new number when its content already fits the current
+layout.
 
 Output is patched in place in a copy of the current file when the mod's materials
 are exactly that file's materials (same names); otherwise it is assembled from the
@@ -20,13 +41,14 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from . import MatfixError, rsz
-from .donors import candidate_paths, find_donor
+from .donors import SAME_FILE_NAME, candidate_paths, find_donor
 from .game import GameIndex, ShaderIndex
 from .mdf2 import Mdf2File, assemble_mdf2, detect_version, extract_material, version_from_name
-from .pak import PakFile, compress_as, write_pak
+from .pak import PakFile, compress_as, path_hash, write_pak
 
 MDF2_RE = re.compile(r"\.mdf2\.(\d+)$", re.IGNORECASE)
 RSZ_RE = re.compile(r"\.(user|pfb|scn)\.(\d+)$", re.IGNORECASE)
@@ -56,18 +78,94 @@ def _inert_default(slot: str) -> str | None:
     return None
 
 
+# Material names that mark a part the mod hides (its mesh still names a material, so the
+# .mdf2 keeps one). Only the bare name, in any case: "null_mat", "Null01" and the like can
+# be real, visible materials, and the slot rule below already covers them.
+PLACEHOLDER_NAMES = frozenset({"null"})
+NOTE_NAMES = 6  # slot names a note lists before "외 N개"
+
+
+def is_placeholder(name: str) -> bool:
+    return name.strip().casefold() in PLACEHOLDER_NAMES
+
+
+def _gpbf_slots(mat: dict) -> set[str]:
+    return {e[0] for e in mat["gpbf_entries"][:mat["gpbf_split"][0]]}
+
+
+@dataclass(frozen=True)
+class Slots:
+    """What the staleness rule reads of a current material: texture types, shader parameters,
+    gpbf slots and the gpbf split."""
+    textures: frozenset
+    props: frozenset
+    gpbf: frozenset
+    split: tuple
+
+    @classmethod
+    def of(cls, mat: dict) -> "Slots":
+        return cls(frozenset(t["type"] for t in mat["textures"]), frozenset(p["name"] for p in mat["props"]),
+                   frozenset(_gpbf_slots(mat)), tuple(mat["gpbf_split"]))
+
+
+def missing_slots(mod_mat: dict, current) -> tuple[list[str], list[str], list[str]]:
+    """(texture types, shader parameters, gpbf slots) the current material (or its Slots) has and
+    ``mod_mat`` lacks. gpbf slots count only when the gpbf splits differ (MHWmodfixer's rule)."""
+    ref = current if isinstance(current, Slots) else Slots.of(current)
+    tex = ref.textures - {t["type"] for t in mod_mat["textures"]}
+    props = ref.props - {p["name"] for p in mod_mat["props"]}
+    gpbf = set() if tuple(mod_mat["gpbf_split"]) == ref.split else ref.gpbf - _gpbf_slots(mod_mat)
+    return sorted(tex, key=str.casefold), sorted(props, key=str.casefold), sorted(gpbf, key=str.casefold)
+
+
 def needs_fix(mod_mat: dict, donor: dict) -> bool:
     """True when the current material has a slot the mod's lacks (something to gain)."""
-    if not {t["type"] for t in donor["textures"]} <= {t["type"] for t in mod_mat["textures"]}:
-        return True
-    if not {p["name"] for p in donor["props"]} <= {p["name"] for p in mod_mat["props"]}:
-        return True
-    if tuple(donor["gpbf_split"]) != tuple(mod_mat["gpbf_split"]):
-        donor_slots = {e[0] for e in donor["gpbf_entries"][:donor["gpbf_split"][0]]}
-        mod_slots = {e[0] for e in mod_mat["gpbf_entries"][:mod_mat["gpbf_split"][0]]}
-        if not donor_slots <= mod_slots:
-            return True
-    return False
+    return any(missing_slots(mod_mat, donor))
+
+
+@dataclass(frozen=True)
+class References:
+    """The current materials using one shader: how many there are and their distinct slot sets,
+    each with the first material that has it (file, material name)."""
+    count: int
+    kinds: tuple  # ((Slots, file, name), ...)
+
+    def closest(self, mod_mat: dict, first=None) -> tuple[tuple[list[str], list[str], list[str]], str, str]:
+        """(missing slots, file, material name) of the one ``mod_mat`` lacks the fewest slots of (nothing
+        missing: the mod's material is one the current game has). ``first`` (Slots, file, name) - the
+        donor - is looked at first and so wins a tie."""
+        best = None
+        for slots, src, name in ([first] if first else []) + list(self.kinds):
+            missing = missing_slots(mod_mat, slots)
+            size = sum(map(len, missing))
+            if best is None or size < best[0]:
+                best = (size, missing, src, name)
+                if not size:
+                    break
+        return best[1], best[2], best[3]
+
+
+@lru_cache(maxsize=1 << 16)
+def _file_key(path: str) -> int:
+    """A game file as the paks key it (the whole-game index lists one under its path, a mod PAK's
+    current entry has a "<pak>#<hash>" label)."""
+    return path_hash(path)
+
+
+def slot_list(missing: tuple[list[str], list[str], list[str]]) -> str:
+    """"텍스처 A, B · 파라미터 C": at most NOTE_NAMES names, the rest as counts."""
+    parts, budget = [], NOTE_NAMES
+    for label, names in zip(("텍스처", "파라미터", "gpbf 버퍼"), missing):
+        if not names:
+            continue
+        shown = names[:max(budget, 0)]
+        budget -= len(shown)
+        if not shown:
+            parts.append(f"{label} {len(names)}개")
+            continue
+        more = f" 외 {len(names) - len(shown)}개" if len(names) > len(shown) else ""
+        parts.append(f"{label} {', '.join(shown)}{more}")
+    return " · ".join(parts)
 
 
 def _gpbf_paths(mat: dict) -> dict[str, str]:
@@ -119,6 +217,23 @@ class MaterialPlan:
     donor_file: str | None = None
     match: str | None = None
     stale: bool = False
+    # slots the mod's material lacks of the current material it was compared with (the donor, or
+    # the closest same-shader material of the current game) and which one that was
+    missing: tuple = ((), (), ())
+    reference: str = ""
+    placeholder: bool = False  # a hidden part's "null" material: never stale for its slots
+    picks: list[str] = field(default_factory=list)  # how the donor was chosen (said only when it is used)
+
+    def notes(self) -> list[str]:
+        name = self.mod["name"]
+        if self.stale:
+            out = list(self.picks)
+            if any(self.missing):
+                out.append(f"재질 '{name}': {self.reference}: {slot_list(self.missing)}")
+            return out
+        if self.placeholder and any(self.missing):
+            return [f"숨김용 재질 '{name}'은 그대로 둡니다"]
+        return []
 
 
 @dataclass
@@ -134,6 +249,7 @@ class EntryPlan:
     notes: list[str] = field(default_factory=list)
     rename_only: bool = False  # content fits the current layout; only the version number is old
     error: str = ""
+    donor_hash: int | None = None  # the current file's path hash when donor_path is a label (a mod PAK's entry)
 
     @property
     def unresolved(self) -> list[str]:
@@ -173,26 +289,67 @@ def plan_entries(units: list[EntryPlan], whole_game, progress=None) -> None:
                 unit.donor_bytes = unit.donor_version = None
         owns.append(own)
         pool.extend(own)
+    keys = {src: unit.donor_hash if unit.donor_hash is not None else _file_key(src)
+            for unit, own in zip(units, owns) for src, _mat in own}
+    shared: dict[str, References | None] = {}
+
+    def same_shader(mmtr: str) -> References | None:
+        """Every current material using ``mmtr``: this mod's current files and the whole game, each once."""
+        if mmtr not in shared:
+            seen, kinds = set(), {}
+            for src, mat in [c for c in pool if c[1]["mmtr_path"] == mmtr] + list(whole_game(mmtr)):
+                key = (keys[src] if src in keys else _file_key(src), mat["name"])
+                if key not in seen:  # (the mod's own current files are in both)
+                    seen.add(key)
+                    kinds.setdefault(Slots.of(mat), (src, mat["name"]))
+            shared[mmtr] = References(len(seen), tuple((k, *v) for k, v in kinds.items())) if seen else None
+        return shared[mmtr]
+
     for i, (unit, own) in enumerate(zip(units, owns)):
         progress(i, len(units), f"재질 비교 중... {i + 1}/{len(units)}")
         try:
             mod = Mdf2File(unit.mod_bytes, unit.mod_version)
             for j in range(len(mod.materials)):
                 mod_mat = extract_material(mod, j)
-                hit = find_donor(mod_mat, own, pool, whole_game, unit.notes)
+                picks: list[str] = []
+                hit = find_donor(mod_mat, own, pool, whole_game, picks)
                 if hit is None:
                     unit.materials.append(MaterialPlan(mod_mat))
-                else:
-                    donor, src, how = hit
-                    unit.materials.append(MaterialPlan(mod_mat, donor, src, how, needs_fix(mod_mat, donor)))
+                    continue
+                donor, src, how = hit
+                plan = MaterialPlan(mod_mat, donor, src, how, picks=picks,
+                                    placeholder=is_placeholder(mod_mat["name"]))
+                plan.missing = missing_slots(mod_mat, donor)
+                plan.reference = f"현재 게임의 재질({src}의 '{donor['name']}')에 있는 칸이 없습니다"
+                # The material the mod copied (its name in the current version of the mod's own file, or the
+                # one same-named candidate) decides by itself. A donor picked from others is one of many with
+                # its shader: stale only when no current material of the shader has all the mod's slots
+                # (looked at, and the whole-game index built, only when the donor alone says stale - the
+                # donor is one of them).
+                copied = how == SAME_FILE_NAME or (donor["name"] == mod_mat["name"] and not picks)
+                refs = same_shader(donor["mmtr_path"]) if any(plan.missing) and not copied \
+                    and whole_game is not None else None
+                if refs is not None:  # (the shader the match used: a "_NoMultiBlend" sibling's, when it was one)
+                    plan.missing, ref_file, ref_name = refs.closest(mod_mat, (Slots.of(donor), src, donor["name"]))
+                    plan.reference = (
+                        f"현재 게임의 같은 셰이더 재질 {refs.count}개 중 가장 가까운 재질({ref_file}의 '{ref_name}')에도 "
+                        "있는 칸이 없습니다" if refs.count > 1 else
+                        f"현재 게임에서 같은 셰이더를 쓰는 유일한 재질({ref_file}의 '{ref_name}')에 있는 칸이 없습니다")
+                plan.stale = any(plan.missing) and not plan.placeholder
+                unit.materials.append(plan)
         except Exception as exc:
             unit.error, unit.materials = f"재질 파일을 읽지 못했습니다: {exc}", []
             continue
         if not unit.stale and unit.donor_version and unit.mod_version != unit.donor_version:
             unit.rename_only = _fits_layout(unit.mod_bytes, unit.mod_version, unit.donor_version)
             if not unit.rename_only:  # the layout itself changed: rebuild everything that has a donor
+                if any(m.donor is not None for m in unit.materials):
+                    unit.notes.append(f"재질 파일 형식이 바뀌어(.mdf2.{unit.mod_version} → .mdf2.{unit.donor_version}) "
+                                      "같은 셰이더를 찾은 재질을 모두 현재 게임의 재질로 다시 만듭니다")
                 for m in unit.materials:
                     m.stale = m.donor is not None
+        for m in unit.materials:
+            unit.notes.extend(m.notes())
 
 
 def _fits_layout(data: bytes, old: int, new: int) -> bool:
@@ -430,7 +587,8 @@ def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: RszContext):
             continue
         donor = game.read_hash(h)
         donor_version = detect_version(donor, prefer=version) if donor is not None else None
-        units.append((h, EntryPlan(label, raw, version, label if donor else None, donor, donor_version)))
+        units.append((h, EntryPlan(label, raw, version, label if donor else None, donor, donor_version,
+                                   donor_hash=h if donor else None)))
     return units, plans
 
 

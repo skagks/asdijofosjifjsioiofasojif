@@ -2,7 +2,12 @@
 
 re_chunk_000.pak and re_chunk_000.pak.sub_000.pak each get their numbered patches
 on top (a higher patch number wins), so one lookup returns the current bytes of any
-game file.  Building the index reads every entry table once; it is cached in the
+game file.  A chain's patches count up from patch_001 and stop at the first missing
+number, as the game reads them, so a PAK another program left past a gap is not part
+of the game; PAKs an older version of the manager renamed into the chain (the game does
+not read them either) are left out by the caller (``exclude``).  A mod PAK another
+program numbered right after the game's own patches cannot be told apart and counts as
+a game file.  Building the index reads every entry table once; it is cached in the
 manager's data folder under a fingerprint of the paks' names, sizes and times, so
 it is rebuilt only after a game update.
 """
@@ -36,7 +41,9 @@ MAX_VERSION = 500
 
 
 def discover_paks(game_dir) -> list[Path]:
-    """re_chunk_000.pak and its patches, then sub_000 and its patches (base first)."""
+    """re_chunk_000.pak and its patches, then sub_000 and its patches (base first): the paks the game
+    reads. Each chain's patches go up from patch_001 to the first missing number (REFramework, too,
+    mounts pak_mods' PAKs in the free numbers after them)."""
     groups: dict[str, list[tuple[int, Path]]] = {"main": [], "sub": []}
     for p in Path(game_dir).glob("re_chunk_000.pak*"):
         name = p.name.lower()
@@ -48,7 +55,20 @@ def discover_paks(game_dir) -> list[Path]:
             m = _PATCH_RE.search(name)
             if m:
                 groups["sub" if ".sub_000.pak." in name else "main"].append((int(m.group(1)), p))
-    return [p for group in ("main", "sub") for _, p in sorted(groups[group], key=lambda t: t[0])]
+    out = []
+    for group in ("main", "sub"):
+        expected = 1
+        for number, p in sorted(groups[group], key=lambda t: (t[0], t[1].name)):
+            if number > expected:
+                break  # a gap: the game reads no further
+            out.append(p)
+            expected = max(expected, number + 1)
+    return out
+
+
+def pak_names(paks) -> frozenset:
+    """File names of paks (paths or names), compared as Windows does."""
+    return frozenset(Path(str(p)).name.casefold() for p in paks)
 
 
 def fingerprint(paks: list[Path]) -> str:
@@ -66,12 +86,19 @@ def game_fingerprint(game_dir) -> str:
 
 
 class GameIndex:
-    def __init__(self, game_dir, cache_dir=None, progress=None):
+    """``exclude``: names of paks in the chain the game does not read (an older version of the manager
+    renamed mod PAKs into it): their files are left out."""
+
+    def __init__(self, game_dir, cache_dir=None, progress=None, exclude=()):
         self.game_dir = Path(game_dir)
-        self.paks = discover_paks(self.game_dir)
-        if not self.paks:
+        read = discover_paks(self.game_dir)
+        if not read:
             raise MatfixError("게임 폴더에서 re_chunk_000.pak을 찾지 못했습니다.")
-        self.fingerprint = fingerprint(self.paks)
+        self.fingerprint = fingerprint(read)  # the game version: every pak the game reads (game_fingerprint)
+        self.exclude = pak_names(exclude)
+        self.paks = [p for p in read if p.name.casefold() not in self.exclude]
+        # what the index holds (its cache files' names): with paks left out, those it was made of
+        self.key = fingerprint(self.paks) if len(self.paks) < len(read) else self.fingerprint
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.hashes = array("Q")
         self.pak_ids = array("H")
@@ -111,7 +138,7 @@ class GameIndex:
         progress(len(self.paks), len(self.paks), f"게임 파일 {len(self.hashes):,}개를 찾았습니다")
 
     def _cache_file(self) -> Path | None:
-        return self.cache_dir / f"pakindex-{self.fingerprint}.bin" if self.cache_dir else None
+        return self.cache_dir / f"pakindex-{self.key}.bin" if self.cache_dir else None
 
     def _arrays(self):
         return (self.hashes, self.pak_ids, self.offsets, self.csizes, self.dsizes, self.attrs)
@@ -238,7 +265,7 @@ class ShaderIndex:
         self._by_mmtr: dict[str, list[tuple[str, dict]]] | None = None
 
     def _cache_file(self) -> Path | None:
-        return self.game.cache_dir / f"shaders-{self.game.fingerprint}.json.gz" if self.game.cache_dir else None
+        return self.game.cache_dir / f"shaders-{self.game.key}.json.gz" if self.game.cache_dir else None
 
     def _load(self) -> None:
         from .mdf2 import Mdf2File, detect_version, extract_material, material_from_json, material_to_json

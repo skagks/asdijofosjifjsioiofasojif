@@ -25,6 +25,16 @@ def no_network(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", blocked)
 
 
+@pytest.fixture(autouse=True)
+def few_game_materials(monkeypatch):
+    """The whole-game material index (재질 점검) reads every path of the bundled list of about 10,000
+    game files. A fake game holds a few, and looking each missing one up in every version takes
+    minutes, so the list is empty here; tests about that index give their own paths."""
+    from mhwmm.matfix import game
+
+    monkeypatch.setattr(game, "known_material_paths", lambda: [])
+
+
 def write(path: Path, data: str | bytes = "x") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(data, str):

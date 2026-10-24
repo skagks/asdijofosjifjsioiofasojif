@@ -103,7 +103,7 @@ STATE_FILE = "precheck.json"  # in the data folder: what the user said not to be
 STATE_FORMAT = 1
 MAX_SEEN = 2000
 BACKGROUND_FILE = "precheck-scan.json"  # in the cache folder
-BACKGROUND_FORMAT = 2
+BACKGROUND_FORMAT = 3  # 3: material verdicts of matfix format 4 (results of older formats are dropped)
 BACKGROUND_DAYS = 1  # an older background result is looked at again
 
 
@@ -794,7 +794,9 @@ def background(facts: Facts, crash_dir=None, cache_dir=None, *, natives: bool = 
         except Exception as exc:  # the records are only a help here
             log.warning("지난 게임 기록을 점검하지 못했습니다: %s", exc)
     if not natives:
-        if previous is not None and previous.game_version == facts.game_version:
+        # (material verdicts of older check rules are not kept: then natives\ is due to be looked at again)
+        if previous is not None and previous.game_version == facts.game_version \
+                and previous.matfix_format == bg.matfix_format:
             bg.natives_made, bg.natives_total, bg.natives_sample, bg.natives_capped = (
                 previous.natives_made, previous.natives_total, previous.natives_sample, previous.natives_capped)
             bg.materials, bg.matfix = previous.materials, previous.matfix
@@ -1051,7 +1053,8 @@ def session_issues(facts: Facts, bg: Background, need: dict[str, list[str]], con
     if bg.game_version != facts.game_version:
         return out  # (the material results are of another game version)
     stale = []
-    for rel, record in sorted(bg.materials.items()):
+    rules = bg.matfix_format == _matfix_format()  # (verdicts of older check rules are not used)
+    for rel, record in sorted(bg.materials.items()) if rules else ():
         if not isinstance(record, list) or len(record) < 3 or record[2] not in ("fixable", "stuck"):
             continue
         st = fsutil.stat_or_none(game / rel)

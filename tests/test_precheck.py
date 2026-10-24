@@ -2,6 +2,7 @@
 files the manager did not place) and "같은 내용이면 다시 묻지 않기" (synthetic folders, logs, lists and
 paks written here; no real user data)."""
 
+import json
 import os
 import time
 from datetime import datetime
@@ -845,6 +846,38 @@ def test_quick_runs_keep_what_was_found_under_natives(game, tmp_path, fake_matfi
     # a quick run without a full one before it: the full one is still due
     fresh = precheck.background(f, None, tmp_path / "other", natives=False)
     assert fresh.natives_made == 0 and precheck.background_due(f, fresh)
+
+
+def test_verdicts_of_older_check_rules_are_not_used(game, tmp_path, fake_matfix, monkeypatch):
+    """After an update that changes the material rules (manager.MATFIX_FORMAT), a natives\\ file the old rules
+    called stale is not reported, a quick run does not carry its verdict over under the new rules, and the
+    next full run checks it again."""
+    old = "natives/STM/Art/old_body.mdf2.45"
+    write(game / old, "m")
+    config(game, f"{LOOSE}=true\n")
+    f = facts(game, [mod("a", kinds=["loose"])])
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(precheck, "_matfix_format", lambda: 3)
+    full = precheck.background(f, None, cache)
+    assert issue(precheck.check(f, full), "natives_stale").detail == [old]
+
+    monkeypatch.setattr(precheck, "_matfix_format", lambda: 4)  # the update
+    assert "natives_stale" not in kinds(precheck.check(f, precheck.load_background(cache)))
+    quick = precheck.background(f, None, cache, natives=False)  # right before a launch
+    assert quick.matfix_format == 4 and quick.materials == {} and precheck.background_due(f, quick)
+    assert "natives_stale" not in kinds(precheck.check(f, quick)) and len(fake_matfix) == 1
+    again = precheck.background(f, None, cache)
+    assert fake_matfix[-1] == [old] and issue(precheck.check(f, again), "natives_stale").detail == [old]
+
+
+def test_scan_results_of_the_previous_format_are_dropped(tmp_path):
+    cache = tmp_path / "cache"
+    precheck.save_background(cache, precheck.Background(game_version="v1", made=1.0))
+    data = json.loads((cache / precheck.BACKGROUND_FILE).read_text(encoding="utf-8"))
+    assert data["format"] == precheck.BACKGROUND_FORMAT == 3
+    data["format"] = 2  # made by v2.2.8 (material verdicts of the rules before 4)
+    (cache / precheck.BACKGROUND_FILE).write_text(json.dumps(data), encoding="utf-8")
+    assert precheck.load_background(cache) is None
 
 
 def test_the_game_index_is_made_only_when_needed(game, tmp_path, monkeypatch):
