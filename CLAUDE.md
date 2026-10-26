@@ -26,7 +26,12 @@
   - `mhwmm/analyzer.py`: 압축 파일 구조 분석, 옵션(variant) 찾기
   - `mhwmm/deploy.py`: 게임 폴더 적용·해제, PAK 모드 pak_mods 배치, 원본 백업, 사용자가 바꾼 모드 파일 보관(`edited\`)
   - `mhwmm/manager.py`: 모드 목록·옵션·설정·설치(옵션별 미리보기 그림은 `mods/<id>/previews/<옵션 id>.<확장자>`),
-    재질 점검·복구 기록(`mods/<id>/matfix.json`, 고친 파일은 `matfix/`)
+    재질 점검·복구 기록(`mods/<id>/matfix.json`, 고친 파일은 `matfix/`), 필요한 모드(Nexus·Lua·셰이더). 셰이더: 점검에서 같은
+    셰이더의 게임 재질이 없어 그대로 둔 재질 중 셰이더 파일도 게임에 없는 것(`FileResult.shaders`, `repair.GameShaders`: pak은
+    해시뿐이라 `MMTR_VERSIONS` 번호로 찾고, `SHADER_PROBE`가 그 번호로 없으면 모름 → 적지 않음)을, 그 `.mmtr`가 든 다른 모드
+    (루스·PAK, 옵션까지)나 게임 폴더에서 찾아 `shader_requirements`(kind "shader", 없음/꺼짐/옵션 꺼짐 `option`/모드 꺼짐
+    `mod_off`)로. 게임에 들어가는 파일의 재질만 보고(`foreign_shaders`: `mod_entries`, 켠 옵션·겹치면 아래 옵션), 모드 자신의 셰이더도 켠 옵션에 있을 때만 됨(아니면 자신의 옵션이
+    꺼짐으로). 지금 게임 버전의 점검 기록만 씀. 원인 찾기도 함께 켬. 알림은 설치 뒤 첫 점검이 저장된 뒤 한 번(gui `_first_check`, 옵션을 아직 안 골랐으면 고른 뒤)
   - `mhwmm/matfix/`: 재질(.mdf2) 복구 (MHWmodfixer 기반, MIT). `pak.py` 게임 pak 읽기·모드 pak 쓰기, `game.py` 게임 파일 색인,
     `mdf2.py` 재질 파일, `donors.py` 현재 재질 찾기, `repair.py` 점검·복구, `rsz.py` .user/.pfb/.scn 복구
     (타입 정보 `rsz_types.json.xz`는 `tools/make_rsz_types.py`로 REasy 덤프 기록에서 만듦). 테스트에 zstandard 필요

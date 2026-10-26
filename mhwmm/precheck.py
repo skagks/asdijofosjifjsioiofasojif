@@ -1221,6 +1221,31 @@ def remember(data_dir, issues: Iterable[Issue], game_version: str, now: float | 
 
 
 # ---- from a manager --------------------------------------------------------------------------------------
+def shader_state(req: dict) -> str:
+    """Where a shader requirement (manager.shader_requirements) stands, in a few words."""
+    by, option = req.get("by"), req.get("option")
+    if req.get("state") == "ok":
+        return f"있음 ({by})"
+    if req.get("state") == "off" and option and req.get("mod_off"):
+        return f"'{by}'과(와) 그 옵션 '{option}'이(가) 꺼져 있음"
+    if req.get("state") == "off" and option:
+        return f"'{by}'의 옵션 '{option}'이(가) 꺼져 있음"
+    if req.get("state") == "off":
+        return f"'{by}'이(가) 꺼져 있음"
+    return "게임에도 설치한 모드에도 없음"
+
+
+def requirement_label(req: dict) -> str:
+    """How a missing requirement (manager.requirement_status) is named in the mods' problems: a shader
+    (the materials use one the game does not have) with where it is."""
+    name = str(req.get("name") or "?")
+    if req.get("kind") != "shader":
+        return name
+    if req.get("state") == "missing":
+        return f"{name} (재질이 쓰는 셰이더 파일이 {shader_state(req)})"
+    return f"{name} ({shader_state(req)})"
+
+
 def mod_states(manager, conflicts=None, missing: dict | None = None) -> list[ModState]:
     """ModStates of a manager.ModManager's mods (GUI thread; what its main list computes anyway).
     ``conflicts`` (manager.conflicts()) and ``missing`` ({enabled mod id: missing_requirements}) are
@@ -1241,7 +1266,7 @@ def mod_states(manager, conflicts=None, missing: dict | None = None) -> list[Mod
         files = manager.mod_files(m.id)
         out.append(ModState(m.id, m.name, m.enabled, f"{m.installed_at}|{m.updated_at}",
                             frozenset(manager.mod_kinds(m.id)), list(files), m.needs_option,
-                            [r.get("name", "?") for r in reqs], state, updated, list(stuck), m.id in hidden,
+                            [requirement_label(r) for r in reqs], state, updated, list(stuck), m.id in hidden,
                             refw is not None and refw.id == m.id))
     return out
 

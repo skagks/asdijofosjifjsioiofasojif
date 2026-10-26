@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, bisect, crashlog, fsutil, steam
+from . import __version__, bisect, crashlog, fsutil, precheck, steam
 from .analyzer import classify, package_name
 from .deploy import DeployError, DeployReport
 from .equip.selftest import DEFAULT_ITEMS as SELFTEST_ITEMS
@@ -57,7 +57,9 @@ def _print_options(manager: ModManager, mod) -> None:
 def _print_missing(manager: ModManager, mod, indent: str = "  ") -> None:
     for req in manager.missing_requirements(mod.id):
         state = "꺼져 있음" if req["state"] == "off" else "없음"
-        kind = " (Lua 라이브러리)" if req["kind"] == "lua" else ""
+        kind = {"lua": " (Lua 라이브러리)", "shader": " (재질이 쓰는 셰이더 파일)"}.get(req["kind"], "")
+        if req["kind"] == "shader":
+            kind += f" - {precheck.shader_state(req)}"
         print(f"{indent}필요한 모드 {state}: {req['name']}{kind}  {req['url']}".rstrip())
 
 
@@ -388,8 +390,22 @@ def cmd_materials(manager: ModManager, args) -> int:
                 elif r.state != "error":
                     moved = f"  ->  {r.new_rel}" if r.kind != "pak" and r.new_rel != r.rel else ""
                     print(f"     {item['label']}: {item['kind']} {'복구' if repair else '복구 필요'} ({item['method']}){moved}")
-            if r.unresolved:
-                print(f"     {r.rel}: 같은 셰이더를 찾지 못해 그대로 둔 재질 - {', '.join(r.unresolved)}")
+            foreign = {name for name, _mmtr in r.shaders}
+            plain = [name for name in r.unresolved if name not in foreign]
+            if plain:
+                print(f"     {r.rel}: 같은 셰이더를 쓰는 재질을 찾지 못해 그대로 둔 재질 - {', '.join(plain)}")
+            if foreign:
+                shaders = sorted({mmtr.rsplit("/", 1)[-1] for _name, mmtr in r.shaders}, key=str.casefold)
+                print(f"     {r.rel}: 게임에 없는 셰이더({', '.join(shaders)})를 쓰는 재질이라 그대로 둠 - "
+                      f"{', '.join(n for n in r.unresolved if n in foreign)}")
+        try:
+            shaders = manager.shader_requirements(job.mod_id)
+        except Exception as exc:  # (only a help)
+            print(f"     재질이 쓰는 셰이더를 확인하지 못했습니다: {exc}")
+            shaders = []
+        for req in shaders:
+            where = precheck.shader_state(req) + (" (셰이더 모드가 필요할 수 있음)" if req["state"] == "missing" else "")
+            print(f"     재질이 쓰는 {req['name']}: {where}")
     if not repair and any(manager.material_state(j.mod_id) == "stale" for j in jobs):
         print("\n복구하려면: materials repair [모드]")
     code = _maybe_deploy(manager, args) if repair else 0

@@ -1780,6 +1780,140 @@ def test_gui_tells_about_missing_requirements(root, manager, tmp_path, monkeypat
     assert "필요한 모드가 없습니다" in info and "Lua Bone System" in info and "_CatLib" in info
 
 
+def test_requirement_notes_of_shaders():
+    from mhwmm import gui
+
+    shader = {"kind": "shader", "by": "Endfield Style Shader Pack", "option": "", "notes": ""}
+    assert gui.requirement_note({**shader, "state": "ok"}) == "있음 (Endfield Style Shader Pack)"
+    assert gui.requirement_note({**shader, "state": "off", "by": "Endfield", "option": "Pack"}) == \
+        "설치되어 있지만 옵션이 꺼져 있음 ('Endfield'의 옵션 'Pack')"
+    assert gui.requirement_note({**shader, "state": "off"}) == "설치되어 있지만 꺼져 있음 (Endfield Style Shader Pack)"
+    assert "셰이더 파일이 게임에도 설치한 모드에도 없음" in gui.requirement_note({**shader, "state": "missing", "by": ""})
+
+
+def test_gui_tells_about_missing_shaders_after_the_first_check(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui
+    from mhwmm.manager import MaterialJob, MaterialRun
+
+    app = gui.App(root, manager, queue.Queue())
+    shown = []
+    monkeypatch.setattr(gui.RequirementsDialog, "show", lambda self: shown.append(self))
+    with manager.prepare_install(make_zip(tmp_path / "Rossi.zip", {"natives/STM/a.mdf2.45": "m"})) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    manager.set_enabled(mod.id, True)
+    item = {"name": "셰이더 EF_Skin_NPR.mmtr", "url": "", "notes": "", "kind": "shader", "state": "missing", "by": "",
+            "option": "", "shaders": ["MaterialShader/Variation/EF_Skin_NPR.mmtr"], "materials": ["body"]}
+    monkeypatch.setattr(manager, "shader_requirements", lambda mod_id: [dict(item)] if mod_id == mod.id else [])
+    monkeypatch.setattr(manager, "finish_materials", lambda run, jobs: [])
+    monkeypatch.setattr(app, "_offer_materials", lambda: None)
+    run, job = MaterialRun("fp", False, {mod.id: []}), MaterialJob(mod.id, mod.name, f"{mod.installed_at}|{mod.updated_at}", [])
+    app._first_check.add(mod.id)  # (installed just now: the material check runs after the install)
+    app._on_materials_checked(run, [job], None)
+    assert len(shown) == 1 and mod.id not in app._first_check
+    text = " ".join(str(w.cget("text")) for row in shown[0].body.winfo_children()
+                    for w in [row, *row.winfo_children()] if isinstance(w, gui.ttk.Label))
+    assert "Rossi" in text and "셰이더 EF_Skin_NPR.mmtr" in text and "게임에도 설치한 모드에도 없음" in text
+    app._on_materials_checked(run, [job], None)  # a later check (game update...): the ⚠ mark tells
+    assert len(shown) == 1
+    app.refresh()
+    assert "problem" in app.tree.item(mod.id, "tags") and "셰이더 EF_Skin_NPR.mmtr" in app._row_tooltip(mod.id)
+
+
+def test_shader_notices_wait_for_their_turn(root, manager, tmp_path, monkeypatch):
+    """Told once the stored check has them: not for a run whose result was thrown away (the mod was
+    reinstalled meanwhile), not over another dialog or task, not during 원인 찾기, and not again by the
+    install-time notice of requirements."""
+    from mhwmm import gui
+    from mhwmm.manager import MaterialJob, MaterialRun
+
+    app = gui.App(root, manager, queue.Queue())
+    shown = []
+    monkeypatch.setattr(gui.RequirementsDialog, "show", lambda self: shown.append(self))
+    with manager.prepare_install(make_zip(tmp_path / "Rossi.zip", {"natives/STM/a.mdf2.45": "m"})) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    manager.set_enabled(mod.id, True)
+    item = {"name": "셰이더 EF_Skin_NPR.mmtr", "url": "", "notes": "", "kind": "shader", "state": "off",
+            "by": "Endfield", "option": "", "mod_off": True, "shaders": [], "materials": ["body"]}
+    monkeypatch.setattr(manager, "shader_requirements", lambda mod_id: [dict(item)] if mod_id == mod.id else [])
+    monkeypatch.setattr(manager, "finish_materials", lambda run, jobs: [])
+    monkeypatch.setattr(app, "_offer_materials", lambda: None)
+    stamp = f"{mod.installed_at}|{mod.updated_at}"
+    run = MaterialRun("fp", False, {mod.id: []})
+    app._first_check.add(mod.id)
+    app._on_materials_checked(run, [MaterialJob(mod.id, mod.name, "an older install", [])], None)
+    assert shown == [] and mod.id in app._first_check  # (that result was not stored: told after the next check)
+    app._on_materials_checked(MaterialRun("fp", False, errors={mod.id: "x"}), [MaterialJob(mod.id, mod.name, stamp, [])],
+                              None)
+    assert shown == [] and mod.id in app._first_check  # (nor when the check failed)
+
+    modal = [True]  # another dialog is open: the notice waits for it
+    monkeypatch.setattr(app, "_modal_open", lambda: modal[0])
+    app._on_materials_checked(run, [MaterialJob(mod.id, mod.name, stamp, [])], None)
+    assert shown == [] and mod.id not in app._first_check
+    root.after(300, lambda: modal.__setitem__(0, False))
+    pump(root, lambda: bool(shown))
+    assert len(shown) == 1
+
+    app._bisect = object()  # 원인 찾기 turns mods off on purpose: not told then
+    app._notify_shader_requirements([mod.id])
+    assert len(shown) == 1
+    app._bisect = None
+
+    monkeypatch.setattr(manager, "missing_requirements", lambda mod_id: [dict(item)])
+    app._queue_requirement_notices([mod.id])  # (the Nexus requirements arriving after the check)
+    assert len(shown) == 1
+    assert gui.requirement_note(item) == "설치되어 있지만 꺼져 있음 (Endfield)"
+    assert gui.requirement_note({**item, "option": "Pack"}) == \
+        "설치되어 있지만 꺼져 있고 옵션도 꺼져 있음 ('Endfield'을(를) 켜고 옵션 'Pack'을(를) 켜세요)"
+
+
+def test_shader_notice_of_a_mod_with_options_waits_for_them(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui
+    from mhwmm.manager import MaterialJob, MaterialRun
+
+    app = gui.App(root, manager, queue.Queue())
+    shown = []
+    monkeypatch.setattr(gui.RequirementsDialog, "show", lambda self: shown.append(self))
+    with manager.prepare_install(make_zip(tmp_path / "Rossi.zip", {"NPR/natives/STM/a.mdf2.45": "m",
+                                                                   "Vanilla/natives/STM/a.mdf2.45": "v"})) as s:
+        mod = manager.install_package(s, s.variants)
+    manager.set_enabled(mod.id, True)
+    assert mod.needs_option  # (a new mod with options: none chosen yet)
+    item = {"name": "셰이더 EF_Skin_NPR.mmtr", "url": "", "notes": "", "kind": "shader", "state": "missing", "by": "",
+            "option": "", "mod_off": False, "shaders": [], "materials": ["body"]}
+    monkeypatch.setattr(manager, "shader_requirements",
+                        lambda mod_id: [dict(item)] if mod_id == mod.id and manager.get(mod_id).selected else [])
+    monkeypatch.setattr(manager, "finish_materials", lambda run, jobs: [])
+    monkeypatch.setattr(manager, "material_state", lambda mod_id: "current")
+    monkeypatch.setattr(app, "_offer_materials", lambda: None)
+    app._first_check.add(mod.id)
+    run = MaterialRun("fp", False, {mod.id: []})
+    app._on_materials_checked(run, [MaterialJob(mod.id, mod.name, f"{mod.installed_at}|{mod.updated_at}", [])], None)
+    assert shown == [] and mod.id in app._first_check  # (checked before an option was chosen: told once they are)
+    app._set_options(mod.id, [mod.options[0]["id"]])
+    pump(root, lambda: bool(shown))
+    assert len(shown) == 1 and mod.id not in app._first_check
+
+
+def test_the_install_time_requirement_notice_waits_for_another_window(root, manager, tmp_path, monkeypatch):
+    from mhwmm import gui
+
+    app = gui.App(root, manager, queue.Queue())
+    shown = []
+    monkeypatch.setattr(gui.RequirementsDialog, "show", lambda self: shown.append(self))
+    with manager.prepare_install(make_zip(tmp_path / "Chen.zip", {"natives/STM/a.tex": "t"})) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    monkeypatch.setattr(manager, "missing_requirements", lambda mod_id: [
+        {"name": "_CatLib", "url": "", "notes": "", "kind": "lua", "state": "missing", "by": ""}])
+    modal = [True]
+    monkeypatch.setattr(app, "_modal_open", lambda: modal[0])
+    app._queue_requirement_notices([mod.id])
+    assert shown == [] and app._req_notices == [mod.id]
+    root.after(300, lambda: modal.__setitem__(0, False))
+    pump(root, lambda: bool(shown))
+    assert len(shown) == 1 and app._req_notices == []
+
+
 def test_gui_links_mods_from_file_names_and_reads_requirements(root, manager, tmp_path, monkeypatch):
     from mhwmm import gui, nexus
 

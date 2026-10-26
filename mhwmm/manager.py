@@ -42,7 +42,9 @@ from .equip import userdata as equip_userdata
 from .equip.model import PART_LABELS
 from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
-from .matfix.repair import RSZ_RE, FileResult, RszContext, check_mod, is_material_file, rsz_sources
+from .matfix.pak import PakFile, path_hash
+from .matfix.repair import MMTR_VERSIONS, RSZ_RE, FileResult, RszContext, check_mod, is_material_file, rsz_sources, \
+    shader_file
 
 log = logging.getLogger(__name__)
 
@@ -60,8 +62,11 @@ MAX_ARCHIVE_DIRS = 8
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
 # can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3;
 # 4: a donor picked from others no longer decides alone (stale when no current material of its shader has
-# all the mod's slots; the copied material still decides), "null" never; paks the game does not read left out.
-MATFIX_FORMAT = 4
+# all the mod's slots; the copied material still decides), "null" never; paks the game does not read left out;
+# 5: the shaders the game does not have of materials left as shipped are recorded (shader requirements).
+MATFIX_FORMAT = 5
+SHADERS_FORMAT = 5  # records from this format on list those shaders (FileResult.shaders)
+SHADER_FILE_RE = re.compile(r"^natives/stm/(.+\.mmtr)\.(\d+)$", re.IGNORECASE)  # a shader file a mod puts in
 REPORT_SELFTEST_ITEMS = 6  # game parts the diagnostics zip's 3D preview self-test looks at
 REPORT_SELFTEST_SECONDS = 60.0  # ... and for at most this long
 REGISTRY_RETRY = 3 * 86400  # how long to wait before looking for newer .user/.pfb type data again
@@ -70,6 +75,20 @@ VERSIONED_RE = re.compile(r"\.(mdf2|user|pfb|scn)\.(\d+)$", re.IGNORECASE)  # th
 
 class InstallError(Exception):
     pass
+
+
+def shader_key(mmtr: str) -> str:
+    """How shaders are compared: as materials name them (under natives/STM/, without the version number)."""
+    return mmtr.replace("\\", "/").strip("/").lower()
+
+
+def _children(folder: Path) -> list[Path]:
+    """The entries of a folder (none when it is missing or cannot be read)."""
+    try:
+        with os.scandir(folder) as it:
+            return [Path(e.path) for e in it]
+    except OSError:
+        return []
 
 
 def app_directory() -> Path:
@@ -1989,11 +2008,160 @@ class ModManager:
         self._providers_cache = (key, index)
         return index
 
+    # ---- shaders other mods put in (shader packs) ----------------------------------------------------
+    def _shader_sources(self, mod: Mod) -> list[tuple[str | None, str, Path]]:
+        """(option id or None, game path, stored file) of the mod's loose shader files and PAKs, every option."""
+        if not mod.options:
+            items = [(None, rel, path) for rel, (path, _key) in self.mod_entries(mod.id).items()]
+        else:
+            items = [(o["id"], rel, self.option_dir(mod.id, o["id"]) / rel)
+                     for o in mod.options for rel in self.option_files(mod.id, o["id"])]
+        return [(opt, rel, path) for opt, rel, path in items if SHADER_FILE_RE.match(rel) or is_root_pak(rel)]
+
+    def _pak_hashes(self, path: Path) -> frozenset:
+        """The file hashes of a PAK's entry table (cached per file version; empty when it cannot be read)."""
+        st = fsutil.stat_or_none(path)
+        if st is None:
+            return frozenset()
+        cache = self.__dict__.setdefault("_pak_hash_cache", {})
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        if key not in cache:
+            try:
+                cache[key] = frozenset(PakFile(path).hashes)
+            except Exception as exc:  # (a damaged PAK: nothing of it counts, the rest still does)
+                log.debug("PAK의 파일 목록을 읽지 못했습니다 (%s): %s", path.name, exc)
+                cache[key] = frozenset()
+        return cache[key]
+
+    def _shader_index(self):
+        """(shader key -> [(mod id, option id or None)] of the loose shader files, [(mod id, option id or None,
+        file hashes)] of the PAKs, the version numbers to look for in PAKs) of every installed mod, all options
+        included (cached until a mod is installed, updated or removed)."""
+        key = tuple((m.id, m.installed_at, m.updated_at, len(m.options)) for m in self.mods)
+        cached = self.__dict__.get("_shader_cache")
+        if cached and cached[0] == key:
+            return cached[1]
+        loose: dict[str, list[tuple[str, str | None]]] = {}
+        paks: list[tuple[str, str | None, frozenset]] = []
+        versions = set(MMTR_VERSIONS)
+        for m in self.mods:
+            for opt, rel, path in self._shader_sources(m):
+                match = SHADER_FILE_RE.match(rel)
+                if match:
+                    loose.setdefault(shader_key(match.group(1)), []).append((m.id, opt))
+                    versions.add(int(match.group(2)))  # (the numbering shader packs use now)
+                else:
+                    hashes = self._pak_hashes(path)
+                    if hashes:
+                        paks.append((m.id, opt, hashes))
+        index = (loose, paks, tuple(sorted(versions)))
+        self._shader_cache = (key, index)
+        return index
+
+    def _shader_providers(self, key: str) -> list[tuple[str, str | None]]:
+        """(mod id, option id or None) of the installed mods with the shader ``key`` (loose or in a PAK)."""
+        loose, paks, versions = self._shader_index()
+        hashes = {path_hash(shader_file(key, v)) for v in versions}
+        found = list(loose.get(key, [])) + [(mod_id, opt) for mod_id, opt, have in paks if hashes & have]
+        return list(dict.fromkeys(found))
+
+    def _game_folder_shader(self, key: str) -> bool:
+        """The game folder has the shader the manager did not put there: loose in natives\\ or in a PAK of
+        pak_mods\\ (another tool's)."""
+        if not self.game_dir or not self.game_dir.is_dir():
+            return False
+        folder: Path | None = self.game_dir / "natives" / "STM"
+        *dirs, name = key.split("/")
+        for part in dirs:  # (names as Windows compares them)
+            folder = next((c for c in _children(folder) if c.name.lower() == part and c.is_dir()), None)
+            if folder is None:
+                break
+        prefix = name + "."
+        if folder is not None and any(c.name.lower().startswith(prefix) and c.name[len(prefix):].isdigit()
+                                      and c.is_file() for c in _children(folder)):
+            return True
+        _loose, _paks, versions = self._shader_index()
+        hashes = {path_hash(shader_file(key, v)) for v in versions}
+        return any(c.suffix.lower() == ".pak" and hashes & self._pak_hashes(c)
+                   for c in _children(self.game_dir / "pak_mods"))
+
+    def foreign_shaders(self, mod_id: str) -> dict[str, list[str]]:
+        """Shaders (as the mod's materials name them) the current game does not have -> the materials using
+        them, of the files the mod puts into the game now (mod_entries: the options chosen): the last material check left
+        those materials as shipped; their shader comes from another mod (a shader pack), from an option of
+        the mod itself, or is missing. Shaders the mod puts in itself (with the options chosen now) are left
+        out. Empty before a check against this game version with the rules of SHADERS_FORMAT."""
+        record = self._material_record(mod_id)
+        if record.get("format", 1) < SHADERS_FORMAT or record.get("game") != self.game_version():
+            return {}
+        mod = self.get(mod_id)
+        prefix = MATFIX_DIR + "/"
+        live = {key[len(prefix):] if key.startswith(prefix) else key for _path, key in self.mod_entries(mod_id).values()}
+        need: dict[str, list[str]] = {}
+        for r in self.material_results(mod_id):
+            if r.key not in live:
+                continue  # (an option not chosen, or a file a later chosen option replaces: not in the game)
+            for name, mmtr in r.shaders:
+                names = need.setdefault(mmtr, [])
+                if name not in names:
+                    names.append(name)
+        return {mmtr: names for mmtr, names in need.items()
+                if not any(provider == mod_id and (opt is None or opt in mod.selected)
+                           for provider, opt in self._shader_providers(shader_key(mmtr)))}
+
+    def shader_needs(self, mod_id: str) -> set[str]:
+        """Keys (shader_key) of the mod's foreign_shaders."""
+        return {shader_key(mmtr) for mmtr in self.foreign_shaders(mod_id)}
+
+    def shaders_provided(self, mod_id: str, keys) -> set[str]:
+        """Which of the shader ``keys`` the mod puts into the game (with the options chosen now)."""
+        mod = self.get(mod_id)
+        return {k for k in keys if any(provider == mod_id and (opt is None or opt in mod.selected)
+                                       for provider, opt in self._shader_providers(k))}
+
+    def shader_requirements(self, mod_id: str) -> list[dict]:
+        """requirement_status items (kind "shader") for the mod's foreign_shaders, one per mod that has them
+        (or one for those no installed mod has): ok when that mod is on with the option that has them; off
+        when it is off ("mod_off") or that option is not chosen ("option": its name; the mod itself too,
+        when its own option has them); missing when no installed mod has them (nor the game folder: then ok,
+        by "게임 폴더"). Extra keys: "option", "mod_off", "shaders", "materials"."""
+        groups: dict[tuple, dict] = {}
+        for mmtr, materials in self.foreign_shaders(mod_id).items():
+            key = shader_key(mmtr)
+            ranked = []
+            for provider, opt in self._shader_providers(key):
+                try:
+                    mod = self.get(provider)
+                except KeyError:
+                    continue
+                chosen = opt is None or opt in mod.selected
+                option = "" if chosen else next((o["name"] for o in mod.options if o["id"] == opt), "")
+                # (the fewest steps first: on, then the option to choose, then the mod to turn on, then both)
+                rank = (0 if chosen else 1) if mod.enabled else (2 if chosen else 3)
+                ranked.append((rank, "ok" if rank == 0 else "off", mod.name, option, not mod.enabled))
+            if ranked:
+                _rank, state, by, option, mod_off = min(ranked, key=lambda r: r[0])
+            elif self._game_folder_shader(key):
+                state, by, option, mod_off = "ok", "게임 폴더", "", False
+            else:
+                state, by, option, mod_off = "missing", "", "", False
+            item = groups.setdefault((state, by, option, mod_off), {
+                "state": state, "by": by, "option": option, "mod_off": mod_off, "shaders": [], "materials": []})
+            item["shaders"].append(mmtr)
+            item["materials"] += [n for n in materials if n not in item["materials"]]
+        out = []
+        for item in groups.values():
+            names = [s.replace("\\", "/").rsplit("/", 1)[-1] for s in item["shaders"]]
+            name = "셰이더 " + names[0] + (f" 외 {len(names) - 1}개" if len(names) > 1 else "")
+            out.append({"name": name, "url": "", "notes": "", "kind": "shader", **item})
+        return out
+
     def requirement_status(self, mod_id: str) -> list[dict]:
         """What the mod needs and whether it is there.
 
-        Each item: {"name", "url", "notes", "kind": "nexus" | "lua", "state", "by"} where state is
-        "ok" (installed and on), "off" (installed but off), "missing" or "unknown" (cannot be checked)."""
+        Each item: {"name", "url", "notes", "kind": "nexus" | "lua" | "shader", "state", "by"} where state is
+        "ok" (installed and on), "off" (installed but off), "missing" or "unknown" (cannot be checked).
+        Shader items (shader_requirements) also have "option", "mod_off", "shaders" and "materials"."""
         mod = self.get(mod_id)
         self._ensure_lua_scan(mod)
         others = [m for m in self.mods if m.id != mod.id]
@@ -2033,6 +2201,10 @@ class ModManager:
                 state, by = "ok", "게임 폴더"
             out.append({"name": module, "url": NEXUS_SEARCH_URL.format(urllib.parse.quote(module)),
                         "notes": "", "kind": "lua", "state": state, "by": by})
+        try:
+            out += self.shader_requirements(mod_id)
+        except Exception as exc:  # only a help: the other requirements still count
+            log.warning("'%s'에 필요한 셰이더를 확인하지 못했습니다: %s", mod.name, exc)
         return out
 
     def missing_requirements(self, mod_id: str) -> list[dict]:

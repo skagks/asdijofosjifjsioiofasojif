@@ -1277,8 +1277,14 @@ class MaterialsDialog(Dialog):
 
 def requirement_note(req: dict) -> str:
     """Short status of a requirement for the user."""
+    if req["state"] == "off" and req.get("option") and req.get("mod_off"):
+        return f"설치되어 있지만 꺼져 있고 옵션도 꺼져 있음 ('{req['by']}'을(를) 켜고 옵션 '{req['option']}'을(를) 켜세요)"
+    if req["state"] == "off" and req.get("option"):
+        return f"설치되어 있지만 옵션이 꺼져 있음 ('{req['by']}'의 옵션 '{req['option']}')"
     if req["state"] == "off":
         return f"설치되어 있지만 꺼져 있음 ({req['by']})"
+    if req["state"] == "missing" and req["kind"] == "shader":
+        return "없음 · 재질이 쓰는 셰이더 파일이 게임에도 설치한 모드에도 없음 (셰이더 모드가 필요할 수 있음)"
     if req["state"] == "ok":
         return f"있음 ({req['by']})" if req["by"] else "있음"
     if req["state"] == "unknown":
@@ -2716,6 +2722,8 @@ class App:
         self._checking_mods = False
         self._mod_check_error: str | None = None
         self._req_notices: list[str] = []  # just installed mods to tell about missing requirements
+        self._first_check: set[str] = set()  # ... and those still to tell about missing shaders after their check
+        self._req_flush_scheduled = False
         self._problems: dict[str, list[str]] = {}  # enabled mods that cannot fully work, with the reasons
         self._matfix_running = False  # a background material check is running
         self.equipment_window = None  # the 장비 외형 window while it is open
@@ -3764,7 +3772,21 @@ class App:
             self._flush_requirement_notices()
 
     def _flush_requirement_notices(self):
-        """Tell about missing requirements of the mods just installed (once the install queue is done)."""
+        """Tell about missing requirements of the mods just installed (once the install queue is done; not
+        over another window or task: then a little later)."""
+        if self._closed or not self._req_notices:
+            return
+        if self.busy is not None or self._modal_open():
+            if not self._req_flush_scheduled:
+                self._req_flush_scheduled = True
+
+                def again():
+                    self._req_flush_scheduled = False
+                    if not self._installing:
+                        self._flush_requirement_notices()
+
+                self.root.after(1000, again)
+            return
         ids, self._req_notices = self._req_notices, []
         items = []
         for mod_id in ids:
@@ -3772,7 +3794,8 @@ class App:
                 mod = self.manager.get(mod_id)
             except KeyError:
                 continue
-            missing = self.manager.missing_requirements(mod_id)
+            # (shaders are told after the mod's first material check: _notify_shader_requirements)
+            missing = [r for r in self.manager.missing_requirements(mod_id) if r["kind"] != "shader"]
             if missing:
                 items.append((mod, missing))
                 for req in missing:
@@ -4056,9 +4079,9 @@ class App:
                        ("Nexus 파일 페이지 열기", ("note", "link", "nexus_files")), ("\n", "note")]
         if missing:
             names = ", ".join(r["name"] for r in missing)
+            link = " 위 '필요한 모드'의 이름을 누르면 Nexus 페이지가 열립니다." if any(r["url"] for r in missing) else ""
             chunks += [("\n", None), ("필요한 모드가 없습니다\n", ("warn", "warn_title")),
-                       (f"{names} — 설치하거나 켜야 이 모드가 제대로 작동합니다. 위 '필요한 모드'의 이름을 누르면 "
-                        "Nexus 페이지가 열립니다.\n", "warn")]
+                       (f"{names} — 설치하거나 켜야 이 모드가 제대로 작동합니다.{link}\n", "warn")]
         if material == "stale":
             chunks += [("\n", None), ("현재 게임과 맞지 않는 파일이 있습니다\n", ("warn", "warn_title")),
                        ("게임 업데이트로 재질(.mdf2)이나 .user·.pfb 파일의 구조가 바뀌어 텍스처가 깨지거나 게임이 "
@@ -4267,6 +4290,9 @@ class App:
         # rebuild after the click handler has returned (it destroys the clicked widget)
         self.root.after_idle(lambda: self._changed(select=mod_id))
         self.warm_equipment()  # other options change other equipment
+        if mod_id in self._first_check and selected and self.manager.material_state(mod_id) != "unchecked":
+            self._first_check.discard(mod_id)  # (installed, checked, and now its options are chosen)
+            self.root.after_idle(lambda: self._notify_shader_requirements([mod_id]))
 
     def show_options(self, mod_id: str):
         self.tree.selection_set(mod_id)
@@ -4742,6 +4768,7 @@ class App:
             if mod.enabled:
                 self.request_apply()
             self._check_requirements_of(mod)
+            self._first_check.add(mod.id)
             self.root.after(1, self._next_install)
 
         def failed(exc):
@@ -5280,11 +5307,16 @@ class App:
         else:
             changed = self.manager.finish_materials(run, jobs)
             self._log_materials(run, jobs)
+            self._log_shader_requirements(run, jobs)
             self.refresh()
             if any(mod.enabled for mod in changed):
                 self.request_apply()
             if run.registry_updated:
                 self._matfix_again = True  # check what could not be repaired again with the new data
+            fresh = [j.mod_id for j in jobs if j.mod_id in self._first_check and self._checked_now(run, j)
+                     and not self._waits_for_options(j.mod_id)]  # (those are told once options are chosen)
+            self._first_check -= set(fresh)
+            self._notify_shader_requirements(fresh)
         if self._matfix_again:
             self._matfix_again = False
             self.check_materials_background()
@@ -5342,11 +5374,76 @@ class App:
                     else:
                         log.warning("%s: %s 파일이 현재 게임과 맞지 않습니다 (%s(으)로 고칠 수 있음)", target,
                                     item["kind"], item["method"])
-                if r.unresolved:
-                    log.info("%s: 현재 게임에서 같은 셰이더를 찾지 못해 그대로 둔 재질: %s", where, ", ".join(r.unresolved))
+                foreign = {name for name, _mmtr in r.shaders}
+                plain = [name for name in r.unresolved if name not in foreign]
+                if plain:
+                    log.info("%s: 현재 게임에서 같은 셰이더를 쓰는 재질을 찾지 못해 그대로 둔 재질: %s", where, ", ".join(plain))
+                if foreign:
+                    shaders = sorted({mmtr.rsplit("/", 1)[-1] for _name, mmtr in r.shaders}, key=str.casefold)
+                    log.info("%s: 게임에 없는 셰이더(%s)를 쓰는 재질이라 그대로 둡니다: %s", where, ", ".join(shaders),
+                             ", ".join(n for n in r.unresolved if n in foreign))
                 if run.repair:
                     for note in r.notes:
                         log.info("%s: %s", where, note)
+
+    def _waits_for_options(self, mod_id: str) -> bool:
+        try:
+            return self.manager.get(mod_id).needs_option
+        except KeyError:
+            return False
+
+    def _checked_now(self, run: MaterialRun, job: MaterialJob) -> bool:
+        """The run's result for the job was stored (False: it failed, or the mod was reinstalled meanwhile; a
+        removed mod counts as done)."""
+        try:
+            mod = self.manager.get(job.mod_id)
+        except KeyError:
+            return True
+        return job.mod_id in run.results and f"{mod.installed_at}|{mod.updated_at}" == job.stamp
+
+    def _log_shader_requirements(self, run: MaterialRun, jobs: list[MaterialJob]):
+        """Where the shaders come from that the checked mods' materials use and the game does not have
+        (a warning for the mods that are on)."""
+        names = {j.mod_id: j.name for j in jobs}
+        for mod_id in run.results:
+            on = self._mod_on(mod_id)
+            for req in self._shader_requirements(mod_id):
+                (log.warning if on and req["state"] in ("missing", "off") else log.info)(
+                    "'%s': 재질이 쓰는 %s - %s", names[mod_id], req["name"], requirement_note(req))
+
+    def _mod_on(self, mod_id: str) -> bool:
+        try:
+            return self.manager.get(mod_id).enabled
+        except KeyError:  # (removed meanwhile)
+            return False
+
+    def _shader_requirements(self, mod_id: str) -> list[dict]:
+        """manager.shader_requirements, never raising (only a help)."""
+        try:
+            return self.manager.shader_requirements(mod_id)
+        except Exception as exc:
+            log.debug("필요한 셰이더를 확인하지 못했습니다: %s", exc)
+            return []
+
+    def _notify_shader_requirements(self, mod_ids: list[str]):
+        """After the first material check of mods just installed: the shaders they need that no mod puts in
+        (not while 원인 모드 찾기 runs: its profile turns mods off on purpose; then the ⚠ marks tell)."""
+        if not mod_ids or self._closed or self._bisect is not None:
+            return
+        if self.busy is not None or self._installing or self._modal_open():
+            self.root.after(1000, lambda: self._notify_shader_requirements(mod_ids))
+            return
+        items = []
+        for mod_id in mod_ids:
+            try:
+                mod = self.manager.get(mod_id)
+            except KeyError:
+                continue
+            missing = [r for r in self._shader_requirements(mod_id) if r["state"] in ("missing", "off")]
+            if mod.enabled and missing:
+                items.append((mod, missing))
+        if items and not self._closed:
+            RequirementsDialog(self.root, self.theme, items).show()
 
     def check_materials(self, mod_ids: list[str] | None = None):
         """Check mods (all by default) against the current game and offer to repair what is stale."""
@@ -5361,6 +5458,7 @@ class App:
         def done(run: MaterialRun):
             changed = m.finish_materials(run, jobs)
             self._log_materials(run, jobs)
+            self._log_shader_requirements(run, jobs)
             self.refresh()
             if any(mod.enabled for mod in changed):
                 self.request_apply()
@@ -5383,9 +5481,15 @@ class App:
             if stuck:
                 text += (f"\n\n현재 게임과 맞지 않지만 고칠 수 없는 파일이 있는 모드: {', '.join(stuck[:5])}"
                          f"{' 외' if len(stuck) > 5 else ''} — 게임이 멈추면 이 모드를 끄고 업데이트를 확인하세요.")
+            shaders = [f"'{j.name}': {r['name']} - {requirement_note(r)}" for j in jobs
+                       if j.mod_id in run.results and self._mod_on(j.mod_id)
+                       for r in self._shader_requirements(j.mod_id) if r["state"] in ("missing", "off")]
+            if shaders:
+                text += ("\n\n재질이 쓰는 셰이더(게임에 없어 다른 모드가 넣는 것)가 없거나 꺼져 있습니다:\n"
+                         + "\n".join(shaders[:5]) + (f"\n외 {len(shaders) - 5}개" if len(shaders) > 5 else ""))
             if failed:
                 text += f"\n\n읽지 못한 파일 {failed}개가 있습니다. 자세한 내용은 로그를 보세요."
-            (messagebox.showwarning if stuck else messagebox.showinfo)("재질 점검", text, parent=self.root)
+            (messagebox.showwarning if stuck or shaders else messagebox.showinfo)("재질 점검", text, parent=self.root)
 
         self.run_task("matfix", "재질 점검 준비 중...", lambda p: m.run_materials(jobs, progress=p), on_done=done)
 
@@ -5400,6 +5504,7 @@ class App:
         def done(run: MaterialRun):
             changed = m.finish_materials(run, jobs)
             self._log_materials(run, jobs)
+            self._log_shader_requirements(run, jobs)
             self.refresh(select=jobs[0].mod_id if len(jobs) == 1 else None)
             if run.registry_updated:
                 self.root.after(500, self.check_materials_background)

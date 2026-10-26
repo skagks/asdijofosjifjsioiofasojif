@@ -17,6 +17,11 @@ working file).  What it is compared with depends on the match:
   slots missing from different materials do not add up to a combination none has.
 * Without the whole-game index the donor alone is the reference, as in MHWmodfixer.
 
+A material left as shipped because no current material uses its shader (no donor) is listed
+with that shader when the current game does not have the shader file itself either: it is one
+another mod puts in (a shader pack) or one that is missing, which the caller tells apart
+(``FileResult.shaders``).
+
 What the game's paks hold counts as the current game (game.discover_paks: up to the first
 gap of a patch chain, without the PAKs an older version of the manager put in the chain),
 so a mod PAK another program numbered right after the game's own patches is read as a
@@ -54,6 +59,9 @@ MDF2_RE = re.compile(r"\.mdf2\.(\d+)$", re.IGNORECASE)
 RSZ_RE = re.compile(r"\.(user|pfb|scn)\.(\d+)$", re.IGNORECASE)
 SAMPLE_PFB = 0x93538AED5435EFA9  # a game pfb MHWmodfixer checks its type registry against
 CURRENT_VERSION_HINT = 45  # what the game uses now; tried first when a pak entry has no name
+# .mmtr (shader) version numbers of the game's file list (REasy MHWS_STM.list; the paks store hashes only)
+MMTR_VERSIONS = (240906211, 250206176)
+SHADER_PROBE = "MaterialShader/Variation/Base_Equip.mmtr"  # a shader of every game version (most armour uses it)
 
 # A slot that is new to the mod gates an optional feature the mod never used, and the
 # donor's own texture there was made for another model's UVs: switch it off the way the
@@ -256,6 +264,11 @@ class EntryPlan:
         return [m.mod["name"] for m in self.materials if m.donor is None]
 
     @property
+    def unresolved_shaders(self) -> list[tuple[str, str]]:
+        """(material, shader) of the materials left as shipped."""
+        return [(m.mod["name"], m.mod["mmtr_path"]) for m in self.materials if m.donor is None]
+
+    @property
     def stale(self) -> list[MaterialPlan]:
         return [m for m in self.materials if m.donor is not None and m.stale]
 
@@ -444,6 +457,9 @@ class FileResult:
     # RSZ files (.user/.pfb/.scn): the loose file itself, or each such entry of a pak:
     # {"label", "kind", "method" ("CRC 갱신" | "재구성" | "원본 교체" | "버전 번호"), "reason" (when stuck)}
     rsz: list[dict] = field(default_factory=list)
+    # (material, shader as materials name it) of the unresolved materials whose shader file the current
+    # game does not have: it has to come from another mod (or is missing)
+    shaders: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def stuck(self) -> list[dict]:
@@ -453,7 +469,8 @@ class FileResult:
     def to_dict(self) -> dict:
         return {"key": self.key, "rel": self.rel, "kind": self.kind, "state": self.state,
                 "new_rel": self.new_rel, "fixed": list(self.fixed), "unresolved": list(self.unresolved),
-                "notes": list(self.notes), "error": self.error, "rsz": [dict(r) for r in self.rsz]}
+                "notes": list(self.notes), "error": self.error, "rsz": [dict(r) for r in self.rsz],
+                "shaders": [[name, mmtr] for name, mmtr in self.shaders]}
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileResult | None":
@@ -462,9 +479,45 @@ class FileResult:
                        data.get("new_rel") or None, None,
                        [str(x) for x in data.get("fixed") or []], [str(x) for x in data.get("unresolved") or []],
                        [str(x) for x in data.get("notes") or []], str(data.get("error") or ""),
-                       [{k: str(v) for k, v in r.items()} for r in data.get("rsz") or [] if isinstance(r, dict)])
+                       [{k: str(v) for k, v in r.items()} for r in data.get("rsz") or [] if isinstance(r, dict)],
+                       [(str(x[0]), str(x[1])) for x in data.get("shaders") or []
+                        if isinstance(x, (list, tuple)) and len(x) == 2])
         except (KeyError, TypeError, AttributeError):
             return None
+
+
+def shader_file(mmtr: str, version: int) -> str:
+    """The game path of a material's shader (materials name it under natives/STM/, without the version)."""
+    path = mmtr.replace("\\", "/").strip("/")
+    return f"natives/STM/{path}.{version}"
+
+
+class GameShaders:
+    """Whether the current game's paks have a shader file. They store hashes only, so the file is looked
+    for under the known version numbers: unknown (None) when the game has none of them for a shader
+    every version has (it numbers them some other way now)."""
+
+    def __init__(self, game: GameIndex):
+        self.game = game
+        self._versions: tuple[int, ...] | None = None
+        self._has: dict[str, bool] = {}
+
+    @property
+    def versions(self) -> tuple[int, ...]:
+        if self._versions is None:
+            self._versions = tuple(v for v in MMTR_VERSIONS if self.game.has(shader_file(SHADER_PROBE, v)))
+        return self._versions
+
+    def has(self, mmtr: str) -> bool | None:
+        if not self.versions:
+            return None
+        if mmtr not in self._has:
+            self._has[mmtr] = any(self.game.has(shader_file(mmtr, v)) for v in MMTR_VERSIONS)
+        return self._has[mmtr]
+
+    def foreign(self, pairs) -> list[tuple[str, str]]:
+        """The (material, shader) pairs whose shader the game surely does not have."""
+        return [(name, mmtr) for name, mmtr in pairs if mmtr and self.has(mmtr) is False]
 
 
 def _loose_unit(rel: str, data: bytes, game: GameIndex) -> EntryPlan:
@@ -625,6 +678,7 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
             results.append(FileResult(key, rel, kind, "error", error=str(exc)))
     units = [u for _, u in loose] + [u for *_, us, _ps in paks for _, u in us]
     plan_entries(units, whole_game, progress)
+    game_shaders = GameShaders(game)
 
     def write(result: FileResult, make) -> None:
         if out is None:
@@ -643,7 +697,8 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
         results.append(result)
 
     for key, unit in loose:
-        result = FileResult(key, unit.label, "mdf2", "current", notes=unit.notes, unresolved=unit.unresolved)
+        result = FileResult(key, unit.label, "mdf2", "current", notes=unit.notes, unresolved=unit.unresolved,
+                            shaders=game_shaders.foreign(unit.unresolved_shaders))
         if unit.error:
             result.state, result.error = "error", unit.error
         elif unit.needs_work:
@@ -660,6 +715,7 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
         for _h, unit in entries:
             result.notes += unit.notes + ([unit.error] if unit.error else [])
             result.unresolved += unit.unresolved
+            result.shaders += game_shaders.foreign(unit.unresolved_shaders)
             result.fixed += [m.mod["name"] for m in unit.stale]
         for _h, p in plans:
             result.rsz.append(_rsz_item(p, p.label))

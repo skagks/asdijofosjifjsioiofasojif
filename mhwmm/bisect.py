@@ -460,12 +460,14 @@ class ModFacts:
     options: Sequence[str] = ()  # names of the chosen options
     kinds: frozenset = frozenset()  # manager.mod_kinds: "loose", "pak", "script", "reframework", "dll", "other"
     hidden: bool = False  # every file loses to another mod: nothing of it reaches the game (manager.hidden_mods)
+    shaders_needed: frozenset = frozenset()  # shaders its materials use that only other mods have (manager.shader_needs)
+    shaders_provided: frozenset = frozenset()  # of all mods' shaders_needed, those it puts in (manager.shaders_provided)
 
 
 def requirement_ids(mods: Sequence[ModFacts]) -> dict[str, list[str]]:
     """Mod id -> ids of the enabled mods it needs, matched as manager.requirement_status matches
-    them (Nexus requirements by mod number or name, Lua libraries by the mods that provide them,
-    REFramework for mods that need it); a requirement no enabled mod meets is left out."""
+    them (Nexus requirements by mod number or name, Lua libraries and shaders by the mods that provide
+    them, REFramework for mods that need it); a requirement no enabled mod meets is left out."""
     refw = next((m for m in mods if m.refw), None)
     out: dict[str, list[str]] = {}
 
@@ -494,6 +496,10 @@ def requirement_ids(mods: Sequence[ModFacts]) -> dict[str, list[str]]:
         for module in mod.lua_requires:
             key = requirements.module_key(module)
             found = best([m for m in others if key in m.provides])
+            if found is not None:
+                need.append(found.id)
+        for key in sorted(mod.shaders_needed):
+            found = best([m for m in others if key in m.shaders_provided])
             if found is not None:
                 need.append(found.id)
         if mod.needs_refw and refw is not None and refw.id != mod.id and refw.enabled:
@@ -988,13 +994,26 @@ def facts(manager, owners: dict | None = None) -> list[ModFacts]:
     except Exception as exc:  # only a help: then every mod takes part
         log.debug("파일이 밀린 모드를 확인하지 못했습니다: %s", exc)
         hidden = set()
+    needs: dict[str, frozenset] = {}
+    for m in manager.mods:
+        if m.enabled:
+            try:
+                needs[m.id] = frozenset(manager.shader_needs(m.id))
+            except Exception as exc:  # requirements are only a help here
+                log.debug("필요한 셰이더를 확인하지 못했습니다 (%s): %s", m.name, exc)
+    wanted = frozenset().union(*needs.values())
     out = []
     for m in manager.mods:
+        provided: frozenset = frozenset()
         if m.enabled:
             try:
                 manager.requirement_status(m.id)  # reads the Lua modules of mods installed by older versions
             except Exception as exc:  # requirements are only a help here
                 log.debug("필수 모드를 확인하지 못했습니다 (%s): %s", m.name, exc)
+            try:
+                provided = frozenset(manager.shaders_provided(m.id, wanted)) if wanted else frozenset()
+            except Exception as exc:
+                log.debug("모드가 넣는 셰이더를 확인하지 못했습니다 (%s): %s", m.name, exc)
         files = manager.mod_files(m.id)
         kinds = manager.mod_kinds(m.id)
         out.append(ModFacts(
@@ -1004,7 +1023,7 @@ def facts(manager, owners: dict | None = None) -> list[ModFacts]:
             needs_refw=bool(kinds & {"loose", "script", "pak"}),
             refw=refw is not None and refw.id == m.id, stamp=f"{m.installed_at}|{m.updated_at}",
             options=[o["name"] for o in m.options if o["id"] in m.selected], kinds=frozenset(kinds),
-            hidden=m.id in hidden))
+            hidden=m.id in hidden, shaders_needed=needs.get(m.id, frozenset()), shaders_provided=provided))
     return out
 
 

@@ -231,6 +231,15 @@ def test_requirements_as_mod_ids():
     assert "r" not in bisect.requirement_ids(mods)["app"]
 
 
+def test_a_shader_pack_is_turned_on_with_the_costume_that_uses_its_shaders():
+    skin = "materialshader/variation/ef_skin_npr.mmtr"
+    mods = [facts(id="pack-off", name="Old pack", enabled=False, shaders_provided=frozenset({skin})),
+            facts(id="pack", name="Endfield Style Shader Pack", shaders_provided=frozenset({skin})),
+            facts(id="rossi", name="Rossi", shaders_needed=frozenset({skin, "materialshader/nobody.mmtr"}))]
+    req = bisect.requirement_ids(mods)
+    assert req["rossi"] == ["pack"] and req["pack"] == []  # (no mod has the other shader: left out)
+
+
 def test_the_plan_turns_what_others_need_on_with_them():
     mods = [
         facts(id="r", name="REFramework", refw=True),

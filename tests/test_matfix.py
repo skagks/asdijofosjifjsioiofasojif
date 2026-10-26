@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(not matfix.available(), reason="zstd 모듈이 �
 from mhwmm.matfix import pak as pakmod  # noqa: E402
 from mhwmm.matfix.game import GameIndex  # noqa: E402
 from mhwmm.matfix.mdf2 import Mdf2File, assemble_mdf2, extract_material  # noqa: E402
-from mhwmm.matfix.repair import NULL_MASK, check_mod  # noqa: E402
+from mhwmm.matfix.repair import NULL_MASK, FileResult, check_mod  # noqa: E402
 import test_rsz as R  # noqa: E402
 
 BODY = "natives/STM/Art/Model/Character/ch03/030/601/1/ch03_030_6011"
@@ -883,3 +883,256 @@ def test_shader_index_cache_cut_short_is_made_again(tmp_path, monkeypatch):
     cache.write_bytes(cache.read_bytes()[:20])  # cut short
     assert gamemod.ShaderIndex(fake).find(mmtr) == index.find(mmtr)
     assert gamemod.ShaderIndex(fake).find(mmtr)  # (and saved whole again)
+
+
+# ---- shaders another mod puts in (a shader pack) ----------------------------------------------------
+EF_SKIN = "MaterialShader/Variation/EF_Skin_NPR.mmtr"
+EF_HAIR = "MaterialShader/Variation/EF_Hair_NPR.mmtr"
+PROBE = "natives/STM/MaterialShader/Variation/Base_Equip.mmtr.240906211"  # (repair.SHADER_PROBE)
+ROSSI = "natives/STM/Art/Model/Character/ch03/034/001/2/ch03_034_0012"
+
+
+def npr_costume():
+    """A costume whose materials use a shader pack's shaders: no game material uses them."""
+    return [material("body", [("BaseDielectricMap", "Art/Dimcirui/rossi/body_ALBD.tex"),
+                              ("NPR_SDFMaskMap", "Art/Dimcirui/rossi/body_SDF.tex")],
+                     [("NPR_LightDir", (0.0, 1.0, 0.0, 0.0))], mmtr=EF_SKIN),
+            material("hair", [("BaseDielectricMap", "Art/Dimcirui/rossi/hair_ALBD.tex")], [], mmtr=EF_HAIR)]
+
+
+def shader_game(game, files=()):
+    """The game with its shaders numbered as now (the probe shader) and ``files`` in a newer patch."""
+    write_game_pak(game / "re_chunk_000.pak.patch_002.pak", {PROBE: b"SDF\x00", **{f: b"SDF\x00" for f in files}})
+
+
+def test_materials_on_a_shader_the_game_does_not_have_are_listed_with_it(game, tmp_path):
+    shader_game(game, ["natives/STM/" + EF_HAIR + ".250206176"])  # a shader file no listed material uses
+    index = GameIndex(game, tmp_path / "cache")
+    (result,) = check_mod(stage(tmp_path, {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)}), index, None)
+    assert result.state == "unresolved" and result.unresolved == ["body", "hair"]
+    assert result.shaders == [("body", EF_SKIN)]  # (the game has the hair shader: only no material of it)
+    assert FileResult.from_dict(result.to_dict()).shaders == result.shaders
+    assert FileResult.from_dict({**result.to_dict(), "shaders": [["x"], "y", ["a", "b"]]}).shaders == [("a", "b")]
+    old = result.to_dict()
+    del old["shaders"]  # (a record of an older version)
+    assert FileResult.from_dict(old).shaders == []
+
+
+def test_shaders_are_not_listed_when_the_game_numbers_its_shaders_otherwise(game, tmp_path):
+    index = GameIndex(game, tmp_path / "cache")  # (no shader under a known version number at all)
+    (result,) = check_mod(stage(tmp_path, {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)}), index, None)
+    assert result.unresolved == ["body", "hair"] and result.shaders == []  # (unknown is not "missing")
+
+
+def test_a_mod_paks_materials_on_shaders_the_game_does_not_have(game, tmp_path):
+    shader_game(game)
+    index = GameIndex(game, tmp_path / "cache")
+    data = assemble_mdf2(npr_costume(), 45)
+    mod_pak = tmp_path / "rossi.pak"
+    pakmod.write_pak([(pakmod.path_hash(ROSSI + ".mdf2.45"), data, len(data), 0)], mod_pak)
+    (result,) = check_mod([("rossi.pak", "rossi.pak", mod_pak)], index, None)
+    assert result.kind == "pak" and result.state == "unresolved"
+    assert result.shaders == [("body", EF_SKIN), ("hair", EF_HAIR)]
+
+
+def shader_pack_tree():
+    """The Endfield Style Shader Pack archive: the shaders, and an optional script (Fluffy packages)."""
+    return {"Endfield Style Shader Pack/modinfo.ini": b"name = Endfield Style Shader Pack\n",
+            "Endfield Style Shader Pack/natives/STM/" + EF_SKIN + ".240906211": b"SDF\x00skin",
+            "Endfield Style Shader Pack/natives/STM/" + EF_HAIR + ".240906211": b"SDF\x00hair",
+            "Endfield Style Shader Driver/modinfo.ini":
+                b"name = Endfield Style Shader Driver\nRequirement=Endfield Style Shader Pack\n",
+            "Endfield Style Shader Driver/reframework/autorun/endfield_npr_face_sdf.lua": b"-- face SDF\n"}
+
+
+def shader_items(manager, mod_id):
+    return [(r["state"], r["by"], r["option"], r["name"]) for r in manager.requirement_status(mod_id)
+            if r["kind"] == "shader"]
+
+
+def test_the_shader_pack_a_costume_uses_is_one_of_its_requirements(library, game, tmp_path):
+    from mhwmm import bisect
+
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    library.set_enabled(rossi.id, True)
+    run(library, unchecked_only=True)
+    assert library.material_state(rossi.id) == "current"  # (left as shipped: nothing to repair)
+    assert shader_items(library, rossi.id) == [("missing", "", "", "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+    (req,) = library.missing_requirements(rossi.id)
+    assert req["shaders"] == [EF_SKIN, EF_HAIR] and req["materials"] == ["body", "hair"]
+    assert library.problems()[rossi.id] == ["필요한 모드가 없거나 꺼져 있습니다: 셰이더 EF_Skin_NPR.mmtr 외 1개 (재질이 "
+                                            "쓰는 셰이더 파일이 게임에도 설치한 모드에도 없음)"]
+
+    pack = install_tree(library, tmp_path / "Endfield_Style_Shader_Pack", shader_pack_tree())
+    options = {o["name"]: o["id"] for o in pack.options}
+    library.set_enabled(pack.id, True)
+    library.set_options(pack.id, [options["Endfield Style Shader Driver"]])  # the script alone
+    assert shader_items(library, rossi.id) == [("off", pack.name, "Endfield Style Shader Pack",
+                                                "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+    assert library.problems()[rossi.id] == ["필요한 모드가 없거나 꺼져 있습니다: 셰이더 EF_Skin_NPR.mmtr 외 1개 "
+                                            "('Endfield_Style_Shader_Pack'의 옵션 'Endfield Style Shader Pack'이(가) 꺼져 있음)"]
+    library.set_options(pack.id, list(options.values()))
+    assert shader_items(library, rossi.id) == [("ok", pack.name, "", "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+    assert library.missing_requirements(rossi.id) == [] and rossi.id not in library.problems()
+    found = {f.id: f for f in bisect.facts(library)}
+    assert bisect.requirement_ids(list(found.values()))[rossi.id] == [pack.id]  # (원인 찾기: on together)
+    library.set_enabled(pack.id, False)
+    assert shader_items(library, rossi.id) == [("off", pack.name, "", "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+    assert shader_items(library, pack.id) == []
+
+
+def test_a_shader_pack_as_a_pak_or_in_the_game_folder_counts_too(library, game, tmp_path):
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    run(library, unchecked_only=True)
+    loose = game / "natives" / "STM" / "MaterialShader" / "Variation"  # put there by hand (not a mod)
+    loose.mkdir(parents=True)
+    (loose / "ef_skin_npr.mmtr.240906211").write_bytes(b"SDF\x00")
+    assert set(shader_items(library, rossi.id)) == {("missing", "", "", "셰이더 EF_Hair_NPR.mmtr"),
+                                                    ("ok", "게임 폴더", "", "셰이더 EF_Skin_NPR.mmtr")}
+    base = tmp_path / "EF pak"
+    base.mkdir()
+    entry = pakmod.path_hash("natives/STM/" + EF_HAIR + ".240906211")
+    pakmod.write_pak([(entry, b"SDF\x00", 4, 0)], base / "EF_shaders.pak")
+    pack = install_tree(library, base, {})
+    library.set_enabled(pack.id, True)
+    assert set(shader_items(library, rossi.id)) == {("ok", "게임 폴더", "", "셰이더 EF_Skin_NPR.mmtr"),
+                                                    ("ok", pack.name, "", "셰이더 EF_Hair_NPR.mmtr")}
+
+
+def test_a_costume_with_its_own_shaders_needs_nothing(library, game, tmp_path):
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {
+        ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45),
+        "natives/STM/" + EF_SKIN + ".240906211": b"SDF\x00", "natives/STM/" + EF_HAIR + ".240906211": b"SDF\x00"})
+    run(library, unchecked_only=True)
+    assert library.material_results(rossi.id)[0].shaders  # (the game does not have them) ...
+    assert shader_items(library, rossi.id) == []  # ... but the mod does
+
+
+def test_records_of_older_rules_name_no_shaders(library, game, tmp_path):
+    from mhwmm import manager
+
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    run(library, unchecked_only=True)
+    record = dict(library._material_record(rossi.id))
+    record["format"] = manager.SHADERS_FORMAT - 1
+    library._save_material_record(rossi.id, record)
+    assert library.material_state(rossi.id) == "unchecked" and shader_items(library, rossi.id) == []
+
+
+def test_the_command_line_names_the_shaders_and_where_they_are(library, game, tmp_path, capsys):
+    from mhwmm.cli import main
+
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    library.set_enabled(rossi.id, True)
+    pack = install_tree(library, tmp_path / "Endfield_Style_Shader_Pack", shader_pack_tree())
+    library.set_enabled(pack.id, True)  # (no option chosen yet)
+    library.save()
+    data = str(library.data_dir)
+    assert main(["--data-dir", data, "materials", "check", rossi.name]) == 0
+    out = capsys.readouterr().out
+    assert "게임에 없는 셰이더(EF_Hair_NPR.mmtr, EF_Skin_NPR.mmtr)를 쓰는 재질이라 그대로 둠 - body, hair" in out
+    assert ("재질이 쓰는 셰이더 EF_Skin_NPR.mmtr 외 1개: 'Endfield_Style_Shader_Pack'의 옵션 "
+            "'Endfield Style Shader Pack'이(가) 꺼져 있음") in out
+    assert main(["--data-dir", data, "list"]) == 0
+    assert ("필요한 모드 꺼져 있음: 셰이더 EF_Skin_NPR.mmtr 외 1개 (재질이 쓰는 셰이더 파일) - "
+            "'Endfield_Style_Shader_Pack'의 옵션 'Endfield Style Shader Pack'") in capsys.readouterr().out
+
+
+def vanilla_costume():
+    return [material("body", [("BaseDielectricMap", "Art/Dimcirui/rossi/body_ALBD.tex")], [("Color", (1.0,) * 4)])]
+
+
+def test_only_the_options_chosen_need_shaders(library, game, tmp_path):
+    """A costume with an NPR option and a vanilla one: the vanilla one needs no shader pack."""
+    from mhwmm import bisect
+
+    shader_game(game)
+    mod = install_tree(library, tmp_path / "Rossi", {
+        "Rossi NPR/" + ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45),
+        "Rossi Vanilla/" + ROSSI + ".mdf2.45": assemble_mdf2(vanilla_costume(), 45)})
+    options = {o["name"]: o["id"] for o in mod.options}
+    library.set_enabled(mod.id, True)
+    library.set_options(mod.id, [options["Rossi Vanilla"]])
+    run(library, unchecked_only=True)
+    assert shader_items(library, mod.id) == [] and mod.id not in library.problems()
+    assert {f.id: f for f in bisect.facts(library)}[mod.id].shaders_needed == frozenset()
+    library.set_options(mod.id, [options["Rossi NPR"]])
+    assert shader_items(library, mod.id) == [("missing", "", "", "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+
+
+def test_the_costumes_own_shader_option_not_chosen_is_told(library, game, tmp_path):
+    shader_game(game)
+    mod = install_tree(library, tmp_path / "Rossi", {
+        "Rossi/" + ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45),
+        "Shaders/natives/STM/" + EF_SKIN + ".240906211": b"SDF\x00", "Shaders/natives/STM/" + EF_HAIR + ".240906211": b"SDF\x00"})
+    options = {o["name"]: o["id"] for o in mod.options}
+    library.set_enabled(mod.id, True)
+    library.set_options(mod.id, [options["Rossi"]])
+    run(library, unchecked_only=True)
+    assert shader_items(library, mod.id) == [("off", mod.name, "Shaders", "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+    library.set_options(mod.id, list(options.values()))
+    assert shader_items(library, mod.id) == []
+
+
+def test_a_pack_that_is_off_with_its_option_not_chosen_says_both(library, game, tmp_path):
+    from mhwmm import precheck
+
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    library.set_enabled(rossi.id, True)
+    pack = install_tree(library, tmp_path / "Endfield_Style_Shader_Pack", shader_pack_tree())
+    library.set_enabled(pack.id, False)
+    run(library, unchecked_only=True)
+    (req,) = [r for r in library.requirement_status(rossi.id) if r["kind"] == "shader"]
+    assert (req["state"], req["option"], req["mod_off"]) == ("off", "Endfield Style Shader Pack", True)
+    assert precheck.requirement_label(req) == ("셰이더 EF_Skin_NPR.mmtr 외 1개 ('Endfield_Style_Shader_Pack'과(와) 그 옵션 "
+                                               "'Endfield Style Shader Pack'이(가) 꺼져 있음)")
+    library.set_options(pack.id, [o["id"] for o in pack.options])  # (the option first: the mod is still off)
+    (req,) = [r for r in library.requirement_status(rossi.id) if r["kind"] == "shader"]
+    assert (req["state"], req["option"], req["mod_off"]) == ("off", "", True)
+
+
+def test_shaders_of_a_check_against_another_game_version_are_not_used(library, game, tmp_path):
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    run(library, unchecked_only=True)
+    assert shader_items(library, rossi.id)
+    record = dict(library._material_record(rossi.id))
+    record["game"] = "an older game version"
+    library._save_material_record(rossi.id, record)
+    assert library.material_state(rossi.id) == "unchecked" and shader_items(library, rossi.id) == []
+
+
+def test_a_damaged_pak_does_not_stop_the_shader_lookup(library, game, tmp_path, monkeypatch):
+    from mhwmm import manager
+
+    shader_game(game)
+    rossi = install_tree(library, tmp_path / "Rossi", {ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45)})
+    base = tmp_path / "Broken"
+    base.mkdir()
+    pakmod.write_pak([(1, b"x", 1, 0)], base / "broken.pak")
+    install_tree(library, base, {})
+    run(library, unchecked_only=True)
+
+    def boom(path):
+        raise struct.error("unpack requires a buffer of 8 bytes")  # (a chunk table cut short)
+
+    monkeypatch.setattr(manager, "PakFile", boom)
+    assert shader_items(library, rossi.id) == [("missing", "", "", "셰이더 EF_Skin_NPR.mmtr 외 1개")]
+
+
+def test_a_material_a_later_chosen_option_replaces_needs_no_shader(library, game, tmp_path):
+    shader_game(game)
+    mod = install_tree(library, tmp_path / "Rossi", {
+        "Rossi NPR/" + ROSSI + ".mdf2.45": assemble_mdf2(npr_costume(), 45),
+        "Rossi Vanilla/" + ROSSI + ".mdf2.45": assemble_mdf2(vanilla_costume(), 45)})
+    library.set_enabled(mod.id, True)
+    library.set_options(mod.id, [o["id"] for o in mod.options])  # (the lower option wins the same file)
+    run(library, unchecked_only=True)
+    assert [k for _p, k in library.mod_entries(mod.id).values()] == [f"{mod.options[1]['id']}/{ROSSI}.mdf2.45"]
+    assert shader_items(library, mod.id) == [] and mod.id not in library.problems()

@@ -325,7 +325,13 @@ def test_diagnostics_report(equip_manager, tmp_path):
     assert "ArmorThumbnailTextureData: " in report and "read ok" in report
     assert "it0200_0083_IMLM4" in report
     selftest = zf_text(target, "preview-selftest.txt")
-    assert selftest.startswith("preview self-test: ") and "== summary" in selftest
+    assert selftest.startswith("preview self-test: ")
+    try:
+        import PIL  # noqa: F401
+    except ImportError:  # (it draws nothing and says why)
+        assert "Pillow가 필요합니다" in selftest
+    else:
+        assert "== summary" in selftest
 
 
 def test_diagnostics_report_survives_a_failing_self_test(equip_manager, tmp_path, monkeypatch):
