@@ -1218,9 +1218,12 @@ def test_gui_mod_list_columns_fit_the_list(root, manager, tmp_path, monkeypatch)
             manager.install_variant(s, s.variants[0])
     manager.settings.auto_apply = False
     manager.settings.remember_window = False
+    scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    # (before the window gets its size: Windows keeps a window within the screen unless told otherwise, and the
+    # CI's screen is narrower than the window)
+    root.maxsize(int(round(4000 * scale)), int(round(3000 * scale)))
     app = gui.App(root, manager, queue.Queue())
     px = app.theme.px
-    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
     tree = app.tree
     columns = ("#0",) + tuple(tree["columns"])
 
@@ -1234,12 +1237,19 @@ def test_gui_mod_list_columns_fit_the_list(root, manager, tmp_path, monkeypatch)
     assert fits()
     name = int(tree.column("name", "width"))
     width, height = root.winfo_width(), root.winfo_height()
-    path = [width + px(10) * k for k in range(1, 33)] + [width + px(320) - px(10) * k for k in range(1, 45)]
+    end = max(width - px(120), root.minsize()[0])  # (narrower than at the start, but not below the window's minimum)
+    assert end < width, (width, root.minsize())
+    path = [width + px(10) * k for k in range(1, 33)]
+    path += list(range(path[-1] - px(10), end, -px(10))) + [end]
     for w in path:  # one drag, wider and back (frozen from its second step)
         root.geometry(f"{w}x{height}")
         root.update()
     assert app.freeze.frozen
-    pump(root, lambda: not app.freeze.frozen and app.content.winfo_width() == root.winfo_width() == path[-1])
+    try:
+        pump(root, lambda: not app.freeze.frozen and app.content.winfo_width() == root.winfo_width() == end)
+    except AssertionError:
+        raise AssertionError(f"frozen {app.freeze.frozen}, content {app.content.winfo_width()}, window "
+                             f"{root.winfo_width()}, wanted {end} (min {root.minsize()}, start {width})") from None
     assert fits() and int(tree.column("name", "width")) < name  # (the name column gave the width back)
 
 
