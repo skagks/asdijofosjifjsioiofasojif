@@ -35,16 +35,18 @@ from .equip import icons as equip_icons
 from .equip import look as equip_look
 from .equip import overview as equip_overview
 from .equip import pathlist as equip_pathlist
+from .equip import retarget as equip_retarget
 from .equip import scan as equip_scan
 from .equip import selftest as equip_selftest
 from .equip import tex as equip_tex
 from .equip import userdata as equip_userdata
-from .equip.model import PART_LABELS
+from .equip.model import PART_LABELS, Target, fallback_label
+from .equip.paths import normalize as normalize_path
 from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
 from .matfix.pak import PakFile, path_hash
-from .matfix.repair import MMTR_VERSIONS, RSZ_RE, FileResult, RszContext, check_mod, is_material_file, rsz_sources, \
-    shader_file
+from .matfix.repair import MMTR_VERSIONS, RSZ_RE, Aliases, FileResult, RszContext, check_mod, is_material_file, \
+    rsz_sources, shader_file
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +59,8 @@ MAX_PROFILE_NAME = 40
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
 OPTION_PREVIEWS = "previews"  # per mod: the pictures of its options, named after the option id
+# 다른 장비로 옮기기 of an armor key without its body ("004/001"): its recipe could not be read afterwards
+RETARGET_BODY = "방어구는 체형까지 적어 주세요 (예: armor/f/087/000)"
 MAX_ARCHIVE_DIRS = 8
 # Version of the check/repair rules: records made with older rules count as unchecked, so every
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
@@ -80,6 +84,71 @@ class InstallError(Exception):
 def shader_key(mmtr: str) -> str:
     """How shaders are compared: as materials name them (under natives/STM/, without the version number)."""
     return mmtr.replace("\\", "/").strip("/").lower()
+
+
+def retarget_aliases(recipe: dict) -> Aliases:
+    """What the material check needs of a mod create_retarget made (Mod.retarget): its moved files are
+    compared with the game's files at their old paths, and an RSZ file is looked at with the old paths
+    and gets the new ones again (equip.retarget's same-length rewrite). ValueError (Korean) for a recipe
+    that does not read: checked like any other mod, a repair could put the original equipment's paths
+    back."""
+    try:
+        kind = recipe["kind"]
+        source = equip_retarget.Slot.of(Target(kind, str(recipe["from"])))
+        target = equip_retarget.Slot.of(Target(kind, str(recipe["to"])))
+        if source is None or target is None:
+            raise ValueError("equipment")
+        parts = recipe.get("parts") if kind == "armor" else None
+        forward = equip_retarget.Renamer(source, target, parts)
+        back = equip_retarget.Renamer(target, source, parts)
+        moves = [(str(new), str(old)) for new, old in recipe.get("moves") or ()]
+        hashes = {int(new): int(old) for new, old in recipe.get("pak_moves") or ()}
+    except (KeyError, TypeError, ValueError, AttributeError, equip_retarget.RetargetError) as exc:
+        raise ValueError(f"다른 장비로 옮긴 기록(mod.json)을 읽지 못해 점검하지 않습니다 ({exc})") from None
+    to_new = equip_retarget.mover(moves, forward)
+    to_old = equip_retarget.mover([(old, new) for new, old in moves], back)
+    return Aliases({new.replace("\\", "/").lower(): old for new, old in moves}, hashes,
+                   lambda data, name, moved: equip_retarget.rewrite(data, name, to_old, back if moved else None)[0],
+                   lambda data, name, moved: equip_retarget.rewrite(data, name, to_new, forward if moved else None)[0])
+
+
+def _chained_recipe(first: dict, then: dict) -> dict:
+    """The recipe of a mod made by moving a mod that was itself moved (``first``: that one's recipe): one
+    move from where ``first``'s files came from, so that the material check compares with the game files
+    the mod was made for. A file of the first move is found whatever its spelling now (a repair may have
+    given it another version number) and gets the original equipment's path in that spelling. {} when the
+    files are back at those paths (a mod like any other); ``then`` alone when ``first`` does not read or
+    did not move the files to where ``then`` moved them from."""
+    try:
+        kind = then["kind"]
+        if first["kind"] != kind:
+            raise ValueError(first["kind"])
+        origin = Target(kind, str(first["from"]))
+        a, b = equip_retarget.Slot.of(origin), equip_retarget.Slot.of(Target(kind, str(first["to"])))
+        if a is None or b is None or b != equip_retarget.Slot.of(Target(kind, str(then["from"]))):
+            raise ValueError("equipment")
+        back = equip_retarget.Renamer(b, a)  # the middle equipment's ids -> the original's
+        firsts = {normalize_path(str(new)): str(old) for new, old in first.get("moves") or ()}
+        hashes = {int(new): int(old) for new, old in first.get("pak_moves") or ()}
+        before = set(first.get("parts") or then["parts"])
+    except (KeyError, TypeError, ValueError, AttributeError, equip_retarget.RetargetError):
+        return then
+    if a == equip_retarget.Slot.of(Target(kind, str(then["to"]))):
+        return {}
+
+    def old_path(path: str) -> str:
+        was = firsts.get(normalize_path(path))
+        if was is None:  # not one of the first move's files: it came from where it is
+            return path
+        try:
+            renamed = back.rename(path, all_parts=True)
+        except equip_retarget.RetargetError:
+            renamed = None
+        return renamed if renamed is not None and normalize_path(renamed) == normalize_path(was) else was
+
+    return {**then, "from": origin.key, "parts": [p for p in then["parts"] if p in before],
+            "moves": [[new, old_path(old)] for new, old in then["moves"]],
+            "pak_moves": [[new, hashes.get(old, old)] for new, old in then["pak_moves"]]}
 
 
 def _children(folder: Path) -> list[Path]:
@@ -346,6 +415,10 @@ class Mod:
     lua_scanned: bool = False
     # the archive's option pictures were looked for (installs since 1.12.0 and read_option_pictures)
     pictures_read: bool = False
+    # 다른 장비로 옮기기: how create_retarget made this mod from another one (empty for every other mod):
+    # {"format", "kind", "from", "to" (Target keys; "from" is where the files first came from), "parts",
+    #  "source_mod", "source_name", "moves": [[new game path, old one]], "pak_moves": [[new pak entry hash, old one]]}
+    retarget: dict = field(default_factory=dict)
 
     @property
     def nexus_url(self) -> str:
@@ -423,6 +496,7 @@ class MaterialJob:
     files: list  # [(source key, game path, original file)]
     provided: set = field(default_factory=set)  # names of all the mod's files (no version number), lower case
     stage: Path | None = None  # where the repaired files are written (repairs only)
+    retarget: dict = field(default_factory=dict)  # Mod.retarget: compared with the original equipment's files
 
 
 @dataclass
@@ -996,6 +1070,9 @@ class ModManager:
                 mod = self.get(replace_id)
                 mod.updated_at = now
                 old_selected = {o["name"] for o in mod.options if o["id"] in mod.selected}
+                if mod.retarget:  # the files are the archive's now, at the paths it has them
+                    log.info("%s: 압축 파일의 파일로 업데이트되어 다른 장비로 옮긴 기록을 지웠습니다", mod.name)
+                    mod.retarget = {}
             else:
                 name = package_name(variants) if multi else variants[0].name
                 mod = Mod(id=mod_id, name=self._unique_name(name),
@@ -1295,7 +1372,11 @@ class ModManager:
             if files and not (unchecked_only and self.material_state(mod_id) != "unchecked"):
                 provided = {re.sub(r"\.\d+$", "", Path(rel).name).lower()  # as resource paths name them
                             for rel in self._stored_files(self.mod_dir(mod_id))}
-                jobs.append(MaterialJob(mod_id, mod.name, self._stamp(mod), list(files), provided))
+                if mod.retarget:  # (its RSZ files are looked at as the original shipped them)
+                    provided |= {re.sub(r"\.\d+$", "", Path(str(move[1])).name).lower()
+                                 for move in mod.retarget.get("moves") or () if isinstance(move, list) and len(move) == 2}
+                jobs.append(MaterialJob(mod_id, mod.name, self._stamp(mod), list(files), provided,
+                                        retarget=copy.deepcopy(mod.retarget)))
         return jobs
 
     def run_materials(self, jobs: list[MaterialJob], repair: bool = False,
@@ -1370,8 +1451,9 @@ class ModManager:
                 out = lambda result, stage=job.stage, numbers=numbers: \
                     stage / f"{next(numbers):03d}_{result.new_rel.rsplit('/', 1)[-1]}"
             try:
+                aliases = retarget_aliases(job.retarget) if job.retarget else None
                 run.results[job.mod_id] = check_mod(job.files, game, shaders, out, provided=job.provided,
-                                                    rszs=context)
+                                                    rszs=context, aliases=aliases)
             except Exception as exc:  # one broken mod must not stop the others
                 log.warning("%s: 재질을 %s하지 못했습니다: %s", job.name, verb, exc)
                 run.errors[job.mod_id] = str(exc)
@@ -1379,7 +1461,10 @@ class ModManager:
     def export_material_report(self, job: MaterialJob, target: Path, progress: ProgressFn | None = None) -> int:
         """Write a zip with the mod's .user/.pfb/.scn files, the current game's copies of them, the
         repaired versions in use and what the last check found - to find out why one could not be
-        repaired. Thread-safe (``job`` from material_jobs). Returns the number of files compared."""
+        repaired. A mod made by 다른 장비로 옮기기 is paired as its check pairs it: a moved file with the
+        original equipment's game file, and what the check looked at (the old paths put back) as
+        ``restored/``; report.json says so. Thread-safe (``job`` from material_jobs). Returns the
+        number of files compared."""
         from . import __version__
 
         progress = progress or (lambda done, total, msg: None)
@@ -1396,16 +1481,31 @@ class ModManager:
             registry_meta = {"error": str(exc)}
         finally:
             rsz.TypeRegistry.release()
-        count = 0
+        aliases, moved = None, {}
+        if job.retarget:
+            recipe = job.retarget
+            try:
+                aliases = retarget_aliases(recipe)
+            except ValueError as exc:  # (the check did not look at it either)
+                moved = {"error": str(exc)}
+            else:
+                moved = {"note": f"다른 장비로 옮긴 모드입니다 ({recipe.get('from')} → {recipe.get('to')}). 점검은 "
+                                 "옮긴 파일을 원래 장비의 게임 파일(game/)과 비교하고, 안의 경로를 원래 장비의 "
+                                 "경로로 되돌린 내용(restored/)으로 봅니다"}
+            moved["recipe"] = {k: v for k, v in recipe.items() if k not in ("moves", "pak_moves")}
+        count, compared = 0, {}
         partial = target.with_name(target.name + ".partial")
         try:
             with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
-                for label, kind, mod_bytes, donor_path, donor_bytes in rsz_sources(job.files, game):
+                for label, kind, mod_bytes, donor_path, donor_bytes, seen in rsz_sources(job.files, game, aliases):
                     progress(count, 0, f"진단 파일 만드는 중... {label.rsplit('/', 1)[-1]}")
                     name = label.replace("#", "_")
                     zf.writestr(f"mod/{name}", mod_bytes)
+                    if seen is not None:
+                        zf.writestr(f"restored/{name}", seen)
                     if donor_bytes is not None:
                         zf.writestr(f"game/{name}", donor_bytes)
+                    compared[label] = donor_path if donor_bytes is not None else None
                     count += 1
                 for key, (rel, path) in self.repaired_materials(job.mod_id).items():
                     if not rel.lower().endswith(".pak"):
@@ -1413,7 +1513,8 @@ class ModManager:
                 zf.writestr("report.json", json.dumps({
                     "app_version": __version__, "mod": job.name, "game": game.fingerprint,
                     "game_paks": [p.name for p in game.paks], "game_paks_left_out": sorted(game.exclude),
-                    "registry": registry_meta, "record": record,
+                    "registry": registry_meta, "record": record, "compared": compared,
+                    **({"retarget": moved} if moved else {}),
                 }, ensure_ascii=False, indent=2))
             os.replace(partial, target)
         except BaseException:
@@ -1971,6 +2072,162 @@ class ModManager:
             return False
         sheet.save(target, "PNG")
         return True
+
+    # ------------------------------------------------------------- 다른 장비로 옮기기
+    def retarget_sources(self, mod_id: str, files: dict | None = None) -> list[Target]:
+        """The armor (one Target per body) and weapons a mod changes the look of that it can be moved away
+        from (equip.retarget), from the equipment scan of what it puts into the game. ``files``: those
+        files ({game path: stored file or (stored file, key)}, e.g. equipment_job(mod_id).files) taken on
+        the GUI thread - then they are scanned on this thread, without the mod's state or the caches;
+        None: the mod's files now (equipment_job, so on the GUI thread) and the cached scan."""
+        if files is None:
+            job = self.equipment_job(mod_id)
+            scan = self.equipment_scans([job])[mod_id]
+        else:
+            with self._equip_lock:
+                if self._equip_paths is None and any(is_root_pak(rel) for rel in files):
+                    self._equip_paths = equip_pathlist.PathIndex(self.data_dir / "cache")
+                index = self._equip_paths
+            scan = equip_scan.scan_files(files, index)
+        return equip_retarget.sources_of(scan.targets)
+
+    def retarget_choices(self, source: Target, progress: ProgressFn | None = None) -> list[tuple[Target, str]]:
+        """(equipment, name) a mod of ``source`` can be moved to, by name: the game's equipment of the same
+        kind (armor: the same body; weapons: the same type) from the catalog, all its names in one (without
+        a game, the bundled path list's with numbers). Thread-safe; the catalog may take a while the
+        first time."""
+        slot = equip_retarget.Slot.of(source)
+        if slot is None:
+            return []
+        catalog = self._retarget_catalog(progress)
+        items = catalog.data.get("items") if catalog is not None else None
+        keys = items.get(source.kind) if isinstance(items, dict) else None
+        if not isinstance(keys, dict) or not keys:
+            keys = {t.key for t in equip_look.game_files().by_item if t.kind == source.kind}
+        body = source.key.partition("/")[0]
+        out = []
+        for key in keys:
+            if not isinstance(key, str) or (source.kind == "armor" and key.partition("/")[0] != body):
+                continue
+            target = Target(source.kind, key)
+            other = equip_retarget.Slot.of(target)
+            if other is not None and equip_retarget.why_not(slot, other) is None:
+                names = list(dict.fromkeys(catalog.names(target))) if catalog is not None else []
+                out.append((target, " · ".join(names) or fallback_label(target)))
+        return sorted(out, key=lambda choice: (choice[1].casefold(), choice[0]))
+
+    def plan_retarget(self, mod_id: str, source: Target, target: Target, parts=None,
+                      files: dict | None = None) -> equip_retarget.Plan:
+        """What moving mod ``mod_id`` from ``source`` to ``target`` would do (equip.retarget.plan; ``parts``:
+        the armor parts to move, None: all), checked against the game's own files of the target when the
+        game can be read. ``files``: the mod's files ({game path: stored file or (stored file, key)}) taken
+        on the GUI thread (equipment_job(mod_id).files) - None: mod_entries now, so on the GUI thread.
+        With ``files`` thread-safe: reads those files, the path list and the game; changes nothing."""
+        return self._plan_retarget(mod_id, source, target, parts, files)[0]
+
+    def _plan_retarget(self, mod_id: str, source: Target, target: Target, parts, files: dict | None = None):
+        def slot(t: Target) -> equip_retarget.Slot:  # (one that cannot be moved gets why_not's reason)
+            return equip_retarget.Slot.of(t) or equip_retarget.Slot(t.kind, t.key)
+
+        a, b = slot(source), slot(target)
+        bodiless = any(t.kind == "armor" and equip_retarget.Slot.of(t) is None and slot(t).valid
+                       for t in (source, target))
+        problem = RETARGET_BODY if bodiless else equip_retarget.why_not(a, b)
+        if problem:
+            return equip_retarget.Plan(a, b, errors=[problem]), []
+        entries = self.mod_entries(mod_id) if files is None else files
+        index = None
+        if any(is_root_pak(rel) for rel in entries):
+            with self._equip_lock:
+                if self._equip_paths is None:
+                    self._equip_paths = equip_pathlist.PathIndex(self.data_dir / "cache")
+                index = self._equip_paths
+        try:
+            items = equip_retarget.items_of(entries, index)
+        except equip_retarget.RetargetError as exc:
+            return equip_retarget.Plan(a, b, errors=[str(exc)]), []
+        try:
+            game = self._equip_game()
+        except Exception as exc:  # the target is then not checked (the plan says so)
+            log.warning("게임 파일을 읽지 못해 옮길 장비를 확인하지 않습니다: %s", exc)
+            game = None
+        return equip_retarget.plan(items, a, b, parts, game), items
+
+    def _retarget_catalog(self, progress: ProgressFn | None = None):
+        try:
+            return self.equipment_catalog(progress)
+        except Exception as exc:  # names are only a help: numbers then
+            log.warning("장비 이름을 읽지 못했습니다: %s", exc)
+            return None
+
+    def retarget_name(self, mod_id: str, target: Target, progress: ProgressFn | None = None) -> str:
+        """The name create_retarget gives the mod it makes of mod ``mod_id`` for ``target``: "<mod> →
+        <the target's first name>" (by number without the game's names), with a number when that is taken.
+        Reads the catalog as retarget_choices does: quick once that has run (before, on a worker thread)."""
+        catalog = self._retarget_catalog(progress)
+        target = target.item
+        label = (catalog.name(target) if catalog is not None else "") or fallback_label(target)
+        return self._unique_name(f"{self.get(mod_id).name} → {label}")
+
+    def create_retarget(self, mod_id: str, source: Target, target: Target, parts=None, disable_original: bool = True,
+                        enable: bool = True, progress: ProgressFn | None = None) -> Mod:
+        """Make a new mod that changes ``target`` the way mod ``mod_id`` changes ``source`` (plan_retarget,
+        planned again): its files are built in a new folder under temp and installed as one mod without
+        options named as retarget_name says, with the original's author, description, version, category and
+        picture (not its Nexus link or update), right after the original in the load order; ``enable``
+        switches it on (whether the original is on or not), ``disable_original`` switches the original
+        off. Its recipe (Mod.retarget) makes the material check compare it with the original equipment's
+        game files (for a mod that was itself moved, those its files first came from). InstallError with
+        the plan's errors. The callers check bisect.BLOCKED first; like install_package it may run on a
+        worker thread while nothing else changes the mods."""
+        progress = progress or (lambda done, total, msg: None)
+        original = self.get(mod_id)
+        progress(0, 0, "옮길 파일 확인 중...")
+        plan, items = self._plan_retarget(mod_id, source, target, parts)
+        if not plan.ok:
+            raise InstallError("\n".join(plan.errors) or "옮길 파일이 없습니다.")
+        name = self.retarget_name(mod_id, target, progress)
+        new_id = uuid.uuid4().hex[:10]
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix="retarget-", dir=self.temp_root))
+        try:
+            try:
+                built = equip_retarget.build(plan, items, stage / "files", progress)
+            except equip_retarget.RetargetError as exc:
+                raise InstallError(str(exc)) from None
+            mod = Mod(id=new_id, name=name, enabled=enable, version=original.version, author=original.author,
+                      description=original.description, category=original.category, installed_at=_now(),
+                      pictures_read=True)
+            picture = self.mod_picture(mod_id)
+            if picture is not None:
+                mod.screenshot = "preview" + picture.suffix.lower()
+                fsutil.copy_file(picture, stage / mod.screenshot)
+            mod.lua_requires = requirements.required_modules(self._stored_files(stage))
+            mod.lua_scanned = True
+            mod.retarget = {
+                "format": equip_retarget.RETARGET_FORMAT, "kind": plan.source.kind, "from": source.item.key,
+                "to": target.item.key, "parts": list(plan.parts), "source_mod": original.id,
+                "source_name": original.name, "moves": [[new, old] for new, old in built.moves],
+                "pak_moves": [[new, old] for new, old in built.pak_moves]}
+            if original.retarget:  # moved again: from where the files first came from
+                mod.retarget = _chained_recipe(original.retarget, mod.retarget)
+            self._write_mod_meta(mod, stage)
+            os.replace(stage, self.mod_dir(new_id))
+        except BaseException:
+            fsutil.rmtree(stage)
+            raise
+        self._invalidate(new_id)
+        ids = [m.id for m in self.mods]
+        self.mods.insert(ids.index(original.id) + 1 if original.id in ids else len(ids), mod)
+        switched_off = disable_original and original.enabled
+        if switched_off:
+            original.enabled = False
+        self.revision += 1
+        self.dirty = self.dirty or mod.enabled or switched_off
+        self.save()
+        log.info("다른 장비로 옮긴 모드를 만들었습니다: %s (%d개 파일, %s%s)", mod.name, len(built.files),
+                 "켜짐" if mod.enabled else "꺼짐", ", 원래 모드는 끔" if switched_off else "")
+        return mod
 
     # ------------------------------------------------------------- requirements
     @staticmethod

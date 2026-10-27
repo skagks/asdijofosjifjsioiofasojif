@@ -20,7 +20,7 @@ from array import array
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 from ..matfix.pak import path_hash
 from .paths import is_npc_visual_setting
@@ -110,6 +110,18 @@ def streaming_twin(path: str) -> str | None:
     if not low.rstrip("0123456789").endswith(tuple(e + "." for e in _TWIN_EXTS)):
         return None
     return path[:len(PREFIX)] + STREAMING + path[len(PREFIX):]
+
+
+def stored_paths(ref: str) -> Iterator[str]:
+    """The paths a pak may keep the file a normalized reference (paths.normalize, e.g. ``art/x.tex``)
+    names under: ``natives/stm/<ref>.<version>`` with each version the game uses for the extension,
+    each followed by its streaming/ copy (.mesh/.tex)."""
+    for version in versions().get(ref.rpartition(".")[2], ()):
+        path = f"{PREFIX}{ref}.{version}"
+        yield path
+        twin = streaming_twin(path)
+        if twin:
+            yield twin
 
 
 def full_path(path: str) -> str:

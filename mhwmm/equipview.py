@@ -15,7 +15,8 @@ from .equip import look as equip_look
 from .equip import overview as ov
 from .equip.model import (ARMOR_PARTS, BODIES, KIND_LABELS, PART_LABELS, Target, parse_armor_key,
                           parse_weapon_key)
-from .gui import (Dialog, FreezeContent, Image, ImageTk, Tooltip, autohide, follow_width, load_image,
+from .equip.retarget import Slot
+from .gui import (RETARGET_ACTION, Dialog, FreezeContent, Image, ImageTk, Tooltip, autohide, follow_width, load_image,
                   set_dark_titlebar)
 
 log = logging.getLogger(__name__)
@@ -580,6 +581,7 @@ class EquipmentWindow(tk.Toplevel):
 
         self._section(d, "바꾸는 모드")
         conflicts = item.conflicts()
+        movable = Slot.of(item.target) is not None  # armor and weapons: 다른 장비로 옮기기
         for use in item.uses:
             row = ttk.Frame(d, style="Card.TFrame")
             row.pack(fill="x", pady=(px(8), 0))
@@ -596,6 +598,10 @@ class EquipmentWindow(tk.Toplevel):
                       justify="left").pack(anchor="w")
             ttk.Button(text, text="목록에서 보기", style="Link.TButton",
                        command=lambda mod_id=use.mod_id: self.app.show_mod(mod_id)).pack(anchor="w")
+            if movable:  # (over this window, starting from this equipment)
+                ttk.Button(text, text=RETARGET_ACTION, style="Link.TButton",
+                           command=lambda mod_id=use.mod_id: self.app.open_retarget(mod_id, item.target, parent=self)
+                           ).pack(anchor="w")
             self._look_strip(d, item, use)
         if conflicts:
             self._section(d, "겹치는 부위")

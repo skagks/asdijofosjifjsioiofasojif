@@ -81,6 +81,9 @@ FILTER_PROBLEMS = "문제 있음"
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, MatfixError, OSError, ValueError)
 
 
+RETARGET_TITLE = "다른 장비로 옮기기"
+RETARGET_ACTION = RETARGET_TITLE + "..."  # (retargetview.RetargetDialog) in the context menu and the 장비 외형 window
+
 KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
 
 
@@ -2692,7 +2695,8 @@ class PrecheckDialog(Dialog):
 
 class App:
     MUTATING_OK_DURING = (None, "deploy")
-    FOLDER_TASKS = ("purge", "game", "remove", "refw", "install", "matfix")  # end with an apply: no launch meanwhile
+    # end with an apply: no launch meanwhile
+    FOLDER_TASKS = ("purge", "game", "remove", "refw", "install", "matfix", "retarget")
 
     def __init__(self, root: tk.Tk, manager: ModManager, events: queue.Queue):
         self.root = root
@@ -2704,6 +2708,7 @@ class App:
         self._installing = False
         self._close_after_task = False
         self._status_after_task = ""  # a line for the status bar once the running task is done (it says "준비")
+        self._retarget_waiting = 0  # 다른 장비로 옮기기 waiting for a running task to make its mod (no launch meanwhile)
         self._closed = False
         self._drag: dict | None = None
         self._preview = None
@@ -2726,6 +2731,7 @@ class App:
         self._req_flush_scheduled = False
         self._problems: dict[str, list[str]] = {}  # enabled mods that cannot fully work, with the reasons
         self._matfix_running = False  # a background material check is running
+        self._matfix_line = ""  # the status line it wrote last (only that one is put back to "준비" at its end)
         self.equipment_window = None  # the 장비 외형 window while it is open
         self._equip_warming = False
         self._equip_again = False
@@ -3927,6 +3933,78 @@ class App:
         from .equipview import EquipmentWindow  # imports this module
 
         self.equipment_window = EquipmentWindow(self, mod_id)
+
+    def open_retarget(self, mod_id: str, source=None, parent=None):
+        """다른 장비로 옮기기: the dialog (over ``parent``, by default the main window; ``source``: the
+        equipment picked first), then the new mod made from the mod's files for the equipment chosen. Over
+        another window (장비 외형) a refusal is told there: the main window's status bar may be hidden."""
+        window = parent if parent is not None and parent is not self.root else None
+        if window is None:
+            if self._search_blocks() or not self.can_mutate():
+                return
+        elif self._search_blocks(loud=False):
+            messagebox.showinfo(bisect.TITLE, bisect.BLOCKED, parent=window)
+            return
+        elif not self.can_mutate():
+            messagebox.showinfo(RETARGET_TITLE, "다른 작업이 진행 중입니다. 작업이 끝난 뒤에 다시 시도하세요.", parent=window)
+            return
+        if not any(m.id == mod_id for m in self.manager.mods):
+            return
+        from .retargetview import RetargetDialog  # imports this module
+
+        choice = RetargetDialog(parent or self.root, self, mod_id, source).show()
+        if choice is not None:
+            self._create_retarget(mod_id, choice)
+
+    def _create_retarget(self, mod_id: str, choice, waited: bool = False):
+        """Make the mod the dialog chose once no other task runs (an apply may have started meanwhile). While
+        it waits the game does not start (_retarget_waiting, as during the task: FOLDER_TASKS)."""
+        if waited:
+            self._retarget_waiting -= 1
+        if self._closed or not any(m.id == mod_id for m in self.manager.mods):
+            return
+        if self.busy is not None or self._installing:
+            self.status_var.set("진행 중인 작업이 끝나면 새 모드를 만듭니다...")
+            self._retarget_waiting += 1
+            self.root.after(200, lambda: self._create_retarget(mod_id, choice, waited=True))
+            return
+        if self._search_blocks():
+            return
+        m = self.manager
+        original = m.get(mod_id)
+        name, was_on = original.name, original.enabled
+
+        def work(progress):
+            return m.create_retarget(mod_id, choice.source, choice.target, parts=choice.parts,
+                                     disable_original=choice.disable_original, enable=True, progress=progress)
+
+        def done(mod: Mod):
+            if was_on and not any(o.id == mod_id and o.enabled for o in m.mods):
+                what = "원래 모드는 껐습니다"
+                log.info("'%s'을(를) 껐습니다. 원래 장비는 게임 모습으로 돌아갑니다 (원래 모드를 다시 켜면 "
+                         "원래 장비도 모드 모습이 됩니다).", name)
+            elif was_on:
+                what = "원래 모드도 켜 두었습니다"
+                log.info("'%s'은(는) 켜 두었습니다. 원래 장비와 옮긴 장비가 모두 모드 모습입니다.", name)
+            else:
+                what = ""
+            self.refresh(select=mod.id)
+            if not self.tree.exists(mod.id):  # (hidden by the search or a filter)
+                self.show_mod(mod.id)
+            self.status_var.set(" · ".join(filter(None, (f"새 모드를 만들었습니다: {mod.name}", what))))
+            if mod.enabled or was_on:
+                if m.settings.auto_apply and m.game_dir:  # (the apply's end would say "준비" at once)
+                    self._status_after_task = self.status_var.get()
+                self.request_apply()
+            self._first_check.add(mod.id)  # its first material check tells of shaders it lacks, as for an install
+            self.check_materials_background()
+            self.warm_equipment()
+
+        def failed(exc):
+            self.show_error(RETARGET_TITLE, f"새 모드를 만들지 못했습니다.\n\n{exc}")
+            self.refresh(select=mod_id)
+
+        self.run_task("retarget", f"새 모드 만드는 중: {name}", work, on_done=done, on_error=failed)
 
     def show_mod(self, mod_id: str):
         """Select a mod in the list (clearing a search or filter that hides it) and show its info."""
@@ -5196,6 +5274,8 @@ class App:
                 menu.add_command(label="이름 변경", command=self.rename_selected)
                 menu.add_command(label="저장된 모드 폴더 열기", command=self.open_mod_folder)
                 menu.add_command(label="장비 외형 보기", command=lambda: self.show_equipment(ids[0]))
+                if self.manager.mod_kinds(ids[0]) & {"loose", "pak"}:  # (the dialog says when nothing can be moved)
+                    menu.add_command(label=RETARGET_ACTION, command=lambda: self.open_retarget(ids[0]))
                 if mods[0].origin != refw.ORIGIN:
                     menu.add_separator()
                     if mods[0].update:
@@ -5247,7 +5327,8 @@ class App:
             return False
         if self._matfix_running:
             self.root.bell()
-            self.status_var.set("재질 점검이 끝난 뒤에 다시 시도하세요.")
+            self._matfix_line = "재질 점검이 끝난 뒤에 다시 시도하세요."  # (the check's end puts back "준비")
+            self.status_var.set(self._matfix_line)
             return False
         if not self.manager.game_dir:
             messagebox.showwarning("재질", "먼저 게임 폴더를 지정하세요.", parent=self.root)
@@ -5291,8 +5372,11 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def _matfix_status(self, msg: str):
-        if self.busy is None and self._matfix_running:
-            self.status_var.set(msg if len(msg) < 90 else "…" + msg[-88:])
+        """The background check's progress, over "준비" or its own line only: a line that tells what was
+        done (새 모드를 만들었습니다...) stays."""
+        if self.busy is None and self._matfix_running and self.status_var.get() in ("준비", self._matfix_line):
+            self._matfix_line = msg if len(msg) < 90 else "…" + msg[-88:]
+            self.status_var.set(self._matfix_line)
 
     def _on_materials_checked(self, run: MaterialRun | None, jobs: list[MaterialJob], error: Exception | None):
         if self._closed:
@@ -5301,7 +5385,9 @@ class App:
             self.root.after(500, lambda: self._on_materials_checked(run, jobs, error))
             return
         self._matfix_running = False
-        self.status_var.set("준비")
+        if self._matfix_line and self.status_var.get() == self._matfix_line:  # (another line stays)
+            self.status_var.set("준비")
+        self._matfix_line = ""
         if error is not None:
             log.warning("재질을 점검하지 못했습니다: %s", error)
         else:
@@ -5787,7 +5873,7 @@ class App:
         if self.busy == "deploy":  # its done handler starts the game (after looking again)
             self._launch_after_apply = True
             return
-        if self.busy in self.FOLDER_TASKS or self._installing:
+        if self.busy in self.FOLDER_TASKS or self._installing or self._retarget_waiting:
             log.info("다른 작업 중이라 게임을 실행하지 않았습니다. 작업이 끝난 뒤 다시 실행하세요.")
             self.status_var.set("작업이 끝난 뒤에 다시 시도하세요.")
             self._precheck_answered = None

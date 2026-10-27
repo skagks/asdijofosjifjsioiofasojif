@@ -25,7 +25,7 @@ from ..matfix import MatfixError, rsz
 from ..matfix.mdf2 import Mdf2File, detect_version
 from ..matfix.pak import PakFile, path_hash
 from .model import Target
-from .pathlist import PREFIX, PathIndex, game_paths, streaming_twin, versions
+from .pathlist import PathIndex, game_paths, stored_paths
 from .paths import classify, normalize
 
 log = logging.getLogger(__name__)
@@ -249,13 +249,10 @@ def _infer(f: _File) -> Target | None:
 def _name(unnamed: dict[int, list[_File]], refs: set[str]) -> None:
     """Name unnamed pak entries after the paths files point at, hashed with each version the game
     uses for the extension (and as streaming/ copies)."""
-    table = versions()
     for ref in refs:
-        for version in table.get(ref.rpartition(".")[2], ()):
-            path = f"{PREFIX}{ref}.{version}"
-            for p in filter(None, (path, streaming_twin(path))):
-                for f in unnamed.pop(path_hash(p), ()):
-                    f.path, f.target = p, classify(p)
+        for p in stored_paths(ref):
+            for f in unnamed.pop(path_hash(p), ()):
+                f.path, f.target = p, classify(p)
         if not unnamed:
             return
 

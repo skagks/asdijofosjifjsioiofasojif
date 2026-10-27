@@ -39,6 +39,10 @@ Output is patched in place in a copy of the current file when the mod's material
 are exactly that file's materials (same names); otherwise it is assembled from the
 rebuilt materials.  Either way it is parsed again and compared with what was meant
 to be written before it is used.
+
+A mod made by moving another one to other equipment (다른 장비로 옮기기, equip.retarget) is
+compared with the current game's files at its moved files' old paths, the ones it was made
+from (``Aliases``): at its new paths are the other equipment's own files.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import Callable
 
 from . import MatfixError, rsz
 from .donors import SAME_FILE_NAME, candidate_paths, find_donor
@@ -520,10 +525,51 @@ class GameShaders:
         return [(name, mmtr) for name, mmtr in pairs if mmtr and self.has(mmtr) is False]
 
 
-def _loose_unit(rel: str, data: bytes, game: GameIndex) -> EntryPlan:
+@dataclass
+class Aliases:
+    """A mod made from another one by moving its files to other equipment (다른 장비로 옮기기,
+    equip.retarget): a moved file is compared with the current game's file at its old path (what
+    the mod was made from), and an RSZ file is looked at as the original shipped it (``restore``)
+    and gets the move again (``forward``) before a repaired copy is written - a repair that takes
+    the game's own file must never undo the move."""
+    paths: dict = field(default_factory=dict)  # a moved loose file's game path (lower case, "/") -> its old one
+    hashes: dict = field(default_factory=dict)  # a moved pak entry's path hash -> its old one
+    # (data, file name or None for a pak entry, the file itself is a moved one) -> the RSZ file with its
+    # references to moved files pointed at their old paths (restore) or at the new ones again (forward)
+    restore: Callable[[bytes, str | None, bool], bytes] | None = None
+    forward: Callable[[bytes, str | None, bool], bytes] | None = None
+
+    def old_path(self, rel: str) -> str | None:
+        return self.paths.get(rel.replace("\\", "/").lower())
+
+
+def _restore(aliases: Aliases | None, data: bytes, name: str | None, moved: bool) -> bytes:
+    if aliases is None or aliases.restore is None:
+        return data
+    try:
+        return aliases.restore(data, name, moved)
+    except Exception:  # looked at as it is (whatever comes out gets the move again)
+        return data
+
+
+def _forward(aliases: Aliases | None, plan: rsz.RszPlan | None, name: str | None, moved: bool) -> None:
+    """A repaired RSZ file of a moved mod gets the move again; one that does not take it is not used."""
+    if aliases is None or aliases.forward is None or plan is None or plan.state != "fixable":
+        return
+    try:
+        plan.data = aliases.forward(plan.data, name, moved)
+    except Exception as exc:  # never write a repair that would put the files back on the old equipment
+        plan.state, plan.data = "stuck", None
+        plan.reason = "다른 장비로 옮긴 경로를 고친 파일에 다시 넣지 못해 복구하지 않습니다"
+        plan.detail = str(exc)
+
+
+def _loose_unit(rel: str, data: bytes, game: GameIndex, old: str | None = None) -> EntryPlan:
     m = MDF2_RE.search(rel)
     version = int(m.group(1))
     base = rel[:m.start()]
+    if old and MDF2_RE.search(old):  # a moved file: the game's file at its old path
+        base = old[:MDF2_RE.search(old).start()]
     donor_path = donor_bytes = donor_version = None
     for candidate in candidate_paths(base):
         found = game.read_versioned(candidate, "mdf2", prefer=(version, CURRENT_VERSION_HINT))
@@ -590,11 +636,14 @@ def _rsz_item(plan: rsz.RszPlan, label: str) -> dict:
 
 
 def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: RszContext,
-               provided) -> tuple[FileResult, bytes | None]:
+               provided, aliases: Aliases | None = None) -> tuple[FileResult, bytes | None]:
     """The result for a loose .user/.pfb/.scn file and the repaired bytes (None: nothing to write)."""
     m = RSZ_RE.search(rel)
     ext, version = m.group(1).lower(), int(m.group(2))
     base = rel[:m.start()]
+    old = aliases.old_path(rel) if aliases is not None else None
+    if old and RSZ_RE.search(old):  # a moved file: the game's file at its old path
+        base = old[:RSZ_RE.search(old).start()]
     donor_path = donor = None
     for candidate in candidate_paths(base):
         found = game.read_versioned(candidate, ext, prefer=(version,))
@@ -602,6 +651,7 @@ def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: RszContex
             donor_path, donor = found
             break
     result = FileResult(key, rel, ext, "current")
+    data = _restore(aliases, data, rel, old is not None)
     p = rszs.plan(rel, data, donor, provided)
     if p is None:
         return result, None  # not an RSZ file after all
@@ -609,6 +659,7 @@ def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: RszContex
     new_version = int(donor_path.rsplit(".", 1)[1]) if donor_path else version
     if p.state == "current" and new_version != version:
         p.state, p.method, p.data = "fixable", "버전 번호", data  # the game reads another version number
+    _forward(aliases, p, rel, old is not None)
     if p.state == "stuck":
         result.state = "stuck"
     elif p.state == "fixable":
@@ -618,7 +669,7 @@ def _rsz_loose(key: str, rel: str, data: bytes, game: GameIndex, rszs: RszContex
     return result, (p.data if p.state == "fixable" else None)
 
 
-def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: RszContext):
+def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: RszContext, aliases: Aliases | None = None):
     """(mdf2 units, RSZ plans) of a mod pak's entries."""
     units, plans = [], []
     for i, h in enumerate(pak.hashes):
@@ -630,27 +681,31 @@ def _pak_units(rel: str, pak: PakFile, game: GameIndex, rszs: RszContext):
         except MatfixError:  # an entry encrypted on its own: nothing we can read
             continue
         label = f"{rel}#{h:016X}"
+        moved = aliases is not None and h in aliases.hashes
+        current = aliases.hashes[h] if moved else h  # a moved entry: the game's file at its old path
         if head in rsz.MAGICS:
-            p = rszs.plan(f"{label}.{rsz.MAGICS[head]}", raw, game.read_hash(h))
+            p = rszs.plan(f"{label}.{rsz.MAGICS[head]}", _restore(aliases, raw, None, moved), game.read_hash(current))
+            _forward(aliases, p, None, moved)
             if p is not None and p.state != "current":
                 plans.append((h, p))
             continue
         version = detect_version(raw, prefer=CURRENT_VERSION_HINT)
         if version is None:
             continue
-        donor = game.read_hash(h)
+        donor = game.read_hash(current)
         donor_version = detect_version(donor, prefer=version) if donor is not None else None
         units.append((h, EntryPlan(label, raw, version, label if donor else None, donor, donor_version,
-                                   donor_hash=h if donor else None)))
+                                   donor_hash=current if donor else None)))
     return units, plans
 
 
 def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: ShaderIndex | None,
               out=None, progress=None, provided: set[str] | None = None,
-              rszs: RszContext | None = None) -> list[FileResult]:
+              rszs: RszContext | None = None, aliases: Aliases | None = None) -> list[FileResult]:
     """Look at (key, game path, stored file) of one mod. With ``out`` (result -> path)
     the repaired files are also written there. ``provided``: lower-cased names (without
     version number) of every file the mod ships, for mods in custom character slots.
+    ``aliases``: the mod's files were moved from other equipment (see Aliases).
     Files other than .mdf2, .user, .pfb, .scn and .pak are ignored."""
     progress = progress or (lambda done, total, msg: None)
     whole_game = shaders.find if shaders is not None else None
@@ -664,12 +719,13 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
             continue
         try:
             if MDF2_RE.search(rel):
-                loose.append((key, _loose_unit(rel, path.read_bytes(), game)))
+                old = aliases.old_path(rel) if aliases is not None else None
+                loose.append((key, _loose_unit(rel, path.read_bytes(), game, old)))
             elif RSZ_RE.search(rel):
-                rsz_files.append(_rsz_loose(key, rel, path.read_bytes(), game, rszs, provided))
+                rsz_files.append(_rsz_loose(key, rel, path.read_bytes(), game, rszs, provided, aliases))
             else:
                 pak = PakFile(path)
-                units, plans = _pak_units(rel, pak, game, rszs)
+                units, plans = _pak_units(rel, pak, game, rszs, aliases)
                 if units or plans:
                     paks.append((key, rel, pak, units, plans))
         except Exception as exc:  # one unreadable file must not stop the rest
@@ -737,20 +793,30 @@ def check_mod(files: list[tuple[str, str, Path]], game: GameIndex, shaders: Shad
     return results
 
 
-def rsz_sources(files: list[tuple[str, str, Path]], game: GameIndex):
-    """(label, kind, the mod's bytes, the game file's path or None, its bytes or None) of every
-    .user/.pfb/.scn of a mod, loose or inside its PAKs - for a diagnostics report."""
+def rsz_sources(files: list[tuple[str, str, Path]], game: GameIndex, aliases: Aliases | None = None):
+    """(label, kind, the mod's bytes, the game file's path or None, its bytes or None, the bytes the
+    check looks at when they are not the mod's or None) of every .user/.pfb/.scn of a mod, loose or
+    inside its PAKs - for a diagnostics report.  With ``aliases`` (a moved mod) each file is paired
+    the way check_mod pairs it: a moved one with the game's file at its old path (old hash), and
+    looked at with the references to moved files pointed at their old paths."""
     for _key, rel, path in files:
         try:
             m = RSZ_RE.search(rel)
             if m:
                 ext, version = m.group(1).lower(), int(m.group(2))
+                base = rel[:m.start()]
+                old = aliases.old_path(rel) if aliases is not None else None
+                if old and RSZ_RE.search(old):  # a moved file: the game's file at its old path
+                    base = old[:RSZ_RE.search(old).start()]
                 found = None
-                for candidate in candidate_paths(rel[:m.start()]):
+                for candidate in candidate_paths(base):
                     found = game.read_versioned(candidate, ext, prefer=(version,))
                     if found is not None:
                         break
-                yield rel, ext, path.read_bytes(), found[0] if found else None, found[1] if found else None
+                data = path.read_bytes()
+                seen = _restore(aliases, data, rel, old is not None)
+                yield (rel, ext, data, found[0] if found else None, found[1] if found else None,
+                       seen if seen != data else None)
             elif is_material_file(rel) and not MDF2_RE.search(rel):
                 pak = PakFile(path)
                 for i, h in enumerate(pak.hashes):
@@ -758,7 +824,12 @@ def rsz_sources(files: list[tuple[str, str, Path]], game: GameIndex):
                         head = pak.head(i)
                         if head in rsz.MAGICS:
                             kind = rsz.MAGICS[head]
-                            yield f"{rel}#{h:016X}.{kind}", kind, pak.read(i), f"#{h:016X}", game.read_hash(h)
+                            moved = aliases is not None and h in aliases.hashes
+                            current = aliases.hashes[h] if moved else h  # as _pak_units
+                            data = pak.read(i)
+                            seen = _restore(aliases, data, None, moved)
+                            yield (f"{rel}#{h:016X}.{kind}", kind, data, f"#{current:016X}", game.read_hash(current),
+                                   seen if seen != data else None)
                     except MatfixError:
                         continue
         except (OSError, MatfixError):

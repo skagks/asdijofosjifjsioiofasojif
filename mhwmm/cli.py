@@ -538,6 +538,91 @@ def cmd_equip_preview(manager: ModManager, args) -> int:
     return 0 if saved else 1
 
 
+def cmd_retarget(manager: ModManager, args) -> int:
+    """다른 장비로 옮기기: a new mod that changes another armor design or weapon model the way a mod changes
+    its own (the original is switched off unless --keep-original)."""
+    from .equip.model import BODIES, PART_LABELS, Target, fallback_label
+    from .equip.retarget import Slot
+
+    def body(t) -> str:
+        head = t.key.partition("/")[0]
+        return head if t.kind == "armor" and head in BODIES else ""
+
+    def with_body(t, b: str):  # armor/004/000 -> armor/f/004/000 (both bodies move together anyway)
+        return Target(t.kind, f"{b}/{t.key}") if t.kind == "armor" and b and not body(t) else t
+
+    def pick(found):  # the one of the body of --to
+        return next((t for t in found if body(t) == body(target)), found[0])
+
+    (mod,) = _resolve(manager, [args.mod])
+    example = "(예: armor/f/087/000, weapon/03/000029)"
+    target = parse_target(args.to)
+    if target is None:
+        raise SystemExit(f"장비를 알 수 없습니다: {args.to} {example}")
+    target = target.item
+    if args.source:
+        source = parse_target(args.source)
+        if source is None:
+            raise SystemExit(f"장비를 알 수 없습니다: {args.source} {example}")
+        source = source.item
+        if source.kind == "armor" and not body(source):  # the body the mod has that design in
+            slot = Slot("armor", source.key)
+            found = [t for t in manager.retarget_sources(mod.id) if Slot.of(t) == slot]
+            source = pick(found) if found else with_body(source, body(target))
+    else:
+        sources = manager.retarget_sources(mod.id)
+        if not sources:
+            print(f"'{mod.name}'은(는) 다른 장비로 옮길 수 있는 방어구나 무기를 바꾸지 않습니다.", file=sys.stderr)
+            return 1
+        if len({Slot.of(t) for t in sources}) > 1:  # (a design's two bodies are one: they move together)
+            raise SystemExit("원래 장비가 여러 개입니다. --from으로 고르세요: " +
+                             ", ".join(f"{t.kind}/{t.key}" for t in sources))
+        source = pick(sources)
+    target = with_body(target, body(source))
+    parts = None
+    if args.parts is not None:
+        labels = {label: part for part, label in PART_LABELS.items()}
+        parts = [labels.get(p.strip(), p.strip().lower()) for p in args.parts.split(",") if p.strip()]
+    shown = [0.0]
+
+    def progress(done, total, msg):
+        if time.time() - shown[0] > 1.0:  # the first run reads the game's data tables
+            shown[0] = time.time()
+            print(msg, file=sys.stderr)
+
+    try:
+        catalog = manager.equipment_catalog(progress)
+    except Exception:  # names are only a help
+        catalog = None
+
+    def label(t) -> str:
+        return f"{(catalog.name(t) if catalog is not None else '') or fallback_label(t)} ({t.kind}/{t.key})"
+
+    plan = manager.plan_retarget(mod.id, source, target, parts)
+    print(f"{mod.name}: {label(source)} → {label(target)}")
+    if plan.source.kind == "armor" and plan.parts:
+        print(f"  부위: {', '.join(PART_LABELS.get(p, p) for p in plan.parts)}")
+    fills = sum(1 for move in plan.moves if move.how == "fill")
+    print(f"  옮길 파일 {len(plan.moves) - fills}개 · " + (f"게임에서 가져올 파일 {fills}개 · " if fills else "") +
+          f"그대로 넣을 파일 {len(plan.kept)}개 · 넣지 않을 파일 {len(plan.dropped)}개")
+    for note in plan.notes:
+        print(f"  참고: {note}")
+    for error in plan.errors:
+        print(f"오류: {error}", file=sys.stderr)
+    if not plan.ok:
+        return 1
+    if args.dry_run:
+        print("(--dry-run: 새 모드는 만들지 않았습니다)")
+        return 0
+    was_on = mod.enabled
+    new = manager.create_retarget(mod.id, source, target, parts, disable_original=not args.keep_original,
+                                  progress=progress)
+    print(f"새 모드: {new.name}  ({len(manager.mod_files(new.id))}개 파일, {'켜짐' if new.enabled else '꺼짐'})")
+    if was_on and not mod.enabled:
+        print(f"원래 모드를 껐습니다: {mod.name}")
+    return _maybe_deploy(manager, args)
+
+
 def _print_findings(findings) -> None:
     for f in findings:
         print(f"• {f.text}")
@@ -979,6 +1064,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-test", type=int, nargs="?", const=SELFTEST_ITEMS, metavar="N",
                    help="게임의 장비 N개로 미리보기를 점검해 결과를 글로 출력 (그림은 저장하지 않음)")
 
+    p = sub.add_parser("retarget", help="다른 장비로 옮기기: 모드가 바꾸는 방어구·무기 대신 다른 장비를 바꾸는 새 모드 "
+                                        "만들기 (원래 모드는 그대로 두고 끔)")
+    p.add_argument("mod", help="모드 id, 번호 또는 이름")
+    p.add_argument("--to", required=True, help="옮길 장비 (예: armor/f/087/000, weapon/03/000029 · 방어구는 같은 체형, "
+                                               "무기는 같은 종류)")
+    p.add_argument("--from", dest="source", help="원래 장비 (모드가 여러 장비를 바꿀 때, 예: armor/f/034/001)")
+    p.add_argument("--parts", help="방어구에서 옮길 부위 (쉼표로, 예: helm,body 또는 머리,몸통 · 생략하면 모든 부위)")
+    p.add_argument("--keep-original", action="store_true", help="원래 모드를 끄지 않음")
+    p.add_argument("--dry-run", action="store_true", help="무엇을 옮기는지만 보여 주고 새 모드는 만들지 않음")
+    p.add_argument("--no-deploy", action="store_true", help="게임 폴더에 바로 적용하지 않음")
+
     p = sub.add_parser("crash", help="게임 튕김 기록: REFramework 기록 모으기 · 의심되는 원인 · 진단 파일")
     p.add_argument("action", choices=("list", "show", "report", "lua"),
                    help="list: 기록 목록 · show [번호]: 의심되는 원인 · report [번호] --out 파일.zip: 진단 파일 저장 · "
@@ -1028,7 +1124,7 @@ COMMANDS = {
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
     "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview, "crash": cmd_crash,
-    "bisect": cmd_bisect, "check": cmd_check,
+    "bisect": cmd_bisect, "check": cmd_check, "retarget": cmd_retarget,
 }
 
 
@@ -1039,7 +1135,8 @@ def changes_mods(args) -> bool:
         return True
     return (args.cmd == "options" and args.set is not None) or (args.cmd == "profile" and bool(args.name)) \
         or (args.cmd == "refw" and args.install) or (args.cmd in ("materials", "matfix")
-                                                       and args.action in ("repair", "restore"))
+                                                       and args.action in ("repair", "restore")) \
+        or (args.cmd == "retarget" and not args.dry_run)
 
 
 def main(argv=None) -> int:

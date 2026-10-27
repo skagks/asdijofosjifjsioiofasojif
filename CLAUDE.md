@@ -62,6 +62,14 @@
       `icons.PICTURE_FORMAT`을, 미리보기 그림이 달라질 수 있는 변경(mesh.py, render.py, look.py)을 하면 `look.PREVIEW_FORMAT`을
       올린다. 그래야 데이터 폴더 `cache\`의 예전 결과를 다시 만든다. 미리보기 캐시 폴더 이름에는 `PICTURE_FORMAT`과
       `SCAN_FORMAT`도 들어 있어(`ModManager.preview_formats`) 텍스처 해석이나 파일 규칙을 바꿔도 미리보기를 다시 그린다.
+  - 다른 장비로 옮기기: `mhwmm/equip/retarget.py`(같은 길이로 장비 번호만 바꾸는 `Renamer`, 무엇을 옮기고·그대로 넣고·빼는지
+    정하는 `plan`(참조를 따라감, 게임 파일로 대상 프리팹이 옮긴 모델을 읽는지 확인, 모델·재질 짝이 모자라면 원래 장비의 게임
+    파일로 `fills` — 모드의 프리팹이 있는 부위는 옮기는 텍스처를 읽는 재질이 없을 때 그 프리팹이 부르는 원래 장비의 재질.
+    PAK의 이름 모르는 항목: 소리 뱅크는 빼고, 모델이나 원래 장비를 가리키는 재질·RSZ면 거절, 나머지는 그대로), 재질·RSZ 안의 경로를 제자리에서 같은 길이로 고치는 `rewrite`, 새 모드 파일·PAK을 쓰는 `build`), 창은
+    `mhwmm/retargetview.py`(원래 모드 끄기는 원래 모드가 새 모드에 없는 것을 하나도 하지 않을 때만 기본으로 켬: `left_behind`), 매니저의 `retarget_*`·`create_retarget`(새 모드, `Mod.retarget` 기록), 재질 점검은 그 기록으로
+    원래 장비의 게임 파일과 비교(`repair.Aliases`, RSZ 복구 결과는 다시 대상 경로로). avp/wvp·소리 파일은 옮기지 않는다
+    (avp의 GUID를 옮기면 장비 화면이 튕길 수 있다는 커뮤니티 보고, 무기 소리 뱅크는 이름만 바꾸면 게임이 읽지 않음).
+    규칙 대부분은 게임 안에서 확인하지 못했고 커뮤니티 도구(MHWmodfixer, Equip Slot Converter)·게임 파일 목록에서 가져왔다
   - `mhwmm/crashlog.py`: REFramework 기록(re2_framework_log·reframework_faulty_files·re2_fw_config) 읽기, 게임 오류 창·
     이벤트 뷰어 문구 인식, 게임 자체 오류 보고서(`<게임>\CrashReport\*.zip`의 CrashReport.txt; 그래픽 오류 등은 이것만 남고
     게임은 종료 코드 0으로 끝남) 읽기. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사
