@@ -67,7 +67,13 @@
     파일로 `fills` — 모드의 프리팹이 있는 부위는 옮기는 텍스처를 읽는 재질이 없을 때 그 프리팹이 부르는 원래 장비의 재질.
     PAK의 이름 모르는 항목: 소리 뱅크는 빼고, 모델이나 원래 장비를 가리키는 재질·RSZ면 거절, 나머지는 그대로), 재질·RSZ 안의 경로를 제자리에서 같은 길이로 고치는 `rewrite`, 새 모드 파일·PAK을 쓰는 `build`), 창은
     `mhwmm/retargetview.py`(원래 모드 끄기는 원래 모드가 새 모드에 없는 것을 하나도 하지 않을 때만 기본으로 켬: `left_behind`), 매니저의 `retarget_*`·`create_retarget`(새 모드, `Mod.retarget` 기록), 재질 점검은 그 기록으로
-    원래 장비의 게임 파일과 비교(`repair.Aliases`, RSZ 복구 결과는 다시 대상 경로로). avp/wvp·소리 파일은 옮기지 않는다
+    원래 장비의 게임 파일과 비교(`repair.Aliases`, RSZ 복구 결과는 다시 대상 경로로).
+    부위마다 다른 장비(방어구만): `plan`의 target이 부위 → Slot 사전(`Plan.targets`·`mixed`, `Move.target`), 부위마다 그 부위의
+    대상으로 확인·채움·알림, 이름 바꾸기는 `MixedRenamer`/`renamer_of`(되돌리기는 `reverse=True`), 고르지 않은 부위의 파일을 서로
+    다른 대상으로 가는 부위들이 함께 쓰면 거절. 기록은 `RETARGET_FORMAT` 2("to"가 문자열이거나 {부위: 키}, 모두 같으면 문자열로
+    저장, 형식 1도 읽음). 옮긴 모드를 다시 옮기면 `_chained_recipe`가 처음 장비부터의 기록 하나로 합침(그대로 둔 파일 `kept`도 —
+    PAK 항목은 해시와 이름 둘 다). 창은 부위 표(고른 행에 목록에서 고른 장비를 입힘), 명령줄은 `--to 부위=장비` 여러 번.
+    무기는 본체·보조를 한 무기로만. avp/wvp·소리 파일은 옮기지 않는다
     (avp의 GUID를 옮기면 장비 화면이 튕길 수 있다는 커뮤니티 보고, 무기 소리 뱅크는 이름만 바꾸면 게임이 읽지 않음).
     규칙 대부분은 게임 안에서 확인하지 못했고 커뮤니티 도구(MHWmodfixer, Equip Slot Converter)·게임 파일 목록에서 가져왔다
   - `mhwmm/crashlog.py`: REFramework 기록(re2_framework_log·reframework_faulty_files·re2_fw_config) 읽기, 게임 오류 창·

@@ -1,17 +1,18 @@
-"""다른 장비로 옮기기 in the GUI: the dialog (원래 장비 and its parts, the searchable list of equipment, what
-the new mod would hold, 원래 모드 끄기), the new mod made through the app, and where it is offered. The
-manager's retarget API is replaced on the instance by fakes (the files themselves: test_equip_retarget.py);
-what the mods change is the real equipment scan of their files."""
+"""다른 장비로 옮기기 in the GUI: the dialog (원래 장비, the table of its parts and the equipment each goes to,
+the searchable list of equipment, what the new mod would hold, 원래 모드 끄기), the new mod made through the
+app, and where it is offered. The manager's retarget API is replaced on the instance by fakes (the files
+themselves: test_equip_retarget.py); what the mods change is the real equipment scan of their files."""
 
 import gc
 import queue
 import threading
 import time
+from collections.abc import Mapping
 
 import pytest
 
 from conftest import make_tree, make_zip
-from mhwmm.equip.model import Target
+from mhwmm.equip.model import PART_LABELS, Target
 from mhwmm.equip.retarget import Move, Plan, RetargetError, Slot
 
 tk = pytest.importorskip("tkinter")
@@ -31,6 +32,7 @@ BODY = CHARACTER + "ch03/004/001/2/ch03_004_0012.mesh.241111606"
 BLADES = "natives/STM/Art/Model/Item/it02/00/0029/it0200_0029_0.mesh.241111606"
 PALICO = CHARACTER + "ch05/062/0000/ch05_062_0000.mesh.241111606"
 AVP = "natives/STM/GameDesign/Equip/_Prefab/Armor/Female/004/001/004_001_avp.user.3"
+PART_FILES = {"helm": HELM, "body": BODY}
 
 
 @pytest.fixture
@@ -88,13 +90,27 @@ class FakeRetarget:
         return list(CHOICES[source.kind])
 
     def name(self, mod_id, target, progress=None):
-        first = dict(CHOICES[target.kind])[target].split(" · ")[0]
-        return f"{self.m.get(mod_id).name} → {first}"
+        def first(t):
+            return dict(CHOICES[t.kind])[t].split(" · ")[0]
+
+        if isinstance(target, Mapping):  # (as the manager names a move of the parts to different equipment)
+            parts = " · ".join(f"{PART_LABELS[p]} {first(t)}" for p, t in target.items())
+            return f"{self.m.get(mod_id).name} → {parts}"
+        return f"{self.m.get(mod_id).name} → {first(target)}"
 
     def plan(self, mod_id, source, target, parts=None, files=None):
         self.plans.append((mod_id, source, target, parts))
         self.files.append(files)
-        a, b = Slot.of(source), Slot.of(target)
+        a = Slot.of(source)
+        if isinstance(target, Mapping):  # each part to its own equipment; 다라 갑옷 has no helm
+            targets = {part: Slot.of(t) for part, t in target.items()}
+            moves = [Move(PART_FILES[part], PART_FILES[part].replace("004/001", slot.key), target=slot)
+                     for part, slot in targets.items()]
+            bad = {part for part, t in target.items() if part == "helm" and t == DARA}
+            return Plan(a, next(iter(targets.values())), parts=tuple(target), moves=moves, targets=targets,
+                        errors=[f"{PART_LABELS[p]}: 대상 장비에는 {PART_LABELS[p]}가 없습니다" for p in bad],
+                        bad_parts=bad, dropped=[(AVP, "외형 설정 파일(_avp.user)은 옮기지 않습니다")])
+        b = Slot.of(target)
         if target == BLADES_C:
             raise RetargetError("모드 파일을 읽지 못했습니다")
         if target == DARA:
@@ -172,9 +188,15 @@ def enabled(button) -> bool:
     return "disabled" not in button.state()
 
 
-def part_boxes(dialog) -> dict:
-    return {str(w.cget("text")).strip(): w for w in dialog.parts_row.winfo_children()
-            if w.winfo_class() == "TCheckbutton"}
+def part_table(dialog) -> list[tuple]:
+    """The table 부위별로 옮길 장비: (부위, 옮길 장비, 번호) per row."""
+    return [tuple(dialog.parts_tree.item(i, "values")) for i in dialog.parts_tree.get_children()]
+
+
+def choose_rows(dialog, *rows):
+    """Select rows of the table (as a click or Ctrl+click does)."""
+    dialog.parts_tree.selection_set(rows)
+    dialog.update()
 
 
 def shown(widget) -> bool:
@@ -191,8 +213,11 @@ def test_dialog_lists_the_equipment_and_shows_the_plan(env):
         pump(root, lambda: isinstance(dialog.choices.get(ARMOR), list) and dialog.tree.get_children())
         assert dialog.source == ARMOR and dialog.source_box.current() == 0
         assert list(dialog.source_box.cget("values")) == ["방어구 004-001 (여성)", "쌍검 모델 00-0029 (쌍검)"]
-        # the parts the mod changes on that design (from the equipment scan), all ticked
-        assert list(part_boxes(dialog)) == ["머리", "몸통"] and all(v.get() for v in dialog.part_vars.values())
+        # a row per part the mod changes on that design (from the equipment scan), all selected, none moved yet
+        assert part_table(dialog) == [("머리", "옮기지 않음", ""), ("몸통", "옮기지 않음", "")]
+        assert dialog.parts_tree.selection() == ("helm", "body")
+        assert dialog.pick_hint.cget("text") == "머리 · 몸통에 입힐 장비를 고르세요"
+        assert not enabled(dialog.all_button) and not enabled(dialog.clear_button)
         assert "남성용·여성용" in dialog.kind_note.cget("text")
         assert rows(dialog) == [("가나 갑옷 · 가나 갑옷 β", "045-002"), ("다라 갑옷", "060-000"), ("로나 갑옷", "050-000")]
         assert dialog.shown_text() == "옮길 장비를 목록에서 고르세요." and not enabled(dialog.create_button)
@@ -207,12 +232,15 @@ def test_dialog_lists_the_equipment_and_shows_the_plan(env):
         dialog.search_var.set("")
         assert len(rows(dialog)) == 3
 
-        # picking one plans it on another thread, from the mod's files read when the dialog opened
+        # picking one gives it to the selected rows (all: the whole design, as one move) and plans it on another
+        # thread, from the mod's files read when the dialog opened
         dialog.tree.selection_set("0")
         root.update()
         assert dialog.target == GANA and dialog.shown_text() == "확인 중..."
+        assert part_table(dialog) == [("머리", "가나 갑옷", "045-002"), ("몸통", "가나 갑옷", "045-002")]
+        assert enabled(dialog.clear_button)
         pump(root, lambda: "옮길 파일" in dialog.shown_text())
-        assert fake.plans == [(mods["Armor"].id, ARMOR, GANA, None)]  # every part ticked: all of them
+        assert fake.plans == [(mods["Armor"].id, ARMOR, GANA, None)]  # every part to it: all of them
         assert set(fake.files[-1]) == {HELM, BODY, BLADES}
         text = dialog.shown_text()
         assert text.startswith("옮길 파일 1개 · 그대로 넣을 파일 1개 · 넣지 않는 파일 2개\n")
@@ -224,25 +252,42 @@ def test_dialog_lists_the_equipment_and_shows_the_plan(env):
         assert "만들 수 없습니다" not in text
         assert enabled(dialog.create_button)
 
-        # a part unticked: only the others are planned; none ticked: nothing to plan
-        part_boxes(dialog)["몸통"].invoke()
-        assert not enabled(dialog.create_button)
+        # a part not moved (옮기지 않기 on its row): only the others are planned, and the text says where each goes;
+        # none: nothing to plan
+        choose_rows(dialog, "body")
+        assert dialog.pick_hint.cget("text") == "몸통에 입힐 장비를 고르세요" and enabled(dialog.all_button)
+        assert dialog.tree.selection() == ("0",)  # (the row's equipment shown in the list)
+        dialog.clear_button.invoke()
+        assert not enabled(dialog.create_button) and not enabled(dialog.clear_button)
+        assert part_table(dialog)[1] == ("몸통", "옮기지 않음", "")
         pump(root, lambda: len(fake.plans) == 2 and "옮길 파일" in dialog.shown_text())
-        assert fake.plans[-1][3] == ("helm",) and enabled(dialog.create_button)
-        part_boxes(dialog)["머리"].invoke()
-        assert dialog.shown_text() == "옮길 부위를 하나 이상 고르세요." and not enabled(dialog.create_button)
-        part_boxes(dialog)["머리"].invoke()
-        part_boxes(dialog)["몸통"].invoke()  # all again: shown at once from before
+        assert fake.plans[-1][2:] == (GANA, ("helm",)) and enabled(dialog.create_button)
+        assert dialog.shown_text().startswith("머리 → 가나 갑옷 (045-002)\n몸통은 옮기지 않습니다\n옮길 파일 1개")
+        assert dialog.tree.selection() == ()
+        choose_rows(dialog, "helm")
+        dialog.clear_button.invoke()
+        assert dialog.shown_text() == "옮길 장비를 목록에서 고르세요." and not enabled(dialog.create_button)
+        dialog.all_button.invoke()
+        assert dialog.parts_tree.selection() == ("helm", "body") and not enabled(dialog.all_button)
+        dialog.tree.selection_set("0")  # all again: shown at once from before
+        root.update()
         assert "옮길 파일" in dialog.shown_text() and enabled(dialog.create_button) and len(fake.plans) == 2
 
-        # a plan with errors cannot be made; one about a part says which box to untick
+        # a plan with errors cannot be made; one about a part says which to leave out
         dialog.tree.selection_set("1")
         pump(root, lambda: "만들 수 없습니다" in dialog.shown_text())
         text = dialog.shown_text()
-        assert "· 대상 장비에는 머리가 없습니다\n'옮길 부위'에서 머리를 끄면 나머지 부위만 옮길 수 있습니다\n" in text
+        assert text.startswith("만들 수 없습니다\n")
+        assert ("· 대상 장비에는 머리가 없습니다\n'부위별로 옮길 장비'에서 머리를 고른 뒤 '옮기지 않기'를 누르거나 다른 "
+                "장비를 고르면 나머지 부위는 그대로 옮길 수 있습니다\n") in text
         assert not enabled(dialog.create_button)
         dialog.ok()  # (the button is off: nothing happens)
         assert dialog.result is None and not dialog.closed
+        # as it says: the part selected in the table, then 옮기지 않기 leaves the other parts as they were
+        choose_rows(dialog, "helm")
+        dialog.clear_button.invoke()
+        assert dialog.assigned == {"body": DARA}
+        dialog.all_button.invoke()
 
         # the chosen equipment stays chosen while a search hides it
         dialog.tree.selection_set("0")
@@ -263,6 +308,141 @@ def test_dialog_lists_the_equipment_and_shows_the_plan(env):
             dialog.destroy()
 
 
+def test_each_part_to_its_own_equipment(env):
+    """부위마다 다른 장비로: the pick goes to the selected rows only; rows of different equipment make one move of
+    each part to its own (planned and made as a mapping), and the text says where each goes."""
+    from mhwmm.retargetview import Choice, RetargetDialog
+
+    app, m, mods, fake = env
+    root = app.root
+    armor = mods["Armor"].id
+    dialog = RetargetDialog(root, app, armor, ARMOR)
+    try:
+        pump(root, lambda: dialog.tree.get_children())
+        # 머리 alone: the pick goes to it; 몸통 is not moved
+        choose_rows(dialog, "helm")
+        assert dialog.pick_hint.cget("text") == "머리에 입힐 장비를 고르세요"
+        assert enabled(dialog.all_button) and not enabled(dialog.clear_button)
+        dialog.tree.selection_set("0")
+        pump(root, lambda: "옮길 파일" in dialog.shown_text())
+        assert part_table(dialog) == [("머리", "가나 갑옷", "045-002"), ("몸통", "옮기지 않음", "")]
+        assert fake.plans[-1] == (armor, ARMOR, GANA, ("helm",))  # (one equipment: as when a part was unticked)
+        assert dialog.shown_text().startswith("머리 → 가나 갑옷 (045-002)\n몸통은 옮기지 않습니다\n")
+
+        # then 몸통 (nothing shown selected in the list: it has no equipment yet) to 로나 갑옷
+        choose_rows(dialog, "body")
+        assert dialog.tree.selection() == () and dialog.pick_hint.cget("text") == "몸통에 입힐 장비를 고르세요"
+        dialog.tree.selection_set("2")
+        root.update()
+        assert dialog.target is None and dialog.assigned == {"helm": GANA, "body": LONA}
+        assert part_table(dialog) == [("머리", "가나 갑옷", "045-002"), ("몸통", "로나 갑옷", "050-000")]
+        pump(root, lambda: enabled(dialog.create_button))
+        assert fake.plans[-1] == (armor, ARMOR, {"helm": GANA, "body": LONA}, None)
+        assert list(fake.plans[-1][2]) == ["helm", "body"]  # (in the game's order)
+        text = dialog.shown_text()
+        assert text.startswith("머리 → 가나 갑옷 (045-002)\n몸통 → 로나 갑옷 (050-000)\n옮길 파일 2개 · ")
+        assert "새 모드: Armor → 머리 가나 갑옷 · 몸통 로나 갑옷\n" in text
+
+        # one row selected: its equipment shown selected in the list; rows of different equipment: none
+        choose_rows(dialog, "helm")
+        assert dialog.tree.selection() == ("0",)
+        choose_rows(dialog, "body")
+        assert dialog.tree.selection() == ("2",)
+        dialog.all_button.invoke()
+        root.update()
+        assert dialog.tree.selection() == () and dialog.pick_hint.cget("text") == "머리 · 몸통에 입힐 장비를 고르세요"
+        assert not enabled(dialog.all_button) and enabled(dialog.clear_button)
+        # a search that hides the rows' equipment: still theirs
+        choose_rows(dialog, "body")
+        dialog.search_var.set("가나")
+        root.update()
+        assert dialog.tree.selection() == () and dialog.assigned == {"helm": GANA, "body": LONA}
+        dialog.search_var.set("")
+        root.update()
+        assert dialog.tree.selection() == ("2",) and enabled(dialog.create_button)
+
+        # an error about one part: its line in red, and what to do about it
+        choose_rows(dialog, "helm")
+        dialog.tree.selection_set("1")
+        pump(root, lambda: "만들 수 없습니다" in dialog.shown_text())
+        text = dialog.shown_text()
+        assert text.startswith("머리 → 다라 갑옷 (060-000)\n몸통 → 로나 갑옷 (050-000)\n만들 수 없습니다\n"
+                               "· 머리: 대상 장비에는 머리가 없습니다\n'부위별로 옮길 장비'에서 머리를 고른 뒤 "
+                               "'옮기지 않기'를 누르거나 다른 장비를 고르면 나머지 부위는 그대로 옮길 수 있습니다\n")
+        assert "error" in dialog.text.tag_names("1.0") and "error" not in dialog.text.tag_names("2.0")
+        assert not enabled(dialog.create_button)
+        planned = len(fake.plans)
+        dialog.tree.selection_set("0")  # back: shown at once from before
+        root.update()
+        assert enabled(dialog.create_button) and len(fake.plans) == planned
+
+        dialog.ok()
+        assert dialog.closed
+        assert dialog.result == Choice(ARMOR, {"helm": GANA, "body": LONA}, None, False,
+                                       "Armor → 머리 가나 갑옷 · 몸통 로나 갑옷")
+    finally:
+        if not dialog.closed:
+            dialog.destroy()
+
+    # made as one mod, the mapping passed on as it is
+    app._create_retarget(armor, dialog.result)
+    pump(root, lambda: fake.created and app.busy is None)
+    assert fake.created == [(armor, ARMOR, {"helm": GANA, "body": LONA}, None, False, True)]
+    assert app.tree.selection() == (m.mods[-1].id,)
+
+
+def test_the_table_works_from_the_keyboard(env):
+    """Tab reaches the table, the arrows move its selection, Return in the list gives the row the equipment
+    the list's keyboard focus is on."""
+    from mhwmm.retargetview import RetargetDialog
+
+    app, m, mods, fake = env
+    root = app.root
+    dialog = RetargetDialog(root, app, mods["Helm"].id)
+    try:
+        dialog.deiconify()
+        pump(root, lambda: dialog.tree.get_children())
+        assert dialog.source_box.tk_focusNext() is dialog.parts_tree
+        # (then the buttons under it when they can be used: not yet, every row is selected and none moved)
+        assert dialog.parts_tree.tk_focusNext() is dialog.search
+        dialog.parts_tree.focus_force()
+        pump(root, lambda: dialog.focus_get() is dialog.parts_tree)
+        assert dialog.parts_tree.focus() == "helm"
+        dialog.parts_tree.event_generate("<Down>")
+        root.update()
+        assert dialog.parts_tree.selection() == ("body",)
+        assert dialog.pick_hint.cget("text") == "몸통에 입힐 장비를 고르세요" and enabled(dialog.all_button)
+        assert dialog.parts_tree.tk_focusNext() is dialog.all_button
+        dialog.tree.focus_force()
+        pump(root, lambda: dialog.focus_get() is dialog.tree)
+        dialog.tree.event_generate("<Return>")
+        root.update()
+        assert dialog.assigned == {"body": GANA} and not dialog.closed
+        pump(root, lambda: enabled(dialog.create_button))
+        assert fake.plans[-1][2:] == (GANA, ("body",))
+        dialog.clear_button.focus_force()  # Return on a button presses it (not 새 모드 만들기)
+        pump(root, lambda: dialog.focus_get() is dialog.clear_button)
+        dialog.clear_button.event_generate("<Return>")
+        root.update()
+        assert dialog.assigned == {} and not dialog.closed
+        dialog.tree.focus_force()
+        pump(root, lambda: dialog.focus_get() is dialog.tree)
+        dialog.tree.event_generate("<Return>")
+        pump(root, lambda: enabled(dialog.create_button))
+        assert dialog.assigned == {"body": GANA}
+        dialog.parts_tree.focus_force()
+        pump(root, lambda: dialog.focus_get() is dialog.parts_tree)
+        dialog.parts_tree.event_generate("<Up>")
+        root.update()
+        assert dialog.parts_tree.selection() == ("helm",) and dialog.tree.selection() == ()
+        dialog.parts_tree.event_generate("<Return>")  # (the dialog's Return: makes the mod)
+        root.update()
+        assert dialog.closed and dialog.result.target == GANA and dialog.result.parts == ("body",)
+    finally:
+        if not dialog.closed:
+            dialog.destroy()
+
+
 def test_dialog_weapons_errors_and_mods_without_equipment(env):
     from mhwmm.retargetview import RetargetDialog
 
@@ -271,18 +451,23 @@ def test_dialog_weapons_errors_and_mods_without_equipment(env):
     dialog = RetargetDialog(root, app, mods["Armor"].id)  # no equipment given: the first one
     try:
         pump(root, lambda: dialog.tree.get_children())
-        assert dialog.source == ARMOR
+        assert dialog.source == ARMOR and shown(dialog.all_button)
         dialog.tree.selection_set("0")
         pump(root, lambda: enabled(dialog.create_button))
-        # another source: its own list (same weapon type), no parts, nothing chosen yet
+        # another source: its own list (same weapon type), one row (its models move together), nothing chosen yet
         dialog.source_box.current(1)
         dialog.source_box.event_generate("<<ComboboxSelected>>")
-        assert dialog.source == WEAPON and dialog.target is None and not dialog.part_vars
+        assert dialog.source == WEAPON and dialog.target is None and dialog.assigned == {}
+        assert part_table(dialog) == [("본체·보조", "옮기지 않음", "")]
+        assert dialog.parts_tree.selection() == ("weapon",) and not shown(dialog.all_button)  # (nothing else)
         assert "본체와 보조" in dialog.kind_note.cget("text") and not enabled(dialog.create_button)
         pump(root, lambda: rows(dialog) == [("쌍검 나", "00-0031"), ("쌍검 다", "00-0044")])
+        assert dialog.pick_hint.cget("text") == "이 무기의 모습을 입힐 무기를 고르세요"
         dialog.tree.selection_set("0")
         pump(root, lambda: enabled(dialog.create_button))
-        assert fake.plans[-1] == (mods["Armor"].id, WEAPON, BLADES_B, None)
+        assert fake.plans[-1] == (mods["Armor"].id, WEAPON, BLADES_B, None)  # (one equipment, as before)
+        assert part_table(dialog) == [("본체·보조", "쌍검 나", "00-0031")]
+        assert not dialog.shown_text().startswith("본체")  # (no per-part lines)
         # a plan that fails says why
         dialog.tree.selection_set("1")
         pump(root, lambda: "확인하지 못했습니다" in dialog.shown_text())
@@ -301,19 +486,27 @@ def test_dialog_weapons_errors_and_mods_without_equipment(env):
 
 
 def test_plan_text_parts_hint_and_fills():
-    """The hint to untick a part only when other parts can still be moved; A's game files that complete a
-    part are counted apart from the mod's own files."""
-    from mhwmm.retargetview import part_hint, plan_text
+    """The hint to leave a part out only when other parts can still be moved; A's game files that complete a
+    part are counted apart from the mod's own files; where each part goes when they do not all go to one."""
+    from mhwmm.retargetview import mapping_lines, part_hint, plan_text
 
     a, b = Slot.of(ARMOR), Slot.of(DARA)
     bad = Plan(a, b, moves=[Move(HELM, HELM)], errors=["대상 장비에는 팔이 없습니다"], bad_parts={"arm", "helm"})
-    assert part_hint(bad, ["helm", "body", "arm"]) == "'옮길 부위'에서 머리·팔을 끄면 나머지 부위만 옮길 수 있습니다"
+    assert part_hint(bad, ["helm", "body", "arm"]) == ("'부위별로 옮길 장비'에서 머리·팔을 고른 뒤 '옮기지 않기'를 "
+                                                       "누르거나 다른 장비를 고르면 나머지 부위는 그대로 옮길 수 있습니다")
     assert part_hint(bad, ["helm", "arm"]) == ""  # (nothing would be left)
     assert part_hint(bad, ["helm"]) == "" and part_hint(bad, []) == ""
-    assert part_hint(Plan(a, b, errors=["x"], bad_parts={"body"}), ["helm", "body"]).endswith("몸통을 끄면 나머지 "
-                                                                                              "부위만 옮길 수 있습니다")
+    assert part_hint(Plan(a, b, errors=["x"], bad_parts={"body"}), ["helm", "body"]).startswith(
+        "'부위별로 옮길 장비'에서 몸통을 고른 뒤")
     assert part_hint(Plan(a, b, errors=["x"]), ["helm", "body"]) == ""  # (an error about no part)
-    assert "'옮길 부위'" not in "".join(text for text, _tags in plan_text(bad, "", ["helm"]))
+    # the line above the list stays one line (the window does not grow while rows are clicked)
+    from types import SimpleNamespace
+    from mhwmm.retargetview import RetargetDialog
+    six = SimpleNamespace(part_rows=["helm", "body", "arm", "waist", "leg", "slinger"])
+    assert RetargetDialog._pick_hint(six, six.part_rows) == "모든 부위에 입힐 장비를 고르세요"
+    assert RetargetDialog._pick_hint(six, six.part_rows[1:]) == "부위 5개에 입힐 장비를 고르세요"
+    assert RetargetDialog._pick_hint(six, ["helm", "body", "arm"]) == "머리 · 몸통 · 팔에 입힐 장비를 고르세요"
+    assert "'옮기지 않기'" not in "".join(text for text, _tags in plan_text(bad, "", ["helm"]))
 
     fill = BODY.replace(".mesh.241111606", ".mdf2.45")
     filled = Plan(a, Slot.of(LONA), moves=[Move(BODY, BODY.replace("004/001", "050/000")),
@@ -321,6 +514,28 @@ def test_plan_text_parts_hint_and_fills():
     text = "".join(text for text, _tags in plan_text(filled, "Helm → 로나 갑옷"))
     assert text.startswith("옮길 파일 1개 · 원래 장비의 게임 파일로 채움 1개\nch03_004_0012.mesh → ")
     assert "ch03_004_0012.mdf2" not in text and "새 모드: Helm → 로나 갑옷" in text
+
+    # the per-part lines: none when every row goes to one equipment (the new mod's name says where)
+    names = dict(CHOICES["armor"])
+    assert mapping_lines(["helm", "body"], {"helm": GANA, "body": GANA}, names) == []
+    assert mapping_lines(["helm", "body"], {}, names) == []
+    assert mapping_lines(["helm", "body", "arm", "waist"], {"helm": GANA, "body": DARA}, names) == [
+        ("helm", "머리 → 가나 갑옷 (045-002)"), ("body", "몸통 → 다라 갑옷 (060-000)"), (None, "팔·허리는 옮기지 않습니다")]
+    assert mapping_lines(["helm", "body"], {"body": GANA}, {}) == [("body", "몸통 → 045-002"),
+                                                                  (None, "머리는 옮기지 않습니다")]
+    mapping = mapping_lines(["helm", "body"], {"helm": DARA, "body": LONA}, names)
+    mixed = Plan(a, b, parts=("helm", "body"), moves=[Move(HELM, HELM), Move(BODY, BODY)],
+                 errors=["머리: 대상 장비에는 머리가 없습니다"], bad_parts={"helm"},
+                 targets={"helm": b, "body": Slot.of(LONA)})
+    pieces = plan_text(mixed, "", ["helm", "body"], mapping)
+    assert pieces[:4] == [("머리 → 다라 갑옷 (060-000)\n", ("error",)), ("몸통 → 로나 갑옷 (050-000)\n", ()),
+                          ("만들 수 없습니다\n", ("heading_error", "gap")),
+                          ("· 머리: 대상 장비에는 머리가 없습니다\n", ("error",))]
+    assert pieces[4][0].startswith("'부위별로 옮길 장비'에서 머리를 고른 뒤") and pieces[5][1] == ("lead", "gap")
+    pieces = plan_text(Plan(a, b, parts=("helm",), moves=[Move(HELM, HELM)]), "", ["helm"],
+                       mapping_lines(["helm", "body"], {"helm": GANA}, names))
+    assert pieces[:3] == [("머리 → 가나 갑옷 (045-002)\n", ()), ("몸통은 옮기지 않습니다\n", ("muted",)),
+                          ("옮길 파일 1개\n", ("lead", "gap"))]
 
 
 def test_original_off_by_default_only_when_nothing_else_is_lost(env):
@@ -345,14 +560,18 @@ def test_original_off_by_default_only_when_nothing_else_is_lost(env):
         pump(root, lambda: "옮길 파일" in dialog.shown_text())
         assert not dialog.off_var.get()
         assert dialog.off_why.cget("text") == "원래 모드에는 새 모드에 들어가지 않는 파일(스크립트·플러그인)도 있습니다"
-        part_boxes(dialog)["몸통"].invoke()  # (a part not chosen: the same)
+        choose_rows(dialog, "body")
+        dialog.clear_button.invoke()  # (a part not moved: the same)
         pump(root, lambda: "옮길 파일" in dialog.shown_text())
         assert not dialog.off_var.get()
         dialog.off_check.invoke()  # the user's choice stays
+        choose_rows(dialog, "helm")
         dialog.tree.selection_set("2")
         pump(root, lambda: enabled(dialog.create_button))
-        part_boxes(dialog)["몸통"].invoke()
-        pump(root, lambda: enabled(dialog.create_button))
+        assert dialog.assigned == {"helm": LONA}
+        dialog.all_button.invoke()
+        dialog.tree.selection_set("2")
+        pump(root, lambda: enabled(dialog.create_button) and dialog.assigned == {"helm": LONA, "body": LONA})
         assert dialog.off_var.get()
         dialog.off_check.invoke()
         dialog.tree.selection_set("2")

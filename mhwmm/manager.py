@@ -20,6 +20,7 @@ import time
 import urllib.parse
 import uuid
 import zipfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
@@ -40,7 +41,7 @@ from .equip import scan as equip_scan
 from .equip import selftest as equip_selftest
 from .equip import tex as equip_tex
 from .equip import userdata as equip_userdata
-from .equip.model import PART_LABELS, Target, fallback_label
+from .equip.model import ARMOR_PARTS, BODIES, PART_LABELS, WEAPON_PARTS, Target, fallback_label
 from .equip.paths import normalize as normalize_path
 from .matfix import MatfixError, rsz
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
@@ -61,6 +62,7 @@ MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay a
 OPTION_PREVIEWS = "previews"  # per mod: the pictures of its options, named after the option id
 # 다른 장비로 옮기기 of an armor key without its body ("004/001"): its recipe could not be read afterwards
 RETARGET_BODY = "방어구는 체형까지 적어 주세요 (예: armor/f/087/000)"
+RETARGET_NAMED = 3  # the name of a mod moved part by part to more pieces of equipment says "<the first> 외 N부위"
 MAX_ARCHIVE_DIRS = 8
 # Version of the check/repair rules: records made with older rules count as unchecked, so every
 # mod is checked again (and repairs offered again) after an update. Raise it whenever a change
@@ -86,21 +88,62 @@ def shader_key(mmtr: str) -> str:
     return mmtr.replace("\\", "/").strip("/").lower()
 
 
+def _part_targets(kind: str, to: dict) -> dict[str, equip_retarget.Slot]:
+    """part -> the equipment it went to, of a recipe whose "to" is a map (부위마다 다른 장비로, format 2), in
+    ARMOR_PARTS order. ValueError for one that does not read (not armor, not a part, a key without its body)."""
+    if kind != "armor" or not to:
+        raise ValueError("parts")
+    targets = {}
+    for part, key in to.items():
+        slot = equip_retarget.Slot.of(Target(kind, str(key)))
+        if part not in ARMOR_PARTS or slot is None:
+            raise ValueError(f"{part}: {key}")
+        targets[part] = slot
+    return {part: targets[part] for part in ARMOR_PARTS if part in targets}
+
+
+def _recipe_targets(recipe: dict, parts=()) -> dict[str, equip_retarget.Slot]:
+    """part -> the equipment a recipe's move took it to: its "to" map, or its one "to" for each of its
+    "parts" (``parts`` when it lists none)."""
+    to = recipe["to"]
+    if isinstance(to, dict):
+        return _part_targets(recipe["kind"], to)
+    slot = equip_retarget.Slot.of(Target(recipe["kind"], str(to)))
+    if slot is None:
+        raise ValueError("equipment")
+    return {str(part): slot for part in recipe.get("parts") or parts}
+
+
+def _recipe_to_text(recipe: dict) -> str:
+    """A recipe's "to" as the diagnostics report says it: "f/004/000" or "머리 f/045/002 · 몸통 f/087/000"."""
+    to = recipe.get("to")
+    if isinstance(to, dict):
+        return " · ".join(f"{PART_LABELS.get(part, part)} {key}" for part, key in to.items())
+    return str(to)
+
+
 def retarget_aliases(recipe: dict) -> Aliases:
     """What the material check needs of a mod create_retarget made (Mod.retarget): its moved files are
     compared with the game's files at their old paths, and an RSZ file is looked at with the old paths
-    and gets the new ones again (equip.retarget's same-length rewrite). ValueError (Korean) for a recipe
-    that does not read: checked like any other mod, a repair could put the original equipment's paths
-    back."""
+    and gets the new ones again (equip.retarget's same-length rewrite; a mod whose parts went to different
+    equipment, "to" a part -> target map, with each part's own). ValueError (Korean) for a recipe that does
+    not read: checked like any other mod, a repair could put the original equipment's paths back."""
     try:
         kind = recipe["kind"]
         source = equip_retarget.Slot.of(Target(kind, str(recipe["from"])))
-        target = equip_retarget.Slot.of(Target(kind, str(recipe["to"])))
-        if source is None or target is None:
+        if source is None:
             raise ValueError("equipment")
-        parts = recipe.get("parts") if kind == "armor" else None
-        forward = equip_retarget.Renamer(source, target, parts)
-        back = equip_retarget.Renamer(target, source, parts)
+        if isinstance(recipe["to"], dict):  # 부위마다 다른 장비로 (format 2)
+            targets = _part_targets(kind, recipe["to"])
+            forward = equip_retarget.renamer_of(source, targets)
+            back = equip_retarget.renamer_of(source, targets, reverse=True)
+        else:  # every part to one piece of equipment (and every recipe of format 1)
+            target = equip_retarget.Slot.of(Target(kind, str(recipe["to"])))
+            if target is None:
+                raise ValueError("equipment")
+            parts = recipe.get("parts") if kind == "armor" else None
+            forward = equip_retarget.Renamer(source, target, parts)
+            back = equip_retarget.Renamer(target, source, parts)
         moves = [(str(new), str(old)) for new, old in recipe.get("moves") or ()]
         hashes = {int(new): int(old) for new, old in recipe.get("pak_moves") or ()}
     except (KeyError, TypeError, ValueError, AttributeError, equip_retarget.RetargetError) as exc:
@@ -112,29 +155,59 @@ def retarget_aliases(recipe: dict) -> Aliases:
                    lambda data, name, moved: equip_retarget.rewrite(data, name, to_new, forward if moved else None)[0])
 
 
-def _chained_recipe(first: dict, then: dict) -> dict:
+def _chained_recipe(first: dict, then: dict, kept=()) -> dict:
     """The recipe of a mod made by moving a mod that was itself moved (``first``: that one's recipe): one
     move from where ``first``'s files came from, so that the material check compares with the game files
     the mod was made for. A file of the first move is found whatever its spelling now (a repair may have
-    given it another version number) and gets the original equipment's path in that spelling. {} when the
-    files are back at those paths (a mod like any other); ``then`` alone when ``first`` does not read or
-    did not move the files to where ``then`` moved them from."""
+    given it another version number) and gets the original equipment's path in that spelling.
+    ``kept``: the files ``then`` put in as they were (loose game paths, pak entry hashes, a named pak
+    entry by both); those the first move put where they are stay its moves (a part it took elsewhere than ``then`` moved from).
+    The parts: those ``then`` took from where the first move put them, to ``then``'s targets, and those
+    the first move took elsewhere, to theirs (their files and names are still there); one the first move
+    did not take has the original's names still, one ``then`` took back to the original equipment is a
+    file like any other mod's: {} when no file is a moved one. ``then`` alone when ``first`` does not read
+    or did not move any part to where ``then`` moved them from (or the parts ``then`` moved without the
+    first one went to several pieces of equipment: one recipe cannot say so)."""
     try:
         kind = then["kind"]
         if first["kind"] != kind:
             raise ValueError(first["kind"])
         origin = Target(kind, str(first["from"]))
-        a, b = equip_retarget.Slot.of(origin), equip_retarget.Slot.of(Target(kind, str(first["to"])))
-        if a is None or b is None or b != equip_retarget.Slot.of(Target(kind, str(then["from"]))):
+        a, middle = equip_retarget.Slot.of(origin), equip_retarget.Slot.of(Target(kind, str(then["from"])))
+        before, after = _recipe_targets(first, then["parts"]), _recipe_targets(then)
+        if a is None or middle is None or middle not in before.values():
             raise ValueError("equipment")
-        back = equip_retarget.Renamer(b, a)  # the middle equipment's ids -> the original's
+        keys = {}  # each target -> its key as the recipes spell it
+        for recipe, targets in ((then, after), (first, before)):
+            if isinstance(recipe["to"], dict):
+                for part, slot in targets.items():
+                    keys.setdefault(slot, str(recipe["to"][part]))
+            else:
+                slot = equip_retarget.Slot.of(Target(kind, str(recipe["to"])))
+                if slot is None:
+                    raise ValueError("equipment")
+                keys.setdefault(slot, str(recipe["to"]))
+        ends = {after[part] for part in after} if isinstance(then["to"], dict) else \
+            {equip_retarget.Slot.of(Target(kind, str(then["to"])))}
+        back = equip_retarget.Renamer(middle, a)  # the middle equipment's ids -> the original's
         firsts = {normalize_path(str(new)): str(old) for new, old in first.get("moves") or ()}
         hashes = {int(new): int(old) for new, old in first.get("pak_moves") or ()}
-        before = set(first.get("parts") or then["parts"])
     except (KeyError, TypeError, ValueError, AttributeError, equip_retarget.RetargetError):
         return then
-    if a == equip_retarget.Slot.of(Target(kind, str(then["to"]))):
+    elsewhere = {part: slot for part, slot in before.items() if slot != middle}
+    if ends == {a} and not elsewhere:  # back where they came from
         return {}
+    chained = {part: slot for part, slot in after.items() if before.get(part) == middle and slot != a}
+    chained.update((part, slot) for part, slot in elsewhere.items() if part not in chained)
+    order = ARMOR_PARTS + WEAPON_PARTS
+    chained = {part: chained[part] for part in sorted(chained, key=lambda p: order.index(p) if p in order else
+                                                       len(order))}
+    if len(set(chained.values())) > 1:
+        to = {part: keys[slot] for part, slot in chained.items()}
+    elif len(set(chained.values()) or ends - {a}) == 1:
+        to = keys[next(iter(set(chained.values()) or ends - {a}))]
+    else:
+        return then
 
     def old_path(path: str) -> str:
         was = firsts.get(normalize_path(path))
@@ -146,9 +219,61 @@ def _chained_recipe(first: dict, then: dict) -> dict:
             renamed = None
         return renamed if renamed is not None and normalize_path(renamed) == normalize_path(was) else was
 
-    return {**then, "from": origin.key, "parts": [p for p in then["parts"] if p in before],
-            "moves": [[new, old_path(old)] for new, old in then["moves"]],
-            "pak_moves": [[new, hashes.get(old, old)] for new, old in then["pak_moves"]]}
+    moves = [[new, old_path(old)] for new, old in then["moves"]]
+    pak_moves = [[new, hashes.get(old, old)] for new, old in then["pak_moves"]]
+    for file in kept:  # (where the first move put it)
+        if isinstance(file, int) and file in hashes:
+            pak_moves.append([file, hashes[file]])
+        elif isinstance(file, str) and normalize_path(file) in firsts:
+            moves.append([file, old_path(file)])
+    moves = [[new, old] for new, old in moves if normalize_path(new) != normalize_path(old)]
+    pak_moves = [[new, old] for new, old in pak_moves if new != old]
+    if not moves and not pak_moves:  # every file back where it came from (or never moved)
+        return {}
+    return {**then, "from": origin.key, "to": to, "parts": list(chained), "moves": moves, "pak_moves": pak_moves}
+
+
+def _retarget_target(source: Target, target, parts=None):
+    """``target`` as plan_retarget, create_retarget and retarget_name take it -> (target, parts, errors,
+    the parts the errors name): one piece of equipment (a Target, ``parts`` as given), or for armor parts
+    moved to different ones (부위마다 다른 장비로) a part -> Target map in ARMOR_PARTS order (``parts`` as
+    given: equip.retarget.plan wants None or the map's parts).
+    A map of every part to one piece of equipment is that one with the map's parts (a weapon's main and sub
+    to one weapon: that weapon). The errors (Korean) of a map are those equip.retarget.plan does not say:
+    a value that is not a Target, an armor key without its body or with another body than ``source``'s
+    (the recipe keeps the keys)."""
+    if not isinstance(target, Mapping):
+        return target, parts, [], set()
+    mapping = dict(target)
+    wrong = [value for value in mapping.values() if not isinstance(value, Target)]
+    if wrong:
+        return mapping, parts, [f"옮길 수 없는 장비입니다 ({wrong[0]})"], set()
+    order = ARMOR_PARTS if source.kind == "armor" else WEAPON_PARTS
+    mapping = {part: mapping[part].item  # (sorted is stable: what is not a part stays as given, at the end)
+               for part in sorted(mapping, key=lambda p: order.index(p) if p in order else len(order))}
+    items = set(mapping.values())
+    if source.kind == "weapon":
+        if len(items) == 1 and set(mapping) == set(WEAPON_PARTS):
+            return next(iter(items)), None, [], set()
+        return mapping, parts, [], set()  # (plan says why not)
+    if source.kind != "armor" or any(part not in ARMOR_PARTS for part in mapping) or (
+            parts is not None and set(parts) != set(mapping)):
+        return mapping, parts, [], set()
+    if any(t.kind == "armor" and equip_retarget.Slot.of(t) is None and
+           equip_retarget.Slot(t.kind, t.key).valid for t in (source, *items)):
+        return mapping, parts, [RETARGET_BODY], set()
+    body = source.key.partition("/")[0]
+    errors, bad = [], set()
+    for part, t in mapping.items():
+        other = t.key.partition("/")[0]
+        if t.kind == "armor" and body in BODIES and other in BODIES and other != body:
+            errors.append(f"{PART_LABELS[part]}: 원래 장비와 체형이 다른 장비입니다 ({t.kind}/{t.key})")
+            bad.add(part)
+    if errors:
+        return mapping, parts, errors, bad
+    if len(items) == 1:
+        return next(iter(items)), list(mapping), [], set()
+    return mapping, parts, [], set()
 
 
 def _children(folder: Path) -> list[Path]:
@@ -416,8 +541,9 @@ class Mod:
     # the archive's option pictures were looked for (installs since 1.12.0 and read_option_pictures)
     pictures_read: bool = False
     # 다른 장비로 옮기기: how create_retarget made this mod from another one (empty for every other mod):
-    # {"format", "kind", "from", "to" (Target keys; "from" is where the files first came from), "parts",
-    #  "source_mod", "source_name", "moves": [[new game path, old one]], "pak_moves": [[new pak entry hash, old one]]}
+    # {"format", "kind", "from", "to" (Target keys; "from" is where the files first came from; "to" of armor
+    #  parts moved to different equipment, format 2: {part: key}), "parts" (the parts moved), "source_mod",
+    #  "source_name", "moves": [[new game path, old one]], "pak_moves": [[new pak entry hash, old one]]}
     retarget: dict = field(default_factory=dict)
 
     @property
@@ -1489,8 +1615,8 @@ class ModManager:
             except ValueError as exc:  # (the check did not look at it either)
                 moved = {"error": str(exc)}
             else:
-                moved = {"note": f"다른 장비로 옮긴 모드입니다 ({recipe.get('from')} → {recipe.get('to')}). 점검은 "
-                                 "옮긴 파일을 원래 장비의 게임 파일(game/)과 비교하고, 안의 경로를 원래 장비의 "
+                moved = {"note": f"다른 장비로 옮긴 모드입니다 ({recipe.get('from')} → {_recipe_to_text(recipe)}). "
+                                 "점검은 옮긴 파일을 원래 장비의 게임 파일(game/)과 비교하고, 안의 경로를 원래 장비의 "
                                  "경로로 되돌린 내용(restored/)으로 봅니다"}
             moved["recipe"] = {k: v for k, v in recipe.items() if k not in ("moves", "pak_moves")}
         count, compared = 0, {}
@@ -2116,25 +2242,42 @@ class ModManager:
                 out.append((target, " · ".join(names) or fallback_label(target)))
         return sorted(out, key=lambda choice: (choice[1].casefold(), choice[0]))
 
-    def plan_retarget(self, mod_id: str, source: Target, target: Target, parts=None,
+    def plan_retarget(self, mod_id: str, source: Target, target: Target | Mapping[str, Target], parts=None,
                       files: dict | None = None) -> equip_retarget.Plan:
         """What moving mod ``mod_id`` from ``source`` to ``target`` would do (equip.retarget.plan; ``parts``:
-        the armor parts to move, None: all), checked against the game's own files of the target when the
-        game can be read. ``files``: the mod's files ({game path: stored file or (stored file, key)}) taken
-        on the GUI thread (equipment_job(mod_id).files) - None: mod_entries now, so on the GUI thread.
-        With ``files`` thread-safe: reads those files, the path list and the game; changes nothing."""
+        the armor parts to move, None: all). ``target``: one piece of equipment, or for armor a part ->
+        Target map (부위마다 다른 장비로: each part to its own, the parts not in it stay; ``parts`` then None
+        or its parts; each Target of the source's body; a weapon's main and sub to one weapon is a move to
+        it). Checked against the game's own files of the targets when the game can be read. ``files``: the
+        mod's files ({game path: stored file or (stored file, key)}) taken on the GUI thread
+        (equipment_job(mod_id).files) - None: mod_entries now, so on the GUI thread. With ``files``
+        thread-safe: reads those files, the path list and the game; changes nothing."""
         return self._plan_retarget(mod_id, source, target, parts, files)[0]
 
-    def _plan_retarget(self, mod_id: str, source: Target, target: Target, parts, files: dict | None = None):
+    def _plan_retarget(self, mod_id: str, source: Target, target, parts, files: dict | None = None):
         def slot(t: Target) -> equip_retarget.Slot:  # (one that cannot be moved gets why_not's reason)
             return equip_retarget.Slot.of(t) or equip_retarget.Slot(t.kind, t.key)
 
-        a, b = slot(source), slot(target)
-        bodiless = any(t.kind == "armor" and equip_retarget.Slot.of(t) is None and slot(t).valid
-                       for t in (source, target))
-        problem = RETARGET_BODY if bodiless else equip_retarget.why_not(a, b)
-        if problem:
-            return equip_retarget.Plan(a, b, errors=[problem]), []
+        target, parts, problems, bad = _retarget_target(source, target, parts)
+        a = slot(source)
+        if isinstance(target, dict):  # each part to its own (plan names the part of a target it refuses)
+            b = {part: slot(t) if isinstance(t, Target) else t for part, t in target.items()}
+            first = next((s for s in b.values() if isinstance(s, equip_retarget.Slot)), a)
+
+            def refused(errors: list[str]) -> equip_retarget.Plan:
+                return equip_retarget.Plan(a, first, parts=tuple(b), errors=list(errors), bad_parts=set(bad),
+                                           targets={p: s for p, s in b.items() if isinstance(s, equip_retarget.Slot)})
+            problem = None
+        else:
+            b = slot(target)
+            bodiless = any(t.kind == "armor" and equip_retarget.Slot.of(t) is None and slot(t).valid
+                           for t in (source, target))
+            problem = RETARGET_BODY if bodiless else equip_retarget.why_not(a, b)
+
+            def refused(errors: list[str]) -> equip_retarget.Plan:
+                return equip_retarget.Plan(a, b, errors=list(errors))
+        if problems or problem:
+            return refused(problems or [problem]), []
         entries = self.mod_entries(mod_id) if files is None else files
         index = None
         if any(is_root_pak(rel) for rel in entries):
@@ -2145,7 +2288,7 @@ class ModManager:
         try:
             items = equip_retarget.items_of(entries, index)
         except equip_retarget.RetargetError as exc:
-            return equip_retarget.Plan(a, b, errors=[str(exc)]), []
+            return refused([str(exc)]), []
         try:
             game = self._equip_game()
         except Exception as exc:  # the target is then not checked (the plan says so)
@@ -2160,32 +2303,58 @@ class ModManager:
             log.warning("장비 이름을 읽지 못했습니다: %s", exc)
             return None
 
-    def retarget_name(self, mod_id: str, target: Target, progress: ProgressFn | None = None) -> str:
+    def retarget_name(self, mod_id: str, target: Target | Mapping[str, Target],
+                      progress: ProgressFn | None = None) -> str:
         """The name create_retarget gives the mod it makes of mod ``mod_id`` for ``target``: "<mod> →
-        <the target's first name>" (by number without the game's names), with a number when that is taken.
-        Reads the catalog as retarget_choices does: quick once that has run (before, on a worker thread)."""
+        <the target's first name>" (by number without the game's names); for parts moved to different
+        equipment (a part -> Target map) "<mod> → 머리 호프 · 몸통 고어" (the parts going to one piece
+        together, "머리·팔 호프", in ARMOR_PARTS order; of more than RETARGET_NAMED pieces only the first, "외
+        N부위"); with a number when that is taken. Reads the catalog as retarget_choices does: quick once
+        that has run (before, on a worker thread)."""
         catalog = self._retarget_catalog(progress)
-        target = target.item
-        label = (catalog.name(target) if catalog is not None else "") or fallback_label(target)
-        return self._unique_name(f"{self.get(mod_id).name} → {label}")
 
-    def create_retarget(self, mod_id: str, source: Target, target: Target, parts=None, disable_original: bool = True,
-                        enable: bool = True, progress: ProgressFn | None = None) -> Mod:
+        def label(t: Target) -> str:
+            t = t.item
+            return (catalog.name(t) if catalog is not None else "") or fallback_label(t)
+
+        if isinstance(target, Mapping):
+            order = ARMOR_PARTS + WEAPON_PARTS
+            groups: dict[Target, list[str]] = {}
+            for part in sorted(target, key=lambda p: order.index(p) if p in order else len(order)):
+                groups.setdefault(target[part].item, []).append(part)
+            if len(groups) == 1:  # every part to one: named as a move to it
+                target = next(iter(groups))
+            else:
+                named = [f"{'·'.join(PART_LABELS.get(p, str(p)) for p in parts)} {label(t)}"
+                         for t, parts in groups.items()]
+                text = " · ".join(named)
+                if len(groups) > RETARGET_NAMED:
+                    text = f"{named[0]} 외 {len(target) - len(next(iter(groups.values())))}부위"
+                return self._unique_name(f"{self.get(mod_id).name} → {text}")
+        return self._unique_name(f"{self.get(mod_id).name} → {label(target)}")
+
+    def create_retarget(self, mod_id: str, source: Target, target: Target | Mapping[str, Target], parts=None,
+                        disable_original: bool = True, enable: bool = True,
+                        progress: ProgressFn | None = None) -> Mod:
         """Make a new mod that changes ``target`` the way mod ``mod_id`` changes ``source`` (plan_retarget,
-        planned again): its files are built in a new folder under temp and installed as one mod without
-        options named as retarget_name says, with the original's author, description, version, category and
-        picture (not its Nexus link or update), right after the original in the load order; ``enable``
-        switches it on (whether the original is on or not), ``disable_original`` switches the original
-        off. Its recipe (Mod.retarget) makes the material check compare it with the original equipment's
-        game files (for a mod that was itself moved, those its files first came from). InstallError with
-        the plan's errors. The callers check bisect.BLOCKED first; like install_package it may run on a
-        worker thread while nothing else changes the mods."""
+        planned again; ``target`` as there: one piece of equipment, or a part -> Target map for armor parts
+        moved to different ones): its files are built in a new folder under temp and installed as one mod
+        without options named as retarget_name says, with the original's author, description, version,
+        category and picture (not its Nexus link or update), right after the original in the load order;
+        ``enable`` switches it on (whether the original is on or not), ``disable_original`` switches the
+        original off. Its recipe (Mod.retarget; a map of every part to one piece of equipment kept as a move
+        to it) makes the material check compare it with the original equipment's game files (for a mod
+        that was itself moved, those its files first came from). InstallError with the plan's errors. The
+        callers check bisect.BLOCKED first; like install_package it may run on a worker thread while
+        nothing else changes the mods."""
         progress = progress or (lambda done, total, msg: None)
         original = self.get(mod_id)
         progress(0, 0, "옮길 파일 확인 중...")
         plan, items = self._plan_retarget(mod_id, source, target, parts)
         if not plan.ok:
             raise InstallError("\n".join(plan.errors) or "옮길 파일이 없습니다.")
+        target = _retarget_target(source, target, parts)[0]  # (the uniform form of a map of every part to one)
+        to = {part: t.key for part, t in target.items()} if isinstance(target, dict) else target.item.key
         name = self.retarget_name(mod_id, target, progress)
         new_id = uuid.uuid4().hex[:10]
         self.temp_root.mkdir(parents=True, exist_ok=True)
@@ -2206,11 +2375,20 @@ class ModManager:
             mod.lua_scanned = True
             mod.retarget = {
                 "format": equip_retarget.RETARGET_FORMAT, "kind": plan.source.kind, "from": source.item.key,
-                "to": target.item.key, "parts": list(plan.parts), "source_mod": original.id,
+                "to": to, "parts": list(plan.parts), "source_mod": original.id,
                 "source_name": original.name, "moves": [[new, old] for new, old in built.moves],
                 "pak_moves": [[new, old] for new, old in built.pak_moves]}
             if original.retarget:  # moved again: from where the files first came from
-                mod.retarget = _chained_recipe(original.retarget, mod.retarget)
+                names = set(plan.kept)  # (as Plan.kept names them)
+                kept = []  # (a named pak entry by its name too: the recipe's moves rename its references)
+                for item in items:
+                    if (item.path if item.path is not None else f"{item.pak}#{item.hash64:016X}") not in names:
+                        continue
+                    if item.pak is not None and item.hash64 is not None:
+                        kept.append(item.hash64)
+                    if item.path is not None:
+                        kept.append(item.path)
+                mod.retarget = _chained_recipe(original.retarget, mod.retarget, kept)
             self._write_mod_meta(mod, stage)
             os.replace(stage, self.mod_dir(new_id))
         except BaseException:

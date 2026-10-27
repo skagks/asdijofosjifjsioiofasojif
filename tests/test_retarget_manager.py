@@ -18,7 +18,7 @@ from conftest import write
 from equip_game_fixtures import pfb_file
 from mhwmm import bisect, matfix
 from mhwmm.cli import main
-from mhwmm.equip import retarget
+from mhwmm.equip import pathlist as equip_pathlist, retarget
 from mhwmm.equip.model import Target
 from mhwmm.manager import RETARGET_BODY, InstallError, ModManager, _chained_recipe, retarget_aliases
 from mhwmm.matfix import pak, rsz
@@ -622,3 +622,354 @@ def test_the_search_for_a_crashing_mod_blocks_it(library, capsys):
     assert bisect.BLOCKED in capsys.readouterr().err
     assert main(["--data-dir", data, "retarget", "Bunny", "--to", "armor/f/004/000", "--dry-run"]) == 0  # (changes nothing)
     assert len(ModManager(m.data_dir).mods) == 3
+
+
+# ---- each part to its own equipment (부위마다 다른 장비로) -------------------------------------------------
+BODY_A, BODY_C = CH + "ch03/004/001/2/ch03_004_0012", CH + "ch03/005/000/2/ch03_005_0002"
+BODY_ALBD_A = CH + "ch03/004/001/2/textures/duo_body_ALBD.tex"
+BODY_ALBD_C = CH + "ch03/005/000/2/textures/duo_body_ALBD.tex"
+BODY_PFB_C = N + "GameDesign/Equip/_Prefab/Armor/Female/005/000/Body/ch03_005_0002.pfb.18"
+FOURTH = Target("armor", "f/006/000")  # not in the catalog either
+HELM_D = CH + "ch03/006/000/3/ch03_006_0003"
+ALBD_D = CH + "ch03/006/000/3/textures/bunny_ALBD.tex"
+HAIR_D = CH + "ch03/006/000/3/hair/ch03_006_0003_HairAdjustList.user.3"
+PFB_D = N + "GameDesign/Equip/_Prefab/Armor/Female/006/000/Helm/ch03_006_0003.pfb.18"
+MIXED = {"helm": B, "body": THIRD}  # the helm to the catalog's "시험", the body to a design it does not name
+MIXED_MOVES = {  # the original's file -> where the move puts it
+    N + HELM_A + ".mesh.241111606": N + HELM_B + ".mesh.241111606",
+    N + HELM_A + ".mdf2.45": N + HELM_B + ".mdf2.45",
+    N + ALBD_A + ".241106027": N + ALBD_B + ".241106027",
+    N + HAIR_A: N + HAIR_B,
+    N + BODY_A + ".mesh.241111606": N + BODY_C + ".mesh.241111606",
+    N + BODY_A + ".mdf2.45": N + BODY_C + ".mdf2.45",
+    N + BODY_ALBD_A + ".241106027": N + BODY_ALBD_C + ".241106027",
+}
+
+
+def duo() -> dict:
+    """A helm and a body for the female Trial (type 2): the helm's hair settings point at the helm's model
+    and at the body's material (a file of the other part)."""
+    return {
+        N + HELM_A + ".mesh.241111606": MESH,
+        N + HELM_A + ".mdf2.45": mdf2("helm", ("BaseDielectricMap", ALBD_A)),
+        N + ALBD_A + ".241106027": TEX,
+        N + HAIR_A: hair_list(R.NO_CHILD_CRC, SHORT, scale=3.0, refs=(HELM_A, BODY_A)),
+        N + BODY_A + ".mesh.241111606": MESH,
+        N + BODY_A + ".mdf2.45": mdf2("body", ("BaseDielectricMap", BODY_ALBD_A)),
+        N + BODY_ALBD_A + ".241106027": TEX + b"body",
+        AVP_A: b"USR\x00" + bytes(60),
+    }
+
+
+@pytest.fixture
+def duo_library(library, game, tmp_path):
+    """The game also has the second target's female body (and a fourth design's helm), the original's current
+    body material, and its hair settings pointing at the helm's model and the body's material; the Duo mod."""
+    m, _mod, _first, _last = library
+    M.write_game_pak(game / "re_chunk_000.pak.patch_001.pak", {
+        BODY_PFB_C: pfb_file(BODY_C + ".mesh", BODY_C + ".mdf2"),
+        PFB_D: pfb_file(HELM_D + ".mesh", HELM_D + ".mdf2"),
+        N + BODY_A + ".mdf2.45": current_mdf2("body", BODY_ALBD_A),
+        N + HAIR_A: hair_list(R.NEW_CRC, R.PARAM_FIELDS, scale=1.0, hide=0, new=1, refs=(HELM_A, BODY_A))})
+    m.game_version(refresh=True)
+    return m, M.install_tree(m, tmp_path / "src" / "Duo", duo())
+
+
+def small_registry(monkeypatch) -> None:
+    """The ``types`` fixture from here on: the names are read before (the catalog keeps them, it would have
+    none with this registry)."""
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry())
+    monkeypatch.setattr(rsz.TypeRegistry, "_from_file", False)
+
+
+def by_rel(m, mod_id) -> dict:
+    return {r.rel: r for r in m.material_results(mod_id)}
+
+
+def textures_of(path) -> dict:
+    return {t["type"]: t["path"] for t in extract_material(Mdf2File(path.read_bytes(), 45), 0)["textures"]}
+
+
+def test_each_part_to_its_own_equipment(duo_library, monkeypatch, tmp_path):
+    """The helm to one design and the body to another in one new mod: the files at each part's target, the
+    recipe with each part's target, the name with both, and a material check that compares each moved file
+    with the original equipment's game file and repairs the hair settings keeping each part's new paths."""
+    m, duo_mod = duo_library
+    plan = m.plan_retarget(duo_mod.id, A, MIXED)
+    assert plan.ok, plan.errors
+    assert plan.mixed and plan.targets == {"helm": retarget.Slot.of(B), "body": retarget.Slot.of(THIRD)}
+    assert {mv.old: mv.new for mv in plan.moves} == MIXED_MOVES
+    assert {mv.new: mv.target for mv in plan.moves}[N + BODY_C + ".mdf2.45"] == retarget.Slot.of(THIRD)
+    assert dict(plan.dropped).keys() == {AVP_A}
+    assert m.retarget_name(duo_mod.id, MIXED) == "Duo → 머리 시험 · 몸통 방어구 005-000"
+
+    new = m.create_retarget(duo_mod.id, A, MIXED)
+    assert new.name == "Duo → 머리 시험 · 몸통 방어구 005-000" and new.enabled and not duo_mod.enabled
+    assert sorted(m.mod_files(new.id)) == sorted(MIXED_MOVES.values())
+    recipe = new.retarget
+    assert {k: recipe[k] for k in ("format", "kind", "from", "to", "parts", "source_mod")} == {
+        "format": 2, "kind": "armor", "from": "f/004/001", "to": {"helm": "f/004/000", "body": "f/005/000"},
+        "parts": ["helm", "body"], "source_mod": duo_mod.id}
+    assert sorted(map(tuple, recipe["moves"])) == sorted((new_, old) for old, new_ in MIXED_MOVES.items())
+    assert ModManager(m.data_dir).get(new.id).retarget == recipe
+    # each moved file points at the others' new paths, the hair settings at both targets
+    assert rsz.parse((m.files_dir(new.id) / (N + HAIR_B)).read_bytes()).resources() == \
+        {HELM_B + ".mesh", BODY_C + ".mdf2"}
+    assert textures_of(m.files_dir(new.id) / (N + BODY_C + ".mdf2.45")) == {"BaseDielectricMap": BODY_ALBD_C}
+    assert m.retarget_sources(new.id) == [B, THIRD]  # the equipment window sees both targets
+
+    small_registry(monkeypatch)
+    (job,) = m.material_jobs([new.id])
+    m.finish_materials(m.run_materials([job]), [job])
+    found = by_rel(m, new.id)
+    helm, body, hair = found[N + HELM_B + ".mdf2.45"], found[N + BODY_C + ".mdf2.45"], found[N + HAIR_B]
+    assert helm.state == body.state == hair.state == "fixable"
+    assert any(N + HELM_A + ".mdf2.45" in n and "DetailMaskMap" in n for n in helm.notes)  # A's, not B's own
+    assert any(N + BODY_A + ".mdf2.45" in n and "DetailMaskMap" in n for n in body.notes)  # (THIRD has none)
+    assert hair.rsz[0]["method"] == "원본 교체"
+    out = tmp_path / "report.zip"  # the diagnostics report pairs the hair settings with the original's too
+    assert m.export_material_report(job, out) == 1
+    with zipfile.ZipFile(out) as zf:
+        report = json.loads(zf.read("report.json"))
+        assert rsz.parse(zf.read(f"restored/{N + HAIR_B}")).resources() == {HELM_A + ".mesh", BODY_A + ".mdf2"}
+    assert report["compared"][N + HAIR_B].lower() == (N + HAIR_A).lower()
+    assert "(f/004/001 → 머리 f/004/000 · 몸통 f/005/000)" in report["retarget"]["note"]
+
+    m.finish_materials(m.run_materials([job], repair=True), [job])
+    assert m.material_state(new.id) == "repaired"
+    entries = m.mod_entries(new.id)
+    path, key = entries[N + BODY_C + ".mdf2.45"]
+    assert key.startswith("matfix/")
+    assert textures_of(path) == {"BaseDielectricMap": BODY_ALBD_C, "DetailMaskMap": NULL_MASK}
+    path, key = entries[N + HAIR_B]
+    data = path.read_bytes()
+    assert key.startswith("matfix/") and rsz.parse(data).resources() == {HELM_B + ".mesh", BODY_C + ".mdf2"}
+    values, _info = R.fields_of(data)
+    assert string_of(values[(2, "_Mesh")]) == HELM_B + ".mesh" and values[(2, "_Scale")] == R.f32(3.0)
+
+
+def test_one_part_of_a_mixed_move_moved_on(duo_library, monkeypatch):
+    """The helm of a mod moved part by part, moved on again from its target: compared with the original
+    equipment's files still, the body files it keeps where the first move put them too."""
+    m, duo_mod = duo_library
+    new = m.create_retarget(duo_mod.id, A, MIXED)
+    onward = m.create_retarget(new.id, B, {"helm": FOURTH}, disable_original=False)
+    assert onward.name == "Duo → 머리 시험 · 몸통 방어구 005-000 → 방어구 006-000"
+    files = sorted(m.mod_files(onward.id))
+    assert files == sorted([N + HELM_D + ".mesh.241111606", N + HELM_D + ".mdf2.45", N + ALBD_D + ".241106027",
+                            N + HAIR_D, N + BODY_C + ".mdf2.45", N + BODY_ALBD_C + ".241106027"])  # (kept)
+    recipe = onward.retarget
+    assert {k: recipe[k] for k in ("from", "to", "parts", "source_mod")} == {
+        "from": "f/004/001", "to": {"helm": "f/006/000", "body": "f/005/000"}, "parts": ["helm", "body"],
+        "source_mod": new.id}
+    assert sorted(map(tuple, recipe["moves"])) == sorted([
+        (N + HELM_D + ".mesh.241111606", N + HELM_A + ".mesh.241111606"),
+        (N + HELM_D + ".mdf2.45", N + HELM_A + ".mdf2.45"), (N + ALBD_D + ".241106027", N + ALBD_A + ".241106027"),
+        (N + HAIR_D, N + HAIR_A),
+        (N + BODY_C + ".mdf2.45", N + BODY_A + ".mdf2.45"),  # kept where the first move put them
+        (N + BODY_ALBD_C + ".241106027", N + BODY_ALBD_A + ".241106027")])
+    aliases = retarget_aliases(recipe)
+    assert aliases.old_path(N + HELM_D + ".mdf2.45") == N + HELM_A + ".mdf2.45"
+    # moved on to where the first move put the other part: one target for both
+    again = m.create_retarget(new.id, B, THIRD, disable_original=False)
+    assert again.retarget["to"] == "f/005/000" and again.retarget["parts"] == ["helm", "body"]
+    assert [N + HELM_C + ".mdf2.45", N + HELM_A + ".mdf2.45"] in again.retarget["moves"]
+
+    small_registry(monkeypatch)
+    jobs = m.material_jobs([onward.id])
+    m.finish_materials(m.run_materials(jobs, repair=True), jobs)
+    found = by_rel(m, onward.id)
+    assert any(N + HELM_A + ".mdf2.45" in n for n in found[N + HELM_D + ".mdf2.45"].notes)
+    assert any(N + BODY_A + ".mdf2.45" in n for n in found[N + BODY_C + ".mdf2.45"].notes)
+    data = m.mod_entries(onward.id)[N + HAIR_D][0].read_bytes()
+    assert found[N + HAIR_D].state == "fixable" and rsz.parse(data).resources() == {HELM_D + ".mesh", BODY_C + ".mdf2"}
+
+
+def test_one_part_of_a_mixed_pak_moved_on(duo_library, monkeypatch, tmp_path):
+    """The same in a .pak: the body entries kept where the first move put them are moves by their names
+    too, so the repaired hair settings point at the body's new material, not at the original's."""
+    m, _loose = duo_library
+    names = sorted(set(duo()) | set(MIXED_MOVES.values()) | {
+        N + HELM_D + ".mesh.241111606", N + HELM_D + ".mdf2.45", N + ALBD_D + ".241106027", N + HAIR_D})
+    real = equip_pathlist.PathIndex
+    monkeypatch.setattr(equip_pathlist, "PathIndex", lambda cache=None, paths=None: real(None, paths=names))
+    source = tmp_path / "src" / "Duo.pak"
+    pak.write_pak([(pak.path_hash(p), d, len(d), pak.COMPRESSION_NONE) for p, d in duo().items()], source)
+    with m.prepare_install(source) as session:
+        duo_pak = m.install_package(session, session.variants)
+    new = m.create_retarget(duo_pak.id, A, MIXED)
+    onward = m.create_retarget(new.id, B, {"helm": FOURTH}, disable_original=False)
+    recipe = onward.retarget
+    assert [N + BODY_C + ".mdf2.45", N + BODY_A + ".mdf2.45"] in recipe["moves"]
+    assert [pak.path_hash(N + BODY_C + ".mdf2.45"), pak.path_hash(N + BODY_A + ".mdf2.45")] in recipe["pak_moves"]
+
+    small_registry(monkeypatch)
+    jobs = m.material_jobs([onward.id])
+    m.finish_materials(m.run_materials(jobs, repair=True), jobs)
+    data = pak.PakFile(m.mod_entries(onward.id)["Duo.pak"][0]).read_hash(pak.path_hash(N + HAIR_D))
+    assert rsz.parse(data).resources() == {HELM_D + ".mesh", BODY_C + ".mdf2"}
+
+
+def test_chains_of_moves_part_by_part():
+    """_chained_recipe with a part -> target map on either side."""
+    a, b1, b2, c = "f/004/001", "f/004/000", "f/005/000", "f/006/000"
+    body_a, body_b2 = N + BODY_A + ".mdf2.45", N + BODY_C + ".mdf2.45"
+    first = {"kind": "armor", "from": a, "to": {"helm": b1, "body": b2}, "parts": ["helm", "body"],
+             "moves": [[N + HELM_B + ".mdf2.45", N + HELM_A + ".mdf2.45"], [body_b2, body_a]], "pak_moves": []}
+    then = {"kind": "armor", "from": b1, "to": c, "parts": list(retarget.ARMOR_PARTS),
+            "moves": [[N + HELM_D + ".mdf2.45", N + HELM_B + ".mdf2.45"]], "pak_moves": []}
+    chained = _chained_recipe(first, then)  # (every part of the second move: the body was not where it moved from)
+    assert {k: chained[k] for k in ("from", "to", "parts", "moves")} == {
+        "from": a, "to": {"helm": c, "body": b2}, "parts": ["helm", "body"],
+        "moves": [[N + HELM_D + ".mdf2.45", N + HELM_A + ".mdf2.45"]]}
+    assert _chained_recipe(first, then, kept=[body_b2, N + "Art/custom.tex"])["moves"][1:] == [[body_b2, body_a]]
+    assert _chained_recipe(first, {**then, "from": "f/099/000"}) == {**then, "from": "f/099/000"}  # not moved there
+    home = {**then, "to": a, "moves": [[N + HELM_A + ".mdf2.45", N + HELM_B + ".mdf2.45"]]}
+    assert _chained_recipe(first, home) == {}
+    assert _chained_recipe(first, {**home, "to": {"helm": a}, "parts": ["helm"]}) == {}
+    kept = _chained_recipe(first, {**home, "to": {"helm": a}, "parts": ["helm"]}, kept=[body_b2])
+    assert {k: kept[k] for k in ("to", "parts", "moves")} == {"to": b2, "parts": ["body"], "moves": [[body_b2, body_a]]}
+    retarget_aliases(chained)  # (reads)
+
+    # the first moved every part to one design, the second each part to its own
+    uniform = {**first, "to": b1, "parts": ["helm", "body"], "moves": first["moves"][:1]}
+    split = {"kind": "armor", "from": b1, "to": {"helm": c, "body": b2}, "parts": ["helm", "body"],
+             "moves": [[N + HELM_D + ".mdf2.45", N + HELM_B + ".mdf2.45"]], "pak_moves": []}
+    chained = _chained_recipe(uniform, split)
+    assert (chained["from"], chained["to"], chained["parts"]) == (a, {"helm": c, "body": b2}, ["helm", "body"])
+    assert chained["moves"] == [[N + HELM_D + ".mdf2.45", N + HELM_A + ".mdf2.45"]]
+    # the parts the first move did not take go where the second one sent them only by path (one target)
+    only_waist = {**split, "to": {"waist": c, "leg": b2}, "parts": ["waist", "leg"]}
+    assert _chained_recipe({**uniform, "parts": ["helm"]}, only_waist) == only_waist  # (two: cannot be said)
+    single = _chained_recipe({**uniform, "parts": ["helm"]}, {**only_waist, "to": {"waist": c}, "parts": ["waist"]})
+    assert (single["to"], single["parts"]) == (c, [])
+
+
+def test_a_recipe_of_v2_4_0(library, monkeypatch):
+    """A recipe stored by v2.4.0 (format 1, one target): read by the material check, and moved on part by part."""
+    m, mod, _first, _last = library
+    new = m.create_retarget(mod.id, A, B)
+    new.retarget = {  # as v2.4.0 wrote it
+        "format": 1, "kind": "armor", "from": "f/004/001", "to": "f/004/000",
+        "parts": ["helm", "body", "arm", "waist", "leg", "slinger"], "source_mod": mod.id, "source_name": "Bunny",
+        "moves": [[N + HELM_B + ".mesh.241111606", N + HELM_A + ".mesh.241111606"],
+                  [N + HELM_B + ".mdf2.45", N + HELM_A + ".mdf2.45"], [N + ALBD_B + ".241106027", N + ALBD_A + ".241106027"],
+                  [N + HAIR_B, N + HAIR_A]], "pak_moves": []}
+    m._write_mod_meta(new)
+    m.save()
+    m = ModManager(m.data_dir)
+    onward = m.create_retarget(new.id, B, {"helm": THIRD})  # (one part: a move of it to that one)
+    assert onward.name == "Bunny → 시험 → 방어구 005-000"
+    assert {k: onward.retarget[k] for k in ("format", "from", "to", "parts")} == {
+        "format": 2, "from": "f/004/001", "to": "f/005/000", "parts": ["helm"]}
+    assert [N + HELM_C + ".mdf2.45", N + HELM_A + ".mdf2.45"] in onward.retarget["moves"]
+
+    small_registry(monkeypatch)
+    jobs = m.material_jobs([new.id, onward.id])
+    assert jobs[0].retarget["format"] == 1
+    m.finish_materials(m.run_materials(jobs), jobs)
+    for who in (new, onward):
+        found = results_by_kind(m, who.id)
+        assert found["mdf2"].state == "fixable" and any(N + HELM_A + ".mdf2.45" in n for n in found["mdf2"].notes)
+        assert found["user"].state == "fixable", who.name
+
+
+def test_part_by_part_targets_that_cannot_be(library, tmp_path):
+    m, mod, _first, _last = library
+    other_body = Target("armor", "m/005/000")
+    plan = m.plan_retarget(mod.id, A, {"helm": B, "body": other_body})
+    assert plan.errors == ["몸통: 원래 장비와 체형이 다른 장비입니다 (armor/m/005/000)"] and plan.bad_parts == {"body"}
+    assert plan.targets == {"helm": retarget.Slot.of(B), "body": retarget.Slot.of(other_body)} and not plan.ok
+    assert m.plan_retarget(mod.id, A, {"helm": Target("armor", "004/000"), "body": THIRD}).errors == [RETARGET_BODY]
+    assert m.plan_retarget(mod.id, Target("armor", "004/001"), MIXED).errors == [RETARGET_BODY]
+    assert m.plan_retarget(mod.id, A, {"helm": "f/004/000"}).errors == ["옮길 수 없는 장비입니다 (f/004/000)"]
+    itself = m.plan_retarget(mod.id, A, {"helm": A, "body": THIRD})  # (the core names the part)
+    assert itself.errors == ["머리: 원래 장비와 같은 장비입니다"] and itself.bad_parts == {"helm"}
+    assert m.plan_retarget(mod.id, A, MIXED, parts=["helm"]).errors == ["옮길 부위가 부위마다 고른 장비와 맞지 않습니다"]
+    assert m.plan_retarget(mod.id, A, {}).errors == ["옮길 부위를 하나 이상 고르세요"]
+    assert m.plan_retarget(mod.id, A, {"head": B}).errors == ["알 수 없는 부위입니다: head"]
+    before = [x.id for x in m.mods]
+    with pytest.raises(InstallError, match="체형이 다른"):
+        m.create_retarget(mod.id, A, {"helm": B, "body": other_body})
+    assert [x.id for x in m.mods] == before and not list(m.temp_root.glob("retarget-*"))
+
+    # a weapon: its main and sub to one weapon only
+    source = tmp_path / "src" / "Blades.pak"
+    pak.write_pak(blades_entries(), source)
+    with m.prepare_install(source) as session:
+        blades = m.install_package(session, session.variants)
+    weapon, target = Target("weapon", "02/000029"), Target("weapon", "02/000028")
+    both = m.plan_retarget(blades.id, weapon, {"main": target, "sub": target})
+    assert both.ok and not both.mixed and both.targets == dict.fromkeys(("main", "sub"), retarget.Slot.of(target))
+    assert m.retarget_name(blades.id, {"main": target, "sub": target}) == "Blades → 첫걸음쌍검Ⅰ"
+    assert m.plan_retarget(blades.id, weapon, {"main": target}).errors == \
+        ["무기는 본체와 보조를 함께 한 무기로만 옮길 수 있습니다"]
+    assert main(["--data-dir", str(m.data_dir), "retarget", "Blades", "--to", "weapon/02/000028", "--to",
+                 "보조=weapon/02/000002", "--dry-run"]) == 1
+    assert main(["--data-dir", str(m.data_dir), "retarget", "Blades", "--to", "main=weapon/02/000028", "--to",
+                 "sub=weapon/02/000028", "--dry-run"]) == 0  # (both to one: as a move to it)
+    for one in ("main", "보조"):  # (one model alone: not the whole weapon)
+        assert main(["--data-dir", str(m.data_dir), "retarget", "Blades", "--to", f"{one}=weapon/02/000028",
+                     "--dry-run"]) == 1
+
+
+def test_parts_to_one_piece_of_equipment_are_a_move_to_it(library):
+    m, mod, _first, _last = library
+    grouped = m.plan_retarget(mod.id, A, {"body": B, "helm": B})
+    uniform = m.plan_retarget(mod.id, A, B, parts=["helm", "body"])
+    assert grouped.ok and not grouped.mixed and grouped.parts == uniform.parts == ("helm", "body")
+    assert [(mv.old, mv.new, mv.how) for mv in grouped.moves] == [(mv.old, mv.new, mv.how) for mv in uniform.moves]
+    assert m.retarget_name(mod.id, {"body": B, "helm": B}) == m.retarget_name(mod.id, B) == "Bunny → 시험"
+    new = m.create_retarget(mod.id, A, {"body": B, "helm": B})
+    assert new.name == "Bunny → 시험"
+    assert (new.retarget["to"], new.retarget["parts"]) == ("f/004/000", ["helm", "body"])  # the uniform form
+
+
+def test_names_of_moves_part_by_part(library):
+    m, mod, _first, _last = library
+    assert m.retarget_name(mod.id, {"arm": B, "body": THIRD, "helm": B}) == "Bunny → 머리·팔 시험 · 몸통 방어구 005-000"
+    many = {"helm": B, "body": THIRD, "arm": FOURTH, "waist": Target("armor", "f/007/000"), "leg": B}
+    assert m.retarget_name(mod.id, many) == "Bunny → 머리·다리 시험 외 3부위"
+    m.create_retarget(mod.id, A, {"helm": B, "body": THIRD}, disable_original=False)  # (no body: still made)
+    assert m.retarget_name(mod.id, {"helm": B, "body": THIRD}) == "Bunny → 머리 시험 · 몸통 방어구 005-000 (2)"
+
+
+def test_the_command_line_part_by_part(duo_library, capsys):
+    m, _duo = duo_library
+    data = str(m.data_dir)
+    assert main(["--data-dir", data, "retarget", "Duo", "--to", "armor/f/004/000", "--to", "body=armor/f/005/000",
+                 "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "Duo: 시험 (armor/f/004/001) → 부위마다 다른 장비" in out
+    assert "  머리 → 시험 (armor/f/004/000)\n  몸통 → 방어구 005-000 (armor/f/005/000)\n  옮길 파일 7개" in out
+    assert "부위:" not in out  # (only the parts Duo changes, not every part to the default)
+
+    assert main(["--data-dir", data, "retarget", "Duo", "--to", "머리=armor/004/000", "--to", "몸통=armor/m/005/000",
+                 "--keep-original", "--no-deploy"]) == 0  # (the body of a key is the original's)
+    out = capsys.readouterr().out
+    assert "  머리 → 시험 (armor/f/004/000)\n  몸통 → 방어구 005-000 (armor/f/005/000)" in out
+    assert "새 모드: Duo → 머리 시험 · 몸통 방어구 005-000  (7개 파일, 켜짐)" in out
+    made = ModManager(data).find("Duo → 머리 시험 · 몸통 방어구 005-000")
+    assert made.retarget["to"] == {"helm": "f/004/000", "body": "f/005/000"}
+
+    # a default and the parts limited: only those, each to its own
+    assert main(["--data-dir", data, "retarget", "Duo", "--to", "armor/f/004/000", "--to", "body=armor/f/005/000",
+                 "--parts", "helm,body", "--keep-original", "--no-deploy"]) == 0
+    assert "새 모드: Duo → 머리 시험 · 몸통 방어구 005-000 (2)" in capsys.readouterr().out
+    # every part to one: as a move to it
+    assert main(["--data-dir", data, "retarget", "Duo", "--to", "armor/f/005/000", "--to", "helm=armor/f/005/000",
+                 "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "Duo: 시험 (armor/f/004/001) → 방어구 005-000 (armor/f/005/000)" in out and "부위: 머리, 몸통\n" in out
+
+    for args, error in ((["--to", "helm=armor/f/004/000", "--parts", "body"], "--parts에 없는 부위의 --to입니다: 머리"),
+                        (["--to", "helm=armor/f/004/000", "--parts", "helm,body"], "고르지 않은 부위입니다: 몸통"),
+                        (["--to", "armor/f/004/000", "--to", "armor/f/005/000"], "하나만 적으세요"),
+                        (["--to", "helm=armor/f/004/000", "--to", "머리=armor/f/005/000"], "두 번 적었습니다: 머리"),
+                        (["--to", "head=armor/f/004/000"], "알 수 없는 부위입니다: head"),
+                        (["--to", "helm=nothing"], "장비를 알 수 없습니다: nothing")):
+        with pytest.raises(SystemExit, match=error):
+            main(["--data-dir", data, "retarget", "Duo", *args, "--dry-run"])
+    assert main(["--data-dir", data, "retarget", "Duo", "--to", "helm=armor/f/004/001", "--to", "body=armor/f/005/000",
+                 "--dry-run"]) == 1
+    assert "머리: 원래 장비와 같은 장비입니다" in capsys.readouterr().err

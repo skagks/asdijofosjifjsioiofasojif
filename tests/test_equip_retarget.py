@@ -1024,3 +1024,349 @@ def test_sources_of_scanned_targets():
     assert R.sources_of(targets) == [Target("armor", "f/034/001"), Target("armor", "m/034/001"),
                                      Target("weapon", "03/000009")]
     assert R.sources_of([]) == []
+
+
+# ---- each part to its own equipment (부위마다 다른 장비로) -------------------------------------------------
+B2 = Slot("armor", "045/002")
+HELM = CHAR + "ch03/034/001/3/ch03_034_0013"
+HELM_B1 = CHAR + "ch03/087/000/3/ch03_087_0003"
+HELM_ALBD = CHAR + "ch03/034/001/3/textures/ch03_034_0013_ALBD.tex"
+HELM_ALBD_B1 = CHAR + "ch03/087/000/3/textures/ch03_087_0003_ALBD.tex"
+HELM_NRRO = CHAR + "ch03/034/001/3/textures/ch03_034_0013_NRRO.tex"  # the game's, not shipped
+BODY_B2 = CHAR + "ch03/045/002/2/ch03_045_0022"
+ALBD_B1 = CHAR + "ch03/087/000/2/textures/ch03_087_0002_ALBD.tex"
+ALBD_B2 = CHAR + "ch03/045/002/2/textures/ch03_045_0022_ALBD.tex"
+M_HELM, M_HELM_B1 = CHAR + "ch02/034/001/3/ch02_034_0013", CHAR + "ch02/087/000/3/ch02_087_0003"
+M_BODY, M_BODY_B2 = CHAR + "ch02/034/001/2/ch02_034_0012", CHAR + "ch02/045/002/2/ch02_045_0022"
+WAIST_ALBD = CHAR + "ch03/034/001/5/textures/ch03_034_0015_ALBD.tex"  # a part the mod has no model of
+WAIST_ALBD_B1 = CHAR + "ch03/087/000/5/textures/ch03_087_0005_ALBD.tex"
+WAIST_ALBD_B2 = CHAR + "ch03/045/002/5/textures/ch03_045_0025_ALBD.tex"
+HELM_PFB = N + "GameDesign/Equip/_Prefab/Armor/Female/034/001/Helm/ch03_034_0013.pfb.18"
+HELM_PFB_B1 = N + "GameDesign/Equip/_Prefab/Armor/Female/087/000/Helm/ch03_087_0003.pfb.18"
+PFB_B2 = N + "GameDesign/Equip/_Prefab/Armor/Female/045/002/Body/ch03_045_0022.pfb.18"
+MIXED = {"helm": B, "body": B2}
+
+
+def helm_prefab() -> bytes:
+    """The helm's prefab; it also reads the body's texture and holds the body's name."""
+    return prefab([{F.TYPE: "via.GameObject", "Name": "ch03_034_0013", "Tag": "", "TimeScale": -1.0},
+                   {F.TYPE: "via.render.Mesh", "Enabled": True, "Mesh": HELM + ".mesh", "Material": HELM + ".mdf2"},
+                   {F.TYPE: "via.GameObject", "Name": "ch03_034_0012", "Tag": "", "TimeScale": -1.0}],
+                  resources=("@" + HELM + ".mesh", HELM + ".mdf2", ALBD))
+
+
+def two_part_mod(waist=("helm",)) -> dict:
+    """A helm and a body of both bodies, with prefabs: the female helm's material reads the body's texture
+    too, the male body's the female body's, and the parts in ``waist`` read a waist texture (a part not
+    chosen)."""
+    files = fix_paths({
+        HELM + ".mesh.241111606": MESH,
+        HELM + ".mdf2.45": mdf2(material("helm", (HELM_ALBD, ALBD, *((WAIST_ALBD,) if "helm" in waist else ())))),
+        HELM_ALBD + ".241106027": TEX + b"helm",
+        BODY + ".mesh.241111606": MESH,
+        "streaming/" + BODY + ".mesh.241111606": MESH + b"high",
+        BODY + ".mdf2.45": mdf2(material("body", (ALBD, *((WAIST_ALBD,) if "body" in waist else ())))),
+        ALBD + ".241106027": TEX + b"body",
+        M_HELM + ".mesh.241111606": MESH,
+        M_HELM + ".mdf2.45": mdf2(material("m_helm")),
+        M_BODY + ".mesh.241111606": MESH,
+        M_BODY + ".mdf2.45": mdf2(material("m_body", (ALBD,))),
+        WAIST_ALBD + ".241106027": TEX + b"waist",
+    })
+    files[PFB] = body_prefab()
+    files[HELM_PFB] = helm_prefab()
+    return files
+
+
+MIXED_MOVES = {  # old -> (new, how, target)
+    N + HELM + ".mesh.241111606": (N + HELM_B1 + ".mesh.241111606", "copy", B),
+    N + HELM + ".mdf2.45": (N + HELM_B1 + ".mdf2.45", "mdf2", B),
+    N + HELM_ALBD + ".241106027": (N + HELM_ALBD_B1 + ".241106027", "copy", B),
+    N + M_HELM + ".mesh.241111606": (N + M_HELM_B1 + ".mesh.241111606", "copy", B),
+    N + M_HELM + ".mdf2.45": (N + M_HELM_B1 + ".mdf2.45", "copy", B),
+    HELM_PFB: (HELM_PFB_B1, "rsz", B),
+    N + WAIST_ALBD + ".241106027": (N + WAIST_ALBD_B1 + ".241106027", "copy", B),  # used by the helm only
+    N + BODY + ".mesh.241111606": (N + BODY_B2 + ".mesh.241111606", "copy", B2),
+    N + "streaming/" + BODY + ".mesh.241111606": (N + "streaming/" + BODY_B2 + ".mesh.241111606", "copy", B2),
+    N + BODY + ".mdf2.45": (N + BODY_B2 + ".mdf2.45", "mdf2", B2),
+    N + ALBD + ".241106027": (N + ALBD_B2 + ".241106027", "copy", B2),
+    N + M_BODY + ".mesh.241111606": (N + M_BODY_B2 + ".mesh.241111606", "copy", B2),
+    N + M_BODY + ".mdf2.45": (N + M_BODY_B2 + ".mdf2.45", "mdf2", B2),
+    PFB: (PFB_B2, "rsz", B2),
+}
+
+
+def test_each_part_to_its_own_equipment(tmp_path):
+    """The helm to one design and the body to another, both bodies, in one new mod: a file of a part goes to
+    that part's target wherever it is used from (the body's texture the helm's material reads moves once, with
+    the body), and the references to it follow."""
+    files = two_part_mod()
+    items = loose_mod(tmp_path, files)
+    plan = R.plan(items, A, MIXED)
+    assert plan.ok, plan.errors
+    assert plan.targets == MIXED and plan.parts == ("helm", "body") and plan.mixed
+    assert plan.target == B  # the first chosen part's (ARMOR_PARTS order)
+    assert {m.old: (m.new, m.how, m.target) for m in plan.moves} == MIXED_MOVES
+    assert plan.kept == [] and plan.dropped == [] and plan.vanilla_refs == 2  # the body prefab's chain and clsp
+    assert "고르지 않은 허리 파일 1개도 머리 파일이 써서 함께 옮깁니다. 머리를 옮길 장비의 허리 모습도 달라질 수 " \
+           "있습니다" in plan.notes
+    assert "머리카락 숨김·다른 부위와 겹칠 때 숨기는 설정은 부위마다 옮길 장비의 것을 씁니다. 머리카락이 투구를 뚫고 " \
+           "나오거나 일부가 보이지 않을 수 있습니다" in plan.notes
+
+    out = tmp_path / "out"
+    built = R.build(plan, items, out)
+    assert sorted(built.moves) == sorted((new, old) for old, (new, _how, _t) in MIXED_MOVES.items())
+    assert sorted(built.files) == sorted(new for new, _how, _t in MIXED_MOVES.values())
+    assert not (out / (N + ALBD_B1 + ".241106027")).exists()  # one copy of the body's texture, at its own target
+    assert (out / (N + ALBD_B2 + ".241106027")).read_bytes() == TEX + b"body"
+    # the helm's material reads its own texture at the helm's target, the body's at the body's
+    assert texture_paths((out / (N + HELM_B1 + ".mdf2.45")).read_bytes()) == [HELM_ALBD_B1, ALBD_B2, WAIST_ALBD_B1]
+    assert texture_paths((out / (N + M_BODY_B2 + ".mdf2.45")).read_bytes()) == [ALBD_B2]
+    # prefabs: references and bare names, each part's to its own target
+    helm = (out / HELM_PFB_B1).read_bytes()
+    assert len(helm) == len(files[HELM_PFB])
+    assert rsz.parse(helm).resources() == {"@" + HELM_B1 + ".mesh", HELM_B1 + ".mdf2", ALBD_B2}
+    assert rsz_values(helm)["Name"] == ["ch03_087_0003", "ch03_045_0022"]
+    body = (out / PFB_B2).read_bytes()
+    assert rsz.parse(body).resources() == {"@" + BODY_B2 + ".mesh", BODY_B2 + ".mdf2", CHAIN, CLSP}
+    assert rsz_values(body)["Name"] == ["ch03_045_0022"]
+
+    # back the same way (what the material check reads the new mod's files with): the original bytes again
+    back = R.renamer_of(A, plan.targets, reverse=True)
+    to_old = R.mover([(old, new) for new, old in built.moves], back)
+    for new, old in built.moves:
+        if R._kind(new):
+            assert R.rewrite((out / new).read_bytes(), new, to_old, back)[0] == files[old], new
+
+
+def test_each_part_to_its_own_equipment_in_a_pak(tmp_path):
+    files = two_part_mod()
+    index = PathIndex(None, paths=[path.lower() for path in files])
+    write_pak([(path_hash(p), d, len(d), COMPRESSION_NONE) for p, d in files.items()], tmp_path / "Bunny.pak")
+    items = R.items_of({"Bunny.pak": tmp_path / "Bunny.pak"}, index)
+    plan = R.plan(items, A, MIXED)
+    assert plan.ok, plan.errors
+    assert {m.old: (m.new, m.how, m.target) for m in plan.moves} == {
+        old.lower(): (new.lower(), how, target) for old, (new, how, target) in MIXED_MOVES.items()}
+    assert {m.pak for m in plan.moves} == {"Bunny.pak"}
+    built = R.build(plan, items, tmp_path / "out")
+    assert built.files == ["Bunny.pak"]
+    pak = PakFile(tmp_path / "out" / "Bunny.pak")
+    assert set(pak.order) == {path_hash(new) for new, _how, _t in MIXED_MOVES.values()}
+    assert sorted(built.pak_moves) == sorted((path_hash(new), path_hash(old))
+                                             for old, (new, _how, _t) in MIXED_MOVES.items())
+    assert pak.read_hash(path_hash(N + ALBD_B1 + ".241106027")) is None  # one copy, at the body's target
+    assert texture_paths(pak.read_hash(path_hash(N + HELM_B1 + ".mdf2.45"))) == [HELM_ALBD_B1, ALBD_B2, WAIST_ALBD_B1]
+    helm = pak.read_hash(path_hash(HELM_PFB_B1))
+    assert rsz.parse(helm).resources() == {"@" + HELM_B1 + ".mesh", HELM_B1 + ".mdf2", ALBD_B2}
+    assert rsz_values(helm)["Name"] == ["ch03_087_0003", "ch03_045_0022"]
+
+
+def test_a_file_of_a_part_not_chosen_used_by_parts_of_different_targets(tmp_path):
+    """A file of a part not chosen goes with the parts that use it: used by the helm and the body moving to
+    different designs, it would have to be in two places."""
+    items = loose_mod(tmp_path, two_part_mod(waist=("helm", "body")))
+    plan = R.plan(items, A, MIXED)
+    assert plan.errors == ["고르지 않은 허리 파일(ch03_034_0015_ALBD.tex.241106027)을 여러 부위(머리·몸통)가 함께 써서 "
+                           "한 장비로 옮길 수 없습니다. 이 부위들을 같은 장비로 옮기거나 허리도 함께 옮기세요"]
+    assert not plan.ok and plan.bad_parts == {"helm", "body"}
+    # to the same design: it goes there with them
+    same = R.plan(items, A, {"helm": B, "body": B})
+    assert same.ok, same.errors
+    assert {m.new: m.target for m in same.moves}[N + WAIST_ALBD_B1 + ".241106027"] == B
+    # the waist moved too: to its own target, whoever uses it (here without a model: needs the game)
+    waist = R.plan(items, A, {**MIXED, "waist": B2})
+    assert not any("여러 부위" in e for e in waist.errors)
+    assert [(m.new, m.target) for m in waist.moves if m.old == N + WAIST_ALBD + ".241106027"] == [
+        (N + WAIST_ALBD_B2 + ".241106027", B2)]
+
+
+def test_a_shared_file_reached_through_a_kept_one(tmp_path):
+    """The parts' prefabs both load a material in the author's own folder (kept where it is) that reads a
+    waist texture: the texture is used by both targets' parts."""
+    own = "Art/Arsinia/Bunny/shared.mdf2"
+    files = fix_paths({HELM + ".mesh.241111606": MESH, BODY + ".mesh.241111606": MESH,
+                       own + ".45": mdf2(material("shared", (WAIST_ALBD, CUSTOM))),
+                       WAIST_ALBD + ".241106027": TEX, CUSTOM + ".241106027": TEX + b"custom"})
+    files[PFB] = body_prefab(extra=(own,))
+    files[HELM_PFB] = prefab([{F.TYPE: "via.GameObject", "Name": "ch03_034_0013"}],
+                             resources=("@" + HELM + ".mesh", own))
+    items = loose_mod(tmp_path, files)
+    plan = R.plan(items, A, MIXED)
+    assert len(plan.errors) == 1 and plan.errors[0].startswith("고르지 않은 허리 파일(ch03_034_0015_ALBD.tex.241106027)을 "
+                                                               "여러 부위(머리·몸통)가 함께 써서")
+    assert plan.kept == sorted([N + own + ".45", N + CUSTOM + ".241106027"])
+    # only the helm's prefab loads it: the texture goes with the helm
+    files[PFB] = body_prefab()
+    plan = R.plan(loose_mod(tmp_path / "helm", files), A, MIXED)
+    assert plan.ok, plan.errors
+    assert {m.old: m.target for m in plan.moves}[N + WAIST_ALBD + ".241106027"] == B
+
+
+def plan_summary(plan: R.Plan) -> tuple:
+    return (plan.source, plan.target, plan.parts, plan.targets,
+            [(m.old, m.new, m.how, m.pak, m.target) for m in plan.moves],
+            plan.kept, plan.dropped, plan.notes, plan.errors, plan.vanilla_refs, [f.path for f in plan.fills],
+            plan.bad_parts)
+
+
+def test_parts_to_the_same_equipment_are_a_move_to_it(tmp_path):
+    """Parts mapped to one target make a group: the same plan and files as moving those parts to it."""
+    files = two_part_mod(waist=("helm", "body"))
+    items = loose_mod(tmp_path, files)
+    grouped = R.plan(items, A, {"body": B, "helm": B})
+    uniform = R.plan(items, A, B, parts=["helm", "body"])
+    assert uniform.ok and not uniform.mixed and uniform.targets == {"helm": B, "body": B}
+    assert plan_summary(grouped) == plan_summary(uniform)
+    assert {m.target for m in uniform.moves} == {B}
+    R.build(grouped, items, tmp_path / "grouped")
+    R.build(uniform, items, tmp_path / "uniform")
+    def written(folder):
+        return sorted(p.relative_to(folder) for p in folder.rglob("*") if p.is_file())
+
+    assert written(tmp_path / "grouped") == written(tmp_path / "uniform")
+    assert all((tmp_path / "grouped" / p).read_bytes() == (tmp_path / "uniform" / p).read_bytes()
+               for p in written(tmp_path / "uniform"))
+    # every part to one target: a move of all of them; with a game too
+    game = F.FakeGame({HELM_PFB_B1: F.pfb_file("@" + HELM_B1 + ".mesh")})
+    assert plan_summary(R.plan(items, A, dict.fromkeys(R.ARMOR_PARTS, B), game=game)) == \
+        plan_summary(R.plan(items, A, B, game=game))
+    # and the same errors
+    assert R.plan(items, A, {"helm": A, "body": A}).errors == R.plan(items, A, A).errors == ["원래 장비와 같은 장비입니다"]
+
+
+def helm_and_body_game() -> F.FakeGame:
+    """The first target has a helm (its prefab loads GPU cloth) and a body; the second target has no body;
+    the original's game helm material."""
+    game = F.FakeGame({HELM_PFB_B1: F.pfb_file("@" + HELM_B1 + ".mesh", HELM_B1 + ".mdf2", HELM_B1 + ".gpuc"),
+                       PFB_B: F.pfb_file("@" + BODY_B + ".mesh", BODY_B + ".mdf2")})
+    game.add(N + HELM + ".mdf2.45", mdf2(material("ch03_034_0013_helm", (HELM_ALBD, HELM_NRRO))))
+    return game
+
+
+def test_the_game_is_asked_about_each_parts_own_target(tmp_path):
+    """The target prefabs, the fills from the original's game files, the notes and bad_parts go by each part's
+    own target."""
+    files = fix_paths({HELM + ".mesh.241111606": MESH, HELM_ALBD + ".241106027": TEX,  # no helm material
+                       BODY + ".mesh.241111606": MESH, BODY + ".mdf2.45": mdf2(material("body", (ALBD,))),
+                       ALBD + ".241106027": TEX})
+    items = loose_mod(tmp_path, files)
+    game = helm_and_body_game()
+    plan = R.plan(items, A, MIXED, game=game)
+    assert plan.errors == ["대상 장비에는 여성 몸통이 없습니다"] and plan.bad_parts == {"body"}  # the first target has one
+    assert R.plan(items, A, B, game=game).ok  # (the first target has both)
+    assert [fill.path for fill in plan.fills] == [N + HELM + ".mdf2.45"]
+    assert [(m.new, m.target) for m in plan.moves if m.how == "fill"] == [(N + HELM_B1 + ".mdf2.45", B)]
+    notes = " / ".join(plan.notes)
+    assert "여성 머리: 모드에 모델(.mesh)과 재질(.mdf2)이 짝으로 들어 있지 않아, 원래 장비의 게임 파일 1개(재질)를" in notes
+    assert "대상 장비의 여성 머리는 GPU 옷감(.gpuc)을 써서" in notes and "여성 몸통은 GPU" not in notes
+
+    # the second target with a body that loads the moved model: made, the filled material reading the moved texture
+    game.add(PFB_B2, F.pfb_file("@" + BODY_B2 + ".mesh", BODY_B2 + ".mdf2"))
+    plan = R.plan(items, A, MIXED, game=game)
+    assert plan.ok, plan.errors
+    R.build(plan, items, tmp_path / "out")
+    assert texture_paths((tmp_path / "out" / (N + HELM_B1 + ".mdf2.45")).read_bytes()) == [HELM_ALBD_B1, HELM_NRRO]
+    assert texture_paths((tmp_path / "out" / (N + BODY_B2 + ".mdf2.45")).read_bytes()) == [ALBD_B2]
+    # ... and with one that loads another model
+    game.add(PFB_B2, F.pfb_file("@" + CHAR + "ch03/099/000/2/ch03_099_0002.mesh"))
+    plan = R.plan(items, A, MIXED, game=game)
+    assert plan.errors == ["대상 장비의 여성 몸통은 다른 장비의 모델을 불러와서, 옮긴 모델이 보이지 않습니다"]
+    assert plan.bad_parts == {"body"}
+    # without the original's helm material only the helm cannot be made
+    game.remove(N + HELM + ".mdf2.45")
+    game.add(PFB_B2, F.pfb_file("@" + BODY_B2 + ".mesh"))
+    plan = R.plan(items, A, MIXED, game=game)
+    assert plan.bad_parts == {"helm"} and len(plan.errors) == 1 and plan.errors[0].startswith("여성 머리:")
+
+
+def test_notes_of_a_move_to_several_targets_name_the_parts(tmp_path):
+    leg = CHAR + "ch03/034/001/4/ch03_034_0014"
+    files = fix_paths({leg + ".mesh.241111606": MESH, leg + ".mdf2.45": mdf2(material("leg")),
+                       CHAR + "ch02/034/001/4/ch02_034_0014.chain2.14": b"CHAIN",
+                       BODY + ".mesh.241111606": MESH, BODY + ".mdf2.45": mdf2(material("body"))})
+    files[AVP] = b"USR\x00" + bytes(60)
+    notes = R.plan(loose_mod(tmp_path, files), A, {"body": B, "leg": B2}).notes
+    assert "모드에 남성용 다리 모델이 없는데 남성용 폴더(ch02)의 파일 1개도 옮깁니다. 그 부위를 옮길 장비의 남성용에도 " \
+           "영향을 줄 수 있습니다" in notes
+    assert "다른 부위와 겹칠 때 숨기는 설정은 부위마다 옮길 장비의 것을 씁니다. 일부가 보이지 않을 수 있습니다" in notes
+    assert "방어구 외형 설정 파일(_avp.user)은 부위마다 옮길 장비의 설정과 맞아야 해서 옮기지 않았습니다. 부위마다 옮길 " \
+           "장비의 설정이 그대로 쓰입니다" in notes
+    # moved to one target, the notes say so as before
+    notes = R.plan(loose_mod(tmp_path / "one", files), A, {"body": B, "leg": B}).notes
+    assert "모드에 남성용 다리 모델이 없는데 남성용 폴더(ch02)의 파일 1개도 옮깁니다. 대상 장비의 남성용에도 영향을 줄 수 " \
+           "있습니다" in notes
+    assert "방어구 외형 설정 파일(_avp.user)은 대상 장비의 설정과 맞아야 해서 옮기지 않았습니다. 대상 장비의 설정이 그대로 " \
+           "쓰입니다" in notes
+
+
+def test_a_part_that_cannot_go_where_it_is_mapped(tmp_path):
+    items = loose_mod(tmp_path, two_part_mod())
+    itself = R.plan(items, A, {"helm": A, "body": B2})
+    assert itself.errors == ["머리: 원래 장비와 같은 장비입니다"] and itself.bad_parts == {"helm"} and not itself.moves
+    assert itself.targets == {"helm": A, "body": B2} and itself.target == A and itself.parts == ("helm", "body")
+    weapon = R.plan(items, A, {"helm": B, "body": SWORD_B})
+    assert weapon.errors == ["몸통: 방어구는 방어구로, 무기는 무기로만 옮길 수 있습니다"] and weapon.bad_parts == {"body"}
+    both = R.plan(items, A, {"helm": A, "body": Slot("armor", "45/2")})
+    assert both.errors == ["머리: 원래 장비와 같은 장비입니다", "몸통: 옮길 수 없는 장비입니다 (45/2)"]
+    assert both.bad_parts == {"helm", "body"}
+    # what is wrong with the original equipment is said once
+    assert R.plan(items, Slot("armor", "002/000"), MIXED).errors == ["옮길 수 없는 장비입니다 (002/000)"]
+    assert R.plan(items, A, {"head": B}).errors == ["알 수 없는 부위입니다: head"]
+    assert R.plan(items, A, {}).errors == ["옮길 부위를 하나 이상 고르세요"]
+    assert R.plan(items, A, MIXED, parts=["helm"]).errors == ["옮길 부위가 부위마다 고른 장비와 맞지 않습니다"]
+    assert R.plan(items, A, MIXED, parts=["body", "helm"]).ok
+    assert R.plan(items, A, {"helm": B, "body": "045/002"}).errors == ["몸통: 옮길 수 없는 장비입니다 (045/002)"]
+    with pytest.raises(RetargetError):
+        R.build(itself, items, tmp_path / "none")
+
+
+def test_a_weapon_moves_to_one_weapon(tmp_path):
+    items = loose_mod(tmp_path, sword_mod())
+    mapped = R.plan(items, SWORD, {"main": SWORD_B, "sub": SWORD_B})
+    assert mapped.errors == ["무기는 본체와 보조를 함께 한 무기로만 옮길 수 있습니다"] and not mapped.moves
+    plan = R.plan(items, SWORD, SWORD_B, game=sword_game())
+    assert plan.ok and plan.targets == {"main": SWORD_B, "sub": SWORD_B} and not plan.mixed
+    assert {m.target for m in plan.moves} == {SWORD_B}
+
+
+def test_renamers_of_parts_to_different_equipment():
+    forward = R.renamer_of(A, MIXED)
+    assert isinstance(forward, R.MixedRenamer) and forward.parts == ("helm", "body") and forward.source == A
+    assert forward.rename(N + HELM + ".mesh.241111606") == N + HELM_B1 + ".mesh.241111606"
+    assert forward.rename(N + BODY + ".mesh.241111606") == N + BODY_B2 + ".mesh.241111606"
+    assert forward.rename(PFB) == PFB_B2 and forward.rename(HELM_PFB) == HELM_PFB_B1
+    assert forward.rename("ch03_034_0012") == "ch03_045_0022" and forward.rename("ch02_034_0013") == "ch02_087_0003"
+    assert forward.rename(WAIST_ALBD) is None and forward.part_of(WAIST_ALBD) == "waist"
+    assert forward.rename(WAIST_ALBD, all_parts=True) == WAIST_ALBD_B1  # (either would do: the first target's)
+    assert forward.renames(WAIST_ALBD) == [WAIST_ALBD_B1, WAIST_ALBD_B2]
+    assert forward.renames(CUSTOM) == [] and forward.part_of(CUSTOM) is None and forward.rename(AVP, True) is None
+    assert forward.to(B2).parts == ("body",) and forward.to(B).target == B
+    with pytest.raises(RetargetError):
+        forward.to(Slot("armor", "099/000"))
+
+    back = R.renamer_of(A, MIXED, reverse=True)
+    assert back.rename(N + HELM_B1 + ".mesh.241111606") == N + HELM + ".mesh.241111606"
+    assert back.rename(N + BODY_B2 + ".mesh.241111606") == N + BODY + ".mesh.241111606"
+    assert back.rename("ch03_045_0022") == "ch03_034_0012" and back.rename("ch03_087_0003") == "ch03_034_0013"
+    assert back.rename(WAIST_ALBD_B1) is None and back.rename(WAIST_ALBD_B1, all_parts=True) == WAIST_ALBD
+    assert back.rename(WAIST_ALBD_B2, all_parts=True) == WAIST_ALBD
+    assert back.rename(N + BODY + ".mesh.241111606", all_parts=True) is None  # the original's: not a target's
+
+    # one target: a Renamer, the same as a move to it
+    same = R.renamer_of(A, {"body": B, "helm": B})
+    assert type(same) is Renamer and same.parts == ("helm", "body") and same.target == B and same.to(B) is same
+    assert type(R.renamer_of(SWORD, {"main": SWORD_B, "sub": SWORD_B})) is Renamer
+    assert same.renames(WAIST_ALBD) == [CHAR + "ch03/087/000/5/textures/ch03_087_0005_ALBD.tex"]
+    with pytest.raises(RetargetError):
+        R.MixedRenamer([Renamer(A, B, ["helm"]), Renamer(A, B2, ["helm", "body"])])  # a part to two places
+    with pytest.raises(RetargetError):
+        R.renamer_of(A, {})
+
+    # the mover takes the target the plan chose for each file, in the reference's own spelling
+    moved = R.mover([(N + WAIST_ALBD_B2 + ".241106027", N + WAIST_ALBD + ".241106027"),
+                     (N + ALBD_B2 + ".241106027", N + ALBD + ".241106027")], forward)
+    assert moved(WAIST_ALBD) == WAIST_ALBD_B2 and moved(ALBD.lower()) == ALBD_B2.lower()
+    assert moved(HELM_ALBD) is None
+    with pytest.raises(RetargetError):
+        R.mover([(N + "Art/elsewhere.tex", N + ALBD + ".241106027")], forward)(ALBD)

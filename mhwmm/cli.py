@@ -540,9 +540,13 @@ def cmd_equip_preview(manager: ModManager, args) -> int:
 
 def cmd_retarget(manager: ModManager, args) -> int:
     """다른 장비로 옮기기: a new mod that changes another armor design or weapon model the way a mod changes
-    its own (the original is switched off unless --keep-original)."""
-    from .equip.model import BODIES, PART_LABELS, Target, fallback_label
-    from .equip.retarget import Slot
+    its own (the original is switched off unless --keep-original). ``--to`` more than once: the one without
+    a part for every part, ``part=equipment`` for that part (armor parts to different designs)."""
+    from .equip.model import BODIES, PART_LABELS, PART_ORDER, Target, fallback_label
+    from .equip.retarget import Slot, parts_on
+
+    example = "(예: armor/f/087/000, weapon/03/000029)"
+    labels = {label: part for part, label in PART_LABELS.items()}
 
     def body(t) -> str:
         head = t.key.partition("/")[0]
@@ -551,15 +555,30 @@ def cmd_retarget(manager: ModManager, args) -> int:
     def with_body(t, b: str):  # armor/004/000 -> armor/f/004/000 (both bodies move together anyway)
         return Target(t.kind, f"{b}/{t.key}") if t.kind == "armor" and b and not body(t) else t
 
-    def pick(found):  # the one of the body of --to
-        return next((t for t in found if body(t) == body(target)), found[0])
+    def equipment(text: str):
+        found = parse_target(text)
+        if found is None:
+            raise SystemExit(f"장비를 알 수 없습니다: {text} {example}")
+        return found.item
 
     (mod,) = _resolve(manager, [args.mod])
-    example = "(예: armor/f/087/000, weapon/03/000029)"
-    target = parse_target(args.to)
-    if target is None:
-        raise SystemExit(f"장비를 알 수 없습니다: {args.to} {example}")
-    target = target.item
+    default, chosen = None, {}  # --to without a part (every part), part=... (that part)
+    for value in args.to:
+        head, sep, rest = value.partition("=")
+        if not sep:
+            if default is not None:
+                raise SystemExit("부위를 적지 않은 --to(모든 부위에 입힐 장비)는 하나만 적으세요")
+            default = equipment(value)
+            continue
+        part = labels.get(head.strip(), head.strip().lower())
+        if part in chosen:
+            raise SystemExit(f"한 부위에 --to를 두 번 적었습니다: {head.strip()}")
+        chosen[part] = equipment(rest)
+    reference = default if default is not None else next(iter(chosen.values()))  # (whose body to take)
+
+    def pick(found):  # the one of the body of --to
+        return next((t for t in found if body(t) == body(reference)), found[0])
+
     if args.source:
         source = parse_target(args.source)
         if source is None:
@@ -568,7 +587,7 @@ def cmd_retarget(manager: ModManager, args) -> int:
         if source.kind == "armor" and not body(source):  # the body the mod has that design in
             slot = Slot("armor", source.key)
             found = [t for t in manager.retarget_sources(mod.id) if Slot.of(t) == slot]
-            source = pick(found) if found else with_body(source, body(target))
+            source = pick(found) if found else with_body(source, body(reference))
     else:
         sources = manager.retarget_sources(mod.id)
         if not sources:
@@ -578,11 +597,42 @@ def cmd_retarget(manager: ModManager, args) -> int:
             raise SystemExit("원래 장비가 여러 개입니다. --from으로 고르세요: " +
                              ", ".join(f"{t.kind}/{t.key}" for t in sources))
         source = pick(sources)
-    target = with_body(target, body(source))
     parts = None
     if args.parts is not None:
-        labels = {label: part for part, label in PART_LABELS.items()}
         parts = [labels.get(p.strip(), p.strip().lower()) for p in args.parts.split(",") if p.strip()]
+    if not chosen:  # one piece of equipment for every part (or those of --parts)
+        target = with_body(default, body(source))
+    else:  # each part its own: the parts named, and with a --to without a part every other one
+        def fit(t):  # (both bodies of a design move together: named with the original's body)
+            if t.kind != "armor" or not body(source):
+                return t
+            return Target("armor", f"{body(source)}/{t.key.partition('/')[2] if body(t) else t.key}")
+
+        def named(names) -> str:
+            return ", ".join(PART_LABELS.get(p, p) for p in names)
+
+        order = PART_ORDER.get(source.kind, ())
+        if [p for p in chosen if p not in order]:
+            raise SystemExit(f"알 수 없는 부위입니다: {named(p for p in chosen if p not in order)}")
+        if parts is not None and [p for p in chosen if p not in parts]:
+            raise SystemExit(f"--parts에 없는 부위의 --to입니다: {named(p for p in chosen if p not in parts)}")
+        if parts is not None:
+            wanted = parts
+        elif default is not None and source.kind == "armor":  # the parts the mod changes (and those named)
+            scan = manager.equipment_scans([manager.equipment_job(mod.id)]).get(mod.id)
+            changed = parts_on(scan.targets, source) if scan is not None else []
+            wanted = [*changed, *chosen] if changed else list(order)
+        else:
+            wanted = list(order) if default is not None else list(chosen)
+        missing = [p for p in wanted if p not in chosen and default is None]
+        if missing:
+            raise SystemExit(f"옮길 장비를 고르지 않은 부위입니다: {named(missing)} (--to 부위=장비, 또는 모든 부위에 "
+                             "입힐 장비를 부위 없이 --to로)")
+        wanted = sorted(dict.fromkeys(wanted), key=lambda p: order.index(p) if p in order else len(order))
+        target = {p: fit(chosen.get(p, default)) for p in wanted}
+        # every part to one: a move to it (as without parts; a weapon's main and sub only together)
+        if len(set(target.values())) == 1 and (source.kind == "armor" or set(target) == set(order)):
+            target, parts = next(iter(target.values())), list(target)
     shown = [0.0]
 
     def progress(done, total, msg):
@@ -599,9 +649,14 @@ def cmd_retarget(manager: ModManager, args) -> int:
         return f"{(catalog.name(t) if catalog is not None else '') or fallback_label(t)} ({t.kind}/{t.key})"
 
     plan = manager.plan_retarget(mod.id, source, target, parts)
-    print(f"{mod.name}: {label(source)} → {label(target)}")
-    if plan.source.kind == "armor" and plan.parts:
-        print(f"  부위: {', '.join(PART_LABELS.get(p, p) for p in plan.parts)}")
+    if isinstance(target, dict):
+        print(f"{mod.name}: {label(source)} → 부위마다 다른 장비")
+        for part, t in target.items():
+            print(f"  {PART_LABELS.get(part, part)} → {label(t)}")
+    else:
+        print(f"{mod.name}: {label(source)} → {label(target)}")
+        if plan.source.kind == "armor" and plan.parts:
+            print(f"  부위: {', '.join(PART_LABELS.get(p, p) for p in plan.parts)}")
     fills = sum(1 for move in plan.moves if move.how == "fill")
     print(f"  옮길 파일 {len(plan.moves) - fills}개 · " + (f"게임에서 가져올 파일 {fills}개 · " if fills else "") +
           f"그대로 넣을 파일 {len(plan.kept)}개 · 넣지 않을 파일 {len(plan.dropped)}개")
@@ -1067,10 +1122,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("retarget", help="다른 장비로 옮기기: 모드가 바꾸는 방어구·무기 대신 다른 장비를 바꾸는 새 모드 "
                                         "만들기 (원래 모드는 그대로 두고 끔)")
     p.add_argument("mod", help="모드 id, 번호 또는 이름")
-    p.add_argument("--to", required=True, help="옮길 장비 (예: armor/f/087/000, weapon/03/000029 · 방어구는 같은 체형, "
-                                               "무기는 같은 종류)")
+    p.add_argument("--to", required=True, action="append", metavar="[부위=]장비",
+                   help="옮길 장비 (예: armor/f/087/000, weapon/03/000029 · 방어구는 같은 체형, 무기는 같은 종류). "
+                        "방어구는 부위마다 다른 장비로도: --to helm=armor/f/045/002 (또는 머리=...)를 부위마다 "
+                        "적고, 부위 없는 --to는 나머지 모든 부위 (예: --to armor/f/087/000 --to 머리=armor/f/045/002)")
     p.add_argument("--from", dest="source", help="원래 장비 (모드가 여러 장비를 바꿀 때, 예: armor/f/034/001)")
-    p.add_argument("--parts", help="방어구에서 옮길 부위 (쉼표로, 예: helm,body 또는 머리,몸통 · 생략하면 모든 부위)")
+    p.add_argument("--parts", help="방어구에서 옮길 부위 (쉼표로, 예: helm,body 또는 머리,몸통 · 생략하면 모든 부위, "
+                                  "부위 없는 --to가 없으면 --to로 고른 부위)")
     p.add_argument("--keep-original", action="store_true", help="원래 모드를 끄지 않음")
     p.add_argument("--dry-run", action="store_true", help="무엇을 옮기는지만 보여 주고 새 모드는 만들지 않음")
     p.add_argument("--no-deploy", action="store_true", help="게임 폴더에 바로 적용하지 않음")

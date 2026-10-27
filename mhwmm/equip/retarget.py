@@ -7,11 +7,16 @@ A's files are put at B's paths and the paths inside the moved materials (.mdf2) 
 keeps the length of the string and every content edit is made in place: no file is laid out again.
 
 - armor: one design folder MMM/SSS with both bodies (ch02/ch03 model folders, Male/Female prefabs)
-  to another design folder, all of the parts or some; weapon: one model TT/MMMMMM (main and sub)
-  to another model of the same type.  Bodies, parts and weapon types never change.
+  to another design folder, all of the parts or some, and each part to a design of its own if need
+  be (부위마다 다른 장비로: the helm to one design, the body to another, in one new mod); weapon: one
+  model TT/MMMMMM (main and sub) to another model of the same type.  Bodies, parts and weapon types
+  never change.
 - which files move follows the references: a shipped file a moved (or kept) material or RSZ file
   points at moves too when it is A's (in any part), and is kept unchanged otherwise (a custom
   folder, a shared texture).  References to A's game files the mod does not ship stay as they are.
+  A file of a chosen part goes to that part's target wherever it is used from; a file of a part not
+  chosen goes with the target of the parts whose files use it (parts of different targets using the
+  same such file: the move cannot be made).
 - never moved: the per-design ``MMM_SSS_avp.user`` (hide/merge settings that must match the target's
   own: a copy can freeze the appearance menu or turn the armor black) and ``*_wvp.user`` (tuned for
   the target's model); sound banks (their ids are the original weapon's, the target's bank list
@@ -57,7 +62,8 @@ from .scan import MAX_READ, _why
 
 log = logging.getLogger(__name__)
 
-RETARGET_FORMAT = 1  # stored in the recipe (Mod.retarget); raise when the rules change
+# stored in the recipe (Mod.retarget); raise when the rules change.  2: "to" may be a part -> target map
+RETARGET_FORMAT = 2
 KINDS = ("armor", "weapon")
 _CONTENT = {"mdf2": "mdf2", "pfb": "rsz", "user": "rsz", "scn": "rsz"}  # files with paths inside
 _MAGICS = {b"MDF\x00": "mdf2", **{magic: "rsz" for magic in rsz.MAGICS}}
@@ -177,6 +183,16 @@ def sources_of(targets: Iterable[Target]) -> list[Target]:
     return sorted({t.item for t in targets if Slot.of(t) is not None})
 
 
+def parts_on(targets: Iterable[Target], source: Target) -> list[str]:
+    """The armor parts among ``targets`` (a ModScan's) on ``source``'s design, both bodies together (they
+    move together), in ARMOR_PARTS order ([] for a weapon)."""
+    if source.kind != "armor":
+        return []
+    design = source.key.partition("/")[2]
+    found = {t.part for t in targets if t.kind == "armor" and t.key.partition("/")[2] == design and t.part}
+    return [p for p in ARMOR_PARTS if p in found]
+
+
 class Renamer:
     """A's ids -> B's in a game path, a resource string or a bare name.  ``parts``: the armor parts to
     move (model.ARMOR_PARTS names, None: all); a weapon always moves both of its models."""
@@ -260,6 +276,91 @@ class Renamer:
         if len(new) != len(path):
             raise RetargetError(f"경로의 길이가 바뀌어 옮길 수 없습니다: {path}")
         return new
+
+    def renames(self, path: str) -> list[str]:
+        """Every new spelling ``path`` can get (any part): [rename(path, all_parts=True)], [] when it is
+        not A's.  (A MixedRenamer can give one per target: :func:`mover` picks the planned one.)"""
+        new = self.rename(path, all_parts=True)
+        return [] if new is None else [new]
+
+    def to(self, target: Slot) -> "Renamer":
+        """The renamer of the parts that go to ``target``: this one (see MixedRenamer.to)."""
+        if target != self.target:
+            raise RetargetError(f"옮길 장비가 계획과 다릅니다 ({target.key})")
+        return self
+
+
+class MixedRenamer:
+    """Several Renamers as one: the armor parts of one design moved to different designs (one Renamer
+    per target with the parts that go there, :func:`renamer_of`), or back (each target's ids to the
+    design its parts came from).  It has Renamer's methods: a path goes by the member whose source it
+    belongs to and whose parts hold its part.  ``rename(path, all_parts=True)`` of a part no member
+    moves could be any member's: it gives the first member's, which tells whether a path is the
+    source's; where such a file goes plan decides (the target of the files that use it), and
+    :func:`mover` takes the member that gives the planned path (``renames``).  ``source`` and
+    ``target``: the first member's."""
+
+    def __init__(self, members: Iterable[Renamer]):
+        self.members = tuple(members)
+        if not self.members:
+            raise RetargetError("옮길 부위를 하나 이상 고르세요")
+        taken: dict[Slot, set[str]] = {}
+        for member in self.members:
+            have = taken.setdefault(member.source, set())
+            if have & set(member.parts):
+                raise RetargetError("한 부위를 두 장비로 옮길 수 없습니다")
+            have.update(member.parts)
+        self.source, self.target = self.members[0].source, self.members[0].target
+        order = ARMOR_PARTS + WEAPON_PARTS
+        self.parts = tuple(p for p in order if any(p in member.parts for member in self.members))
+
+    def _owner(self, path: str) -> Renamer | None:
+        for member in self.members:
+            part = member.part_of(path)
+            if part is not None and (part in member.parts or member.source.kind != "armor"):
+                return member
+        return None
+
+    def part_of(self, path: str) -> str | None:
+        return next((part for member in self.members if (part := member.part_of(path)) is not None), None)
+
+    def rename(self, path: str, all_parts: bool = False) -> str | None:
+        owner = self._owner(path)
+        if owner is not None:
+            return owner.rename(path, all_parts)
+        if not all_parts:
+            return None
+        return next((new for member in self.members if (new := member.rename(path, all_parts=True)) is not None),
+                    None)
+
+    def renames(self, path: str) -> list[str]:
+        return list(dict.fromkeys(new for member in self.members
+                                  if (new := member.rename(path, all_parts=True)) is not None))
+
+    def to(self, target: Slot) -> Renamer:
+        """The member that moves to ``target`` (its parts' Renamer)."""
+        member = next((m for m in self.members if m.target == target), None)
+        if member is None:
+            raise RetargetError(f"옮길 장비가 계획과 다릅니다 ({target.key})")
+        return member
+
+
+def renamer_of(source: Slot, targets: Mapping[str, Slot], reverse: bool = False) -> Renamer | MixedRenamer:
+    """The renamer of a move of ``source``'s parts to ``targets`` (part -> its target, as Plan.targets: a
+    weapon's main and sub to one weapon): a Renamer when every part goes to one target (the same as
+    ``Renamer(source, target, parts)``), else a MixedRenamer of one Renamer per target with the parts that
+    go there.  ``reverse``: back, each target's ids to ``source``'s (how the material check reads the new
+    mod's files).  RetargetError as Renamer."""
+    groups: dict[Slot, list[str]] = {}
+    for part, slot in targets.items():
+        groups.setdefault(slot, []).append(part)
+    if not groups:
+        raise RetargetError("옮길 부위를 하나 이상 고르세요")
+    members = []
+    for slot, parts in groups.items():
+        chosen = parts if source.kind == "armor" else None
+        members.append(Renamer(slot, source, chosen) if reverse else Renamer(source, slot, chosen))
+    return members[0] if len(members) == 1 else MixedRenamer(members)
 
 
 # ---- the mod's files --------------------------------------------------------------------------------
@@ -439,12 +540,13 @@ def _same_length(old: str, new: str) -> None:
 
 
 def rewrite(data: bytes, name: str | None, moved: Callable[[str], str | None],
-            renamer: Renamer | None = None) -> tuple[bytes, int]:
+            renamer: Renamer | MixedRenamer | None = None) -> tuple[bytes, int]:
     """``data`` with its references to moved files pointed at their new paths, in place (every new
     string is as long as the old one): (new bytes, number of strings changed).  ``name``: the file's
     name (its type and version; None for an unnamed pak entry: told by its first bytes).  ``moved(ref)``
     gives a reference's new text or None (see :func:`mover`).  ``renamer`` also renames the bare names
-    of A in an RSZ file (a prefab's GameObject name ``ch03_034_0012``); None leaves them.  Other files
+    of A in an RSZ file (a prefab's GameObject name ``ch03_034_0012``: with a MixedRenamer, each to its
+    own part's target, as references to files go); None leaves them.  Other files
     than .mdf2 and RSZ files hold no paths and come back unchanged.  RetargetError when the result
     does not read back as intended."""
     kind = _kind(name, data)
@@ -510,19 +612,25 @@ def _rewrite_rsz(data: bytes, moved, renamer: Renamer | None) -> tuple[bytes, in
     return bytes(out), count
 
 
-def mover(pairs: Iterable[tuple[str, str]], renamer: Renamer) -> Callable[[str], str | None]:
+def mover(pairs: Iterable[tuple[str, str]], renamer: Renamer | MixedRenamer) -> Callable[[str], str | None]:
     """The ``moved`` function of :func:`rewrite` for moved files ``pairs`` ((new path, old path), as
     Built.moves and the recipe keep them): a reference to an old path (compared normalized: case,
     natives/STM/, streaming/, version) -> that reference renamed, its own spelling kept; None for
-    anything else."""
+    anything else.  With a MixedRenamer, the member that gives the reference its file's new path (a
+    file of one part a file of another part points at went to its own part's target)."""
     table = {normalize(old): normalize(new) for new, old in pairs}
+    renames = getattr(renamer, "renames", None)
+    if renames is None:  # (anything with Renamer.rename)
+        def renames(ref: str) -> list[str]:
+            new = renamer.rename(ref, all_parts=True)
+            return [] if new is None else [new]
 
     def moved(ref: str) -> str | None:
         want = table.get(normalize(ref))
         if want is None:
             return None
-        new = renamer.rename(ref, all_parts=True)
-        if new is None or normalize(new) != want:
+        new = next((new for new in renames(ref) if normalize(new) == want), None)
+        if new is None:
             raise RetargetError(f"옮긴 파일을 가리키는 경로를 고치지 못했습니다: {ref}")
         return new
 
@@ -538,11 +646,14 @@ class Move:
     # mod does not ship, completing a model and its material: Plan.fills)
     how: str = "copy"
     pak: str | None = None  # the pak of an entry
+    target: Slot | None = None  # the equipment the file went to (Plan.targets: its part's, or its users')
 
 
 @dataclass
 class Plan:
     source: Slot
+    # the target of a move of every part to one piece of equipment; of a move of the parts to different
+    # ones (부위마다 다른 장비로), that of the first chosen part in ARMOR_PARTS order (Plan.targets has all)
     target: Slot
     parts: tuple[str, ...] = ()  # the chosen armor parts (a weapon: both models)
     moves: list[Move] = field(default_factory=list)
@@ -558,41 +669,112 @@ class Plan:
     # new path (a material's references to moved files rewritten); also in moves, how "fill"
     fills: list[Item] = field(default_factory=list)
     bad_parts: set[str] = field(default_factory=set)  # armor parts an error names (unticking them helps)
+    # each chosen part -> the equipment it goes to (a move to one: every part to ``target``; a weapon: main
+    # and sub to it); filled from ``parts`` when not given
+    targets: dict[str, Slot] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.targets and self.parts:
+            self.targets = {part: self.target for part in self.parts}
 
     @property
     def ok(self) -> bool:
         return not self.errors and bool(self.moves)
 
+    @property
+    def mixed(self) -> bool:
+        """Do the chosen parts go to different equipment?"""
+        return len(set(self.targets.values())) > 1
 
-def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | None = None,
-         game=None) -> Plan:
-    """What moving ``items`` (items_of) from ``source`` to ``target`` would do.  ``parts``: the armor
-    parts to move (None: all).  ``game`` (has(path) / read(path) like matfix.game.GameIndex; None: not
-    checked) shows whether the target's own prefabs would load the moved models, and gives the model
-    or material a part of the mod lacks (Plan.fills: A's game file; without the game such a part is an
-    error).  Reads the mod's materials and RSZ files; never raises for a broken file (it becomes an
-    error)."""
-    result = Plan(source, target)
-    problem = why_not(source, target)
-    if problem:
-        result.errors.append(problem)
-        return result
-    try:
-        renamer = Renamer(source, target, parts)
-    except RetargetError as exc:
-        result.errors.append(str(exc))
-        return result
-    result.parts = renamer.parts
-    if not renamer.parts:
+
+def _mapped(source: Slot, mapping: Mapping[str, Slot], parts: Iterable[str] | None) -> tuple[Plan, dict | None]:
+    """A Plan for a move of each part to its own target (``mapping``: part -> target, armor only) with the
+    chosen parts and their targets, and those targets in ARMOR_PARTS order; None (the Plan's errors say
+    why) when it cannot be made: a weapon (its models go together), a part that is not one, ``parts``
+    other than the mapping's, a target a part cannot go to (why_not; named with the part, which goes
+    into bad_parts, unless every part goes to the same one: then as a move to that one)."""
+    first = next((slot for slot in mapping.values() if isinstance(slot, Slot)), source)  # (source: none)
+    if source.kind == "weapon":
+        result = Plan(source, first)
+        result.errors.append("무기는 본체와 보조를 함께 한 무기로만 옮길 수 있습니다")
+        return result, None
+    chosen = {part: mapping[part] for part in ARMOR_PARTS if part in mapping}
+    slots = {part: slot for part, slot in chosen.items() if isinstance(slot, Slot)}
+    result = Plan(source, next(iter(slots.values()), first))
+    result.parts, result.targets = tuple(chosen), slots
+    unknown = sorted(str(part) for part in mapping if part not in ARMOR_PARTS)
+    if unknown:
+        result.errors.append(f"알 수 없는 부위입니다: {', '.join(unknown)}")
+        return result, None
+    if parts is not None and set(parts) != set(chosen):
+        result.errors.append("옮길 부위가 부위마다 고른 장비와 맞지 않습니다")
+        return result, None
+    if not chosen:
         result.errors.append("옮길 부위를 하나 이상 고르세요")
-        return result
+        return result, None
+    problems = {}
+    for part, slot in chosen.items():
+        problem = why_not(source, slot) if isinstance(slot, Slot) else f"옮길 수 없는 장비입니다 ({slot})"
+        if problem:
+            problems[part] = problem
+    if problems:
+        same = len(slots) == len(chosen) and not result.mixed
+        if same or (len(problems) == len(chosen) and len(set(problems.values())) == 1):
+            result.errors.append(next(iter(problems.values())))  # (the source's own problem, or one target)
+        else:
+            for part, problem in problems.items():
+                result.errors.append(f"{PART_LABELS[part]}: {problem}")
+                result.bad_parts.add(part)
+        return result, None
+    return result, chosen
+
+
+def plan(items: list[Item], source: Slot, target: Slot | Mapping[str, Slot], parts: Iterable[str] | None = None,
+         game=None) -> Plan:
+    """What moving ``items`` (items_of) from ``source`` to ``target`` would do.  ``target``: the equipment
+    the chosen ``parts`` (armor parts, None: all) go to, or for armor a mapping part -> the equipment that
+    part goes to (부위마다 다른 장비로; the parts not in it are not moved, ``parts`` must then be None or
+    its parts; a mapping of every part to one target is the same as that target).  ``game`` (has(path) /
+    read(path) like matfix.game.GameIndex; None: not checked) shows whether the targets' own prefabs
+    would load the moved models, and gives the model or material a part of the mod lacks (Plan.fills: A's
+    game file; without the game such a part is an error).  Reads the mod's materials and RSZ files; never
+    raises for a broken file (it becomes an error)."""
+    if isinstance(target, Mapping):
+        result, targets = _mapped(source, target, parts)
+        if targets is None:
+            return result
+        try:
+            renamer = renamer_of(source, targets)
+        except RetargetError as exc:
+            result.errors.append(str(exc))
+            return result
+    else:
+        result = Plan(source, target)
+        problem = why_not(source, target)
+        if problem:
+            result.errors.append(problem)
+            return result
+        try:
+            renamer = Renamer(source, target, parts)
+        except RetargetError as exc:
+            result.errors.append(str(exc))
+            return result
+        result.parts = renamer.parts
+        if not renamer.parts:
+            result.errors.append("옮길 부위를 하나 이상 고르세요")
+            return result
+        targets = {part: target for part in renamer.parts}
+        result.targets = dict(targets)
+    mixed = result.mixed
+    weapon = source.kind == "weapon"
 
     named: dict[str, list[Item]] = {}  # normalized path -> items (a file and its streaming/ copy, versions)
     for item in items:
         if item.path is not None:
             named.setdefault(normalize(item.path), []).append(item)
     fate: dict[int, str] = {}  # id(item) -> "move" | "keep"
-    pulled: Counter = Counter()  # parts not chosen whose files move because moved files use them
+    pulled: list[Item] = []  # files of parts not chosen that move because moved files use them
+    uses: dict[int, list[Item]] = {}  # id(item) -> the shipped files it points at that are moved or kept
     # unnamed models, and materials and RSZ files that name A: they would stay at A, the rest at B
     unknown: Counter = Counter()
     for item in items:
@@ -616,19 +798,21 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
     contents: dict[int, tuple[bytes, list[str]]] = {}
     queue = deque(item for item in items if id(item) in fate and item.path is not None and kinds[id(item)])
 
-    def follow(refs: Iterable[str]) -> None:
+    def follow(refs: Iterable[str], user: Item) -> None:
+        edges = uses.setdefault(id(user), [])
         for ref in refs:
             for other in named.get(normalize(ref), ()):
-                if (id(other) in fate or not _game_file(other.path) or _NEVER.search(other.path)
-                        or _is_sound(other.path)):
-                    continue
-                if not _is_shader(other.path) and renamer.rename(other.path, all_parts=True) is not None:
-                    fate[id(other)] = "move"
-                    pulled[renamer.part_of(other.path)] += 1
-                else:  # a custom folder's or a shared file, a shader: where it is
-                    fate[id(other)] = "keep"
-                if kinds[id(other)]:
-                    queue.append(other)
+                if id(other) not in fate:
+                    if not _game_file(other.path) or _NEVER.search(other.path) or _is_sound(other.path):
+                        continue
+                    if not _is_shader(other.path) and renamer.rename(other.path, all_parts=True) is not None:
+                        fate[id(other)] = "move"
+                        pulled.append(other)
+                    else:  # a custom folder's or a shared file, a shader: where it is
+                        fate[id(other)] = "keep"
+                    if kinds[id(other)]:
+                        queue.append(other)
+                edges.append(other)
 
     def drain() -> None:
         while queue:
@@ -646,12 +830,13 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
                     log.info("%s: %s", _label(item), exc)
                 continue
             contents[id(item)] = (data, refs)
-            follow(refs)
+            follow(refs, item)
 
     drain()
-    fills, failed = _fills(result, [item for item in items if fate.get(id(item)) == "move"], renamer, game,
-                           contents, set(named))
-    follow(ref for fill in fills for ref in contents.get(id(fill), (b"", []))[1])  # A's material's own files
+    fills, failed, filled_for = _fills(result, [item for item in items if fate.get(id(item)) == "move"], renamer,
+                                       game, contents, set(named))
+    for fill in fills:  # A's material's own files
+        follow(contents.get(id(fill), (b"", []))[1], fill)
     drain()
     result.fills = fills
 
@@ -659,10 +844,59 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
     keeping = [item for item in items if fate.get(id(item)) == "keep"]
     filled = {id(fill) for fill in fills}
     filled_paths = {normalize(fill.path) for fill in fills}  # (a moved prefab may name them: not left as they are)
-    placed = [*moving, *fills]  # everything that lands at the target's paths
-    new_of = {id(item): renamer.rename(item.path, all_parts=True) for item in placed}
+    placed = [*moving, *fills]  # everything that lands at the targets' paths
     if not moving:
         result.errors.append("이 모드에는 옮길 원래 장비의 파일이 없습니다")
+
+    # where each file goes: a chosen part's to its target, any other to the target of the files using it
+    dest: dict[int, Slot] = {}
+    reach: dict[int, dict[Slot, set[str]]] = {}  # id(item) -> target -> the chosen parts whose files use it
+    work: deque = deque()
+    for item in placed:
+        part = renamer.part_of(item.path)
+        if id(item) in filled and part not in targets:
+            part = filled_for[id(item)]  # (a material a part's prefab names)
+        if weapon or part in targets:
+            dest[id(item)] = result.target if weapon else targets[part]
+            reach[id(item)] = {dest[id(item)]: {part or ""}}
+            work.append(item)
+    while work:
+        item = work.popleft()
+        for other in uses.get(id(item), ()):
+            if id(other) in dest:
+                continue
+            mine, grew = reach.setdefault(id(other), {}), False
+            for slot, users in reach[id(item)].items():
+                have = mine.setdefault(slot, set())
+                if not users <= have:
+                    have |= users
+                    grew = True
+            if grew:
+                work.append(other)
+    order = list(dict.fromkeys(targets.values()))
+    shared: dict[tuple[str, frozenset], list[str]] = {}  # (part, the parts using it) -> files of different targets
+    carried: dict[tuple[str, Slot], tuple[int, set[str]]] = {}  # (part, target) -> files, the parts using them
+    for item in pulled:
+        got = reach.get(id(item)) or {result.target: set()}
+        slots = sorted(got, key=lambda slot: order.index(slot) if slot in order else len(order))
+        dest[id(item)] = slots[0]
+        part = renamer.part_of(item.path) or ""
+        users = set().union(*got.values())
+        if len(slots) > 1:
+            shared.setdefault((part, frozenset(users)), []).append(item.path)
+        else:
+            n, before = carried.get((part, slots[0]), (0, set()))
+            carried[(part, slots[0])] = (n + 1, before | users)
+    for (part, users), paths in sorted(shared.items(), key=lambda kv: (_part_order(kv[0][0]), sorted(kv[1]))):
+        label, names = PART_LABELS.get(part, part), sorted(paths, key=str.lower)
+        more = f" 외 {len(names) - 1}개" if len(names) > 1 else ""
+        result.errors.append(f"고르지 않은 {label} 파일({names[0].rpartition('/')[2]}{more})을 여러 부위"
+                             f"({_labels(users)})가 함께 써서 한 장비로 옮길 수 없습니다. 이 부위들을 같은 장비로 "
+                             f"옮기거나 {label}도 함께 옮기세요")
+        result.bad_parts.update(users)  # (leaving one of them where it is helps too)
+
+    own = {slot: renamer.to(slot) for slot in order}  # each target's renamer
+    new_of = {id(item): own[dest[id(item)]].rename(item.path, all_parts=True) for item in placed}
 
     # a moved file must not land on a file the mod already has (it then changes the target already)
     staying = {key for key, group in named.items() if any(fate.get(id(it)) != "move" for it in group)}
@@ -695,7 +929,7 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
                 norm = normalize(ref)
                 if norm not in named and norm not in filled_paths and renamer.rename(ref, all_parts=True) is not None:
                     vanilla.add(norm)
-        result.moves.append(Move(item.path, new_of[id(item)], how, item.pak))
+        result.moves.append(Move(item.path, new_of[id(item)], how, item.pak, dest[id(item)]))
     result.moves.sort(key=lambda m: (m.pak or "", m.new.lower()))
     result.vanilla_refs = len(vanilla)
     for item in keeping:
@@ -720,7 +954,6 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
             reason = "소리 파일은 옮기지 않습니다"
             sounds += renamer.rename(path, all_parts=True) is not None
         elif (owner := classify(path)) is not None and _NEVER.search(path) and Slot.of(owner) == source:
-            weapon = source.kind == "weapon"
             reason = "무기 외형 설정 파일(_wvp.user)은 옮기지 않습니다" if weapon else \
                 "외형 설정 파일(_avp.user)은 옮기지 않습니다"
             never.add(source.kind)
@@ -735,36 +968,44 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
         result.dropped.append((path, reason))
     result.dropped.sort(key=lambda d: d[0].lower())
 
-    for part, n in sorted(pulled.items(), key=lambda kv: _part_order(kv[0])):
+    for (part, slot), (n, users) in sorted(carried.items(), key=lambda kv: (_part_order(kv[0][0]),
+                                                                           order.index(kv[0][1]))):
         label = PART_LABELS.get(part, part)
-        result.notes.append(f"고르지 않은 {label} 파일 {n}개도 옮기는 파일이 써서 함께 옮깁니다. "
-                            f"대상 장비의 {label} 모습도 달라질 수 있습니다")
+        if mixed:  # the parts using them name the target
+            users_label = _labels(users)
+            result.notes.append(f"고르지 않은 {label} 파일 {n}개도 {users_label} 파일이 써서 함께 옮깁니다. "
+                                f"{_josa(users_label, '을를')} 옮길 장비의 {label} 모습도 달라질 수 있습니다")
+        else:
+            result.notes.append(f"고르지 않은 {label} 파일 {n}개도 옮기는 파일이 써서 함께 옮깁니다. "
+                                f"대상 장비의 {label} 모습도 달라질 수 있습니다")
     if moving:
         new_paths = [new_of[id(item)] for item in placed]
-        _check_game(result, new_paths, game)
+        _check_game(result, [(new_of[id(item)], dest[id(item)]) for item in placed], game)
         _meshless_notes(result, new_paths, {part for _body, part in failed})
         _body_notes(result, [new_of[id(item)] for item in moving], new_paths, failed)
     if result.vanilla_refs:
         result.notes.append(f"모드가 원래 장비의 게임 텍스처 등 {result.vanilla_refs}개를 그대로 씁니다. "
                             "원래 장비를 바꾸는 다른 모드를 켜면 옮긴 모드의 모습도 달라질 수 있습니다")
     if "armor" in never:
-        result.notes.append("방어구 외형 설정 파일(_avp.user)은 대상 장비의 설정과 맞아야 해서 옮기지 않았습니다. "
-                            "대상 장비의 설정이 그대로 쓰입니다")
+        whose = "부위마다 옮길 장비의" if mixed else "대상 장비의"
+        result.notes.append(f"방어구 외형 설정 파일(_avp.user)은 {whose} 설정과 맞아야 해서 옮기지 않았습니다. "
+                            f"{whose} 설정이 그대로 쓰입니다")
     if "weapon" in never:
         result.notes.append("무기 외형 설정 파일(_wvp.user)은 원래 무기의 모델에 맞춘 것이라 옮기지 않았습니다. "
                             "대상 무기의 설정이 그대로 쓰입니다")
     if moving and source.kind == "armor":
-        # the target's avp (and the hair settings it names) stays in force: it was made for its own models
+        # the targets' avp (and the hair settings it names) stays in force: it was made for its own models
+        whose = "부위마다 옮길 장비의" if mixed else "대상 장비의"
         if "helm" in renamer.parts and any(renamer.part_of(item.path) == "helm" for item in moving):
-            result.notes.append("머리카락 숨김·다른 부위와 겹칠 때 숨기는 설정은 대상 장비의 것을 씁니다. "
+            result.notes.append(f"머리카락 숨김·다른 부위와 겹칠 때 숨기는 설정은 {whose} 것을 씁니다. "
                                 "머리카락이 투구를 뚫고 나오거나 일부가 보이지 않을 수 있습니다")
         else:
-            result.notes.append("다른 부위와 겹칠 때 숨기는 설정은 대상 장비의 것을 씁니다. 일부가 보이지 않을 수 있습니다")
-    if moving and target.kind == "weapon" and target.ids()[1] == _ARTIAN_BAND:
+            result.notes.append(f"다른 부위와 겹칠 때 숨기는 설정은 {whose} 것을 씁니다. 일부가 보이지 않을 수 있습니다")
+    if moving and weapon and result.target.ids()[1] == _ARTIAN_BAND:
         result.notes.append("아티아 무기는 여러 무기가 같은 모델을 함께 씁니다. 옮긴 모습이 다른 아티아 무기에도 보일 수 "
                             "있습니다")
     if sounds:
-        result.notes.append(f"소리 파일은 옮기지 않습니다 (게임이 다른 {'무기' if source.kind == 'weapon' else '장비'}의 "
+        result.notes.append(f"소리 파일은 옮기지 않습니다 (게임이 다른 {'무기' if weapon else '장비'}의 "
                             "소리로 읽지 않습니다)")
     unnamed = sum(1 for item in keeping if item.path is None)
     if unnamed and not unknown:
@@ -773,6 +1014,11 @@ def plan(items: list[Item], source: Slot, target: Slot, parts: Iterable[str] | N
     if outside:
         result.notes.append(f"게임 폴더(natives) 밖의 파일 {outside}개(스크립트·플러그인 등)는 새 모드에 넣지 않습니다")
     return result
+
+
+def _labels(parts: Iterable[str]) -> str:
+    """"머리·몸통": part labels in ARMOR_PARTS order."""
+    return "·".join(PART_LABELS.get(part, part) for part in sorted(parts, key=_part_order))
 
 
 def _part_order(part: str) -> int:
@@ -820,8 +1066,8 @@ def _read_game(game, path: str) -> bytes:
     return bytes(data)
 
 
-def _fills(result: Plan, moving: list[Item], renamer: Renamer, game, contents: dict,
-           shipped: set[str]) -> tuple[list[Item], set[tuple[str, str]]]:
+def _fills(result: Plan, moving: list[Item], renamer: Renamer | MixedRenamer, game, contents: dict,
+           shipped: set[str]) -> tuple[list[Item], set[tuple[str, str]], dict[int, str]]:
     """A's game files that complete what a chosen part (armor per body, weapon per model) shows at the
     target, put at B's paths like the moved files:
     - a part without a prefab of the mod's own: the target's own prefab loads ``<stem>.mesh`` and
@@ -834,7 +1080,8 @@ def _fills(result: Plan, moving: list[Item], renamer: Renamer, game, contents: d
       the copy the moved textures.  A's game model the prefab names stays as it is (it still exists).
     A material read here goes into ``contents`` like the mod's.  ``shipped``: the normalized paths of the
     mod's files.  (fills, the (body, part)s that could not be completed: errors, armor parts in
-    Plan.bad_parts)."""
+    Plan.bad_parts, id(fill) -> the part it completes: it goes to that part's target unless it is a file of
+    another chosen part)."""
     source = result.source
     weapon = source.kind == "weapon"
     groups: dict[tuple[str, str], list[Item]] = {}
@@ -846,6 +1093,7 @@ def _fills(result: Plan, moving: list[Item], renamer: Renamer, game, contents: d
     paired: list[Item] = []  # the halves of a model and its material
     named: list[Item] = []  # the materials prefabs of the mod's own name
     paired_parts, named_parts, failed = [], [], set()
+    completes: dict[int, str] = {}
     read = {normalize(ref) for _data, refs in contents.values() for ref in refs}  # what the moved and kept files use
 
     def find(base: str, ext: str, group: list[Item]) -> str | None:
@@ -933,6 +1181,7 @@ def _fills(result: Plan, moving: list[Item], renamer: Renamer, game, contents: d
             continue
         (named if prefabs else paired).extend(new)
         (named_parts if prefabs else paired_parts).append(name)
+        completes.update((id(fill), part) for fill in new)
         read.update(normalize(ref) for fill in new for ref in contents.get(id(fill), (b"", []))[1])
     if paired:
         kinds = "·".join(label for ext, label in (("mesh", "모델"), ("mdf2", "재질"))
@@ -942,7 +1191,7 @@ def _fills(result: Plan, moving: list[Item], renamer: Renamer, game, contents: d
     if named:
         result.notes.append(f"{'·'.join(named_parts)}: 옮기는 텍스처를 쓰는 재질이 모드에 없어, 모드의 프리팹이 불러오는 "
                             f"원래 장비의 게임 재질 {len(named)}개를 함께 넣어 옮긴 텍스처를 쓰게 합니다")
-    return paired + named, failed
+    return paired + named, failed, completes
 
 
 def _meshless_notes(result: Plan, new_paths: list[str], failed: set[str]) -> None:
@@ -986,8 +1235,9 @@ def _body_notes(result: Plan, moved_paths: list[str], new_paths: list[str], fail
     for body, parts in sorted(files.items()):
         labels = "·".join(PART_LABELS.get(p, p) for p in sorted(parts, key=_part_order))
         ch = "ch02" if body == "m" else "ch03"
+        whose = "그 부위를 옮길 장비의" if result.mixed else "대상 장비의"
         result.notes.append(f"모드에 {BODIES[body]}용 {labels} 모델이 없는데 {BODIES[body]}용 폴더({ch})의 파일 "
-                            f"{sum(parts.values())}개도 옮깁니다. 대상 장비의 {BODIES[body]}용에도 영향을 줄 수 있습니다")
+                            f"{sum(parts.values())}개도 옮깁니다. {whose} {BODIES[body]}용에도 영향을 줄 수 있습니다")
 
 
 # ---- what the game says about the target ----------------------------------------------------------
@@ -1006,31 +1256,34 @@ def _prefabs(slot: Slot, body: str, part: str, more: Iterable[str] = ()) -> list
     return [f"natives/STM/GameDesign/Equip/_Prefab/Weapon/wp{t}/{ss}/{n}/it{t}{ss}_{n}_{k}.pfb.{v}" for v in pfb]
 
 
-def _check_game(result: Plan, new_paths: list[str], game) -> None:
-    """Errors and notes from the target's own files: does it have the part, does its prefab load the
-    moved model (and the moved physics), and does a prefab of the mod's own land where the target
-    keeps its prefab?  A part an error names goes into Plan.bad_parts (armor)."""
-    weapon = result.target.kind == "weapon"
-    groups: dict[tuple[str, str], dict[str, set[str]]] = {}  # (body, part) -> ext -> normalized new paths
-    by_part: dict[str, dict[str, set[str]]] = {}  # the same over both bodies
-    own: dict[tuple[str, str], list[str]] = {}  # (body, part) -> the new paths of the mod's own prefabs
-    for new in new_paths:
+def _check_game(result: Plan, placed: list[tuple[str, Slot]], game) -> None:
+    """Errors and notes from the targets' own files: does the target of a part have it, does its prefab
+    load the moved model (and the moved physics), and does a prefab of the mod's own land where the
+    target keeps its prefab?  ``placed``: (new path, the target it went to) of every file put at a target.
+    A part an error names goes into Plan.bad_parts (armor)."""
+    weapon = result.source.kind == "weapon"
+    # (target, body, part) -> ext -> normalized new paths
+    groups: dict[tuple[Slot, str, str], dict[str, set[str]]] = {}
+    by_part: dict[tuple[Slot, str], dict[str, set[str]]] = {}  # the same over both bodies
+    own: dict[tuple[Slot, str, str], list[str]] = {}  # -> the new paths of the mod's own prefabs
+    for new, slot in placed:
         t = classify(new)
-        if t is None or t.kind != result.target.kind or not t.part:
+        if t is None or t.kind != result.source.kind or not t.part:
             continue
         norm = normalize(new)
         ext = norm.rpartition(".")[2]
         body = "" if weapon else t.key[0]
-        groups.setdefault((body, t.part), {}).setdefault(ext, set()).add(norm)
-        by_part.setdefault(t.part, {}).setdefault(ext, set()).add(norm)
+        groups.setdefault((slot, body, t.part), {}).setdefault(ext, set()).add(norm)
+        by_part.setdefault((slot, t.part), {}).setdefault(ext, set()).add(norm)
         if _own_prefab(new):
-            own.setdefault((body, t.part), []).append(new)
-    checked = sorted({key for key, got in groups.items() if "mesh" in got} | set(own), key=_key_order)
+            own.setdefault((slot, body, t.part), []).append(new)
+    checked = sorted({key for key, got in groups.items() if "mesh" in got} | set(own),
+                     key=lambda key: (_key_order(key[1:]), key[0]))
     if game is None:
         if checked:
             result.notes.append("게임 파일을 읽을 수 없어 대상 장비에 그 부위가 있는지 확인하지 못했습니다")
         return
-    for body, part in checked:
+    for slot, body, part in checked:
         name = _part_label(body, part)
         optional = weapon and part == "sub"  # the main model still shows
 
@@ -1044,18 +1297,18 @@ def _check_game(result: Plan, new_paths: list[str], game) -> None:
 
         missing = ("대상 장비에는 보조 모델이 없어 옮긴 보조 모델은 보이지 않습니다" if optional
                    else f"대상 장비에는 {_josa(name, '이가')} 없습니다")
-        mine = own.get((body, part))
+        mine = own.get((slot, body, part))
         try:
             if mine:  # the mod's own prefab moves too: the game must ask for it where it lands
                 lost = next((p for p in mine if not game.has(p)), None)
                 if lost is not None:
-                    theirs = next((p for p in _prefabs(result.target, body, part, _versions_of("pfb", mine))
+                    theirs = next((p for p in _prefabs(slot, body, part, _versions_of("pfb", mine))
                                    if game.has(p)), None)
                     fail(missing if theirs is None else
                          f"대상 장비의 {name} 프리팹은 이름({theirs.rpartition('/')[2]})이 모드의 프리팹"
                          f"({lost.rpartition('/')[2]})과 달라, 옮긴 프리팹을 게임이 불러오지 않습니다")
                 continue
-            prefab = next((p for p in _prefabs(result.target, body, part) if game.has(p)), None)
+            prefab = next((p for p in _prefabs(slot, body, part) if game.has(p)), None)
             if prefab is None:
                 fail(missing)
                 continue
@@ -1068,12 +1321,12 @@ def _check_game(result: Plan, new_paths: list[str], game) -> None:
             result.notes.append(f"대상 장비의 {name} 프리팹을 읽지 못해 옮긴 모델을 불러오는지 확인하지 못했습니다")
             continue
         loads = {normalize(r) for r in info.resources() if r}
-        if not loads & by_part[part]["mesh"]:
+        if not loads & by_part[(slot, part)]["mesh"]:
             fail(f"이 무기는 다른 무기의 모델을 함께 써서 옮긴 모델이 보이지 않습니다 ({name})" if weapon
                  else f"대상 장비의 {_josa(name, '은는')} 다른 장비의 모델을 불러와서, 옮긴 모델이 보이지 않습니다",
                  optional=False)
             continue
-        chains = by_part[part].get("chain2", set())
+        chains = by_part[(slot, part)].get("chain2", set())
         if chains and not loads & chains:
             result.notes.append(f"대상 장비의 {_josa(name, '은는')} 모드의 흔들림 파일(.chain2)을 불러오지 않아 "
                                 "흔들림이 빠질 수 있습니다")
@@ -1108,7 +1361,7 @@ def build(plan: Plan, items: list[Item], out_dir: Path, progress=None) -> Built:
         raise RetargetError("\n".join(plan.errors) or "옮길 파일이 없습니다")
     progress = progress or (lambda done, total, msg: None)
     out_dir = Path(out_dir)
-    renamer = Renamer(plan.source, plan.target, plan.parts)
+    renamer = renamer_of(plan.source, plan.targets or {part: plan.target for part in plan.parts})
     moved = mover([(m.new, m.old) for m in plan.moves], renamer)
     moves = {(m.pak, m.old): m for m in plan.moves if m.how != "fill"}
     fills = {(m.pak, m.old): m for m in plan.moves if m.how == "fill"}
