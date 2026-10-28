@@ -1,6 +1,6 @@
-"""다른 장비로 옮기기 in the GUI: the dialog (원래 장비, the table of its parts and the equipment each goes to,
-the searchable list of equipment, what the new mod would hold, 원래 모드 끄기), the new mod made through the
-app, and where it is offered. The manager's retarget API is replaced on the instance by fakes (the files
+"""다른 장비로 옮기기 in the GUI: the 모드 수정 window (the mod picked in it, 원래 장비, the table of its parts and
+the equipment each goes to, the searchable list of equipment, what the new mod would hold, 원래 모드 끄기), the
+new mod made through the app, and where it is offered (the toolbar, the context menu, the 장비 외형 window). The manager's retarget API is replaced on the instance by fakes (the files
 themselves: test_equip_retarget.py); what the mods change is the real equipment scan of their files."""
 
 import gc
@@ -887,6 +887,7 @@ def test_blocked_during_the_search_and_while_busy(env, monkeypatch):
 
     class Dialog:
         def __init__(self, parent, app, mod_id, source=None):
+            self.mod_id = mod_id
             opened.append(mod_id)
 
         def show(self):
@@ -939,8 +940,8 @@ def test_offered_for_mods_with_game_files(env, monkeypatch):
 
     monkeypatch.setattr(retargetview, "RetargetDialog", Dialog)
 
-    # the main list's context menu: for every mod with game files, at once (the dialog says when nothing of
-    # them can be moved)
+    # the main list's context menu: 모드 수정 for every mod with game files, at once (the dialog says when nothing
+    # of them can be moved)
     assert not app._equip_warming
     app.context_menu.tk_popup = lambda *a: None
     app.context_menu.add_command(label="-")  # (Python 3.10's tkinter cannot clear an empty menu of Tk 9)
@@ -956,13 +957,15 @@ def test_offered_for_mods_with_game_files(env, monkeypatch):
         return {menu.entrycget(i, "label"): i for i in range(menu.index("end") + 1) if menu.type(i) == "command"}
 
     found = entries(mods["Armor"].id)
-    assert list(found).index(gui.RETARGET_ACTION) == list(found).index("장비 외형 보기") + 1
-    assert gui.RETARGET_ACTION in entries(mods["Palico"].id)
-    assert gui.RETARGET_ACTION not in entries(mods["Script"].id)
-    app.context_menu.invoke(entries(mods["Armor"].id)[gui.RETARGET_ACTION])
+    assert gui.MOD_TOOL_ACTION == "모드 수정..." and gui.RETARGET_ACTION not in found
+    assert list(found).index(gui.MOD_TOOL_ACTION) == list(found).index("장비 외형 보기") + 1
+    assert gui.MOD_TOOL_ACTION in entries(mods["Palico"].id)
+    assert gui.MOD_TOOL_ACTION not in entries(mods["Script"].id)
+    app.context_menu.invoke(entries(mods["Armor"].id)[gui.MOD_TOOL_ACTION])
     assert opened == [(mods["Armor"].id, None, root)]
 
-    # the 장비 외형 window: a link under each mod of an armor or a weapon, opening over the window
+    # the 장비 외형 window: a link under each mod of an armor or a weapon (its own words), opening the same window
+    # over it on that mod and equipment
     monkeypatch.setattr(equipview, "Image", None)  # (no 3D pictures)
     app.show_equipment()
     window = app.equipment_window
@@ -985,3 +988,242 @@ def test_offered_for_mods_with_game_files(env, monkeypatch):
         assert links() == []
     finally:
         window.close()
+
+
+def root_update(app):
+    for _ in range(3):
+        app.root.update()
+
+
+def test_the_toolbar_opens_the_mod_tool(env, monkeypatch):
+    """모드 수정 on the toolbar: the window on the first selected mod it can work on, else on the list's first such
+    mod; refused during 원인 모드 찾기 and while another task runs (as the context menu's entry)."""
+    from mhwmm import bisect, gui, retargetview
+
+    app, m, mods, fake = env
+    opened, told = [], []
+
+    class Dialog:
+        def __init__(self, parent, app, mod_id, source=None):
+            self.mod_id = mod_id
+            opened.append((mod_id, source, parent))
+
+        def show(self):
+            return None
+
+    monkeypatch.setattr(retargetview, "RetargetDialog", Dialog)
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text, parent=None: told.append((title, text)))
+    armor, helm, palico, script = (mods[name].id for name in ("Armor", "Helm", "Palico", "Script"))
+    button = app.buttons["modtool"]
+    app.tree.selection_set(helm)
+    button.invoke()
+    assert opened == [(helm, None, app.root)]
+    app.tree.selection_set((script, palico))  # (a script mod: nothing to work on)
+    button.invoke()
+    assert opened[-1][0] == palico
+    app.tree.selection_set((script,))  # only that: the window on it (it says what it cannot do with it)
+    button.invoke()
+    assert opened[-1][0] == script
+    app.tree.selection_set(())  # nothing selected: the first the list shows
+    button.invoke()
+    assert opened[-1][0] == armor
+    app.search_var.set("Helm")
+    root_update(app)
+    button.invoke()
+    assert opened[-1][0] == helm
+    app.search_var.set("")
+    root_update(app)
+    assert len(opened) == 5 and told == []
+
+    app._bisect_preparing = True
+    button.invoke()
+    assert len(opened) == 5 and told == [(bisect.TITLE, bisect.BLOCKED)]
+    app._bisect_preparing = False
+    app.busy = "install"
+    button.invoke()
+    assert len(opened) == 5 and app.status_var.get() == "작업이 끝난 뒤에 다시 시도하세요."
+    app.busy = None
+
+
+def test_another_mod_picked_in_the_window(env, monkeypatch):
+    """The 모드 box lists the mods the window can work on (in the list's order; (꺼짐) for one that is off); another
+    one picked switches the window to it in place: nothing chosen, its sources read again, its options line and
+    원래 모드 끄기. What was still being worked out for the mod before is dropped when it comes back (its plan of
+    the same move is not taken for this mod's)."""
+    from mhwmm.retargetview import RetargetDialog
+
+    app, m, mods, fake = env
+    root = app.root
+    armor, helm, colors = mods["Armor"].id, mods["Helm"].id, mods["Colors"].id
+    m.set_enabled(helm, False)
+    held, release, made = [], threading.Event(), {}
+
+    def plan(mod_id, source, target, parts=None, files=None):  # the first mod's plan waits until let go
+        if mod_id == armor:
+            held.append(target)
+            release.wait(30)
+        made[mod_id] = fake.plan(mod_id, source, target, parts, files)
+        return made[mod_id]
+
+    monkeypatch.setattr(m, "plan_retarget", plan)
+    dialog = RetargetDialog(root, app, armor, ARMOR)
+    try:
+        dialog.deiconify()
+        assert dialog.title() == "모드 수정"
+        assert list(dialog.mod_box.cget("values")) == ["Armor", "Helm (꺼짐)", "Palico", mods["Colors"].name]
+        assert dialog.mod_box.current() == 0 and str(dialog.mod_box.cget("state")) == "readonly"
+        pump(root, lambda: dialog.tree.get_children())
+        assert dialog.mod_box.tk_focusNext() is dialog.source_box  # (the mod first, then its equipment)
+        dialog.tree.selection_set("0")  # 가나 갑옷: planned on another thread, held there
+        pump(root, lambda: held)
+        before = dialog._generation
+
+        dialog.mod_box.current(1)
+        dialog.mod_box.event_generate("<<ComboboxSelected>>")
+        assert dialog.mod_id == helm and dialog.mod is m.get(helm) and dialog._generation == before + 1
+        assert dialog.assigned == {} and dialog.plans == {} and dialog._planning is None and part_table(dialog) == []
+        assert str(dialog.source_box.cget("state")) == "disabled" and dialog.source_var.get() == "읽는 중..."
+        assert dialog.shown_text() == "장비 정보를 읽는 중..." and not enabled(dialog.create_button)
+        assert rows(dialog) == [] and dialog.kind_note.cget("text") == "" and dialog.pick_hint.cget("text") == ""
+        assert not shown(dialog.off_check.master)  # (it is off: nothing to switch off)
+        assert dialog.off_note.cget("text") == "원래 모드는 꺼져 있습니다. 새 모드는 켠 상태로 만듭니다."
+        pump(root, lambda: dialog.source == ARMOR and dialog.tree.get_children())
+        assert list(dialog.source_box.cget("values")) == ["방어구 004-001 (여성)"]  # (Helm changes no weapon)
+        assert part_table(dialog) == [("머리", "옮기지 않음", ""), ("몸통", "옮기지 않음", "")]
+        assert dialog.parts_tree.selection() == ("helm", "body")
+        # the first mod's sources coming back late do not fill this one's
+        dialog._done("sources", None, ([WEAPON], ["쌍검 모델 00-0029 (쌍검)"], {WEAPON: []}), before)
+        assert dialog.sources == [ARMOR] and list(dialog.source_box.cget("values")) == ["방어구 004-001 (여성)"]
+
+        # the same move for this mod: planned for it at once (not waiting for the first mod's), and the first
+        # mod's plan coming back after it is dropped
+        dialog.tree.selection_set("0")
+        pump(root, lambda: enabled(dialog.create_button))
+        assert fake.plans[-1] == (helm, ARMOR, GANA, None) and "새 모드: Helm → 가나 갑옷" in dialog.shown_text()
+        came = []
+
+        def done(*args, _real=dialog._done):
+            came.append(args)
+            _real(*args)
+
+        dialog._done = done
+        release.set()
+        pump(root, lambda: [args for args in came if args[0] == "plan"])
+        assert [args[3] for args in came if args[0] == "plan"] == [before] and made[armor] is not made[helm]
+        assert dialog.plans == {(ARMOR, GANA, None): made[helm]}
+        assert "새 모드: Helm → 가나 갑옷" in dialog.shown_text() and enabled(dialog.create_button)
+
+        # Return on the 모드 box does not make the mod (the dialog's Return would)
+        dialog.mod_box.focus_force()
+        pump(root, lambda: dialog.focus_get() is dialog.mod_box)
+        dialog.mod_box.event_generate("<Return>")
+        root.update()
+        assert not dialog.closed and dialog.mod_id == helm
+
+        # a mod with options: its line under the first one, the list a row lower; one that is on: 원래 모드 끄기
+        dialog.mod_box.current(3)
+        dialog.mod_box.event_generate("<<ComboboxSelected>>")
+        assert dialog.mod_id == colors and shown(dialog.options_note) and "옵션" in dialog.options_note.cget("text")
+        assert dialog.options_note.winfo_manager() == "pack"
+        packed = dialog.body.pack_slaves()
+        assert packed.index(dialog.options_note) == packed.index(dialog.intro) + 1
+        assert int(dialog.tree.cget("height")) == dialog._list_rows(True)
+        assert shown(dialog.off_check.master) and "끄면 원래 장비는" in dialog.off_note.cget("text")
+        assert packed.index(dialog.off_check.master) + 1 == packed.index(dialog.off_note)
+        assert packed.index(dialog.off_note) + 1 == packed.index(dialog.button_row)
+        pump(root, lambda: dialog.source == ARMOR and dialog.tree.get_children())
+        assert dialog.off_var.get()  # (one equipment, until a plan says more)
+        dialog.mod_box.current(0)
+        dialog.mod_box.event_generate("<<ComboboxSelected>>")
+        assert dialog.mod_id == armor and not shown(dialog.options_note) and dialog.options_note.cget("text") == ""
+        assert int(dialog.tree.cget("height")) == dialog._list_rows(False) and dialog.wanted is None
+        pump(root, lambda: dialog.source == ARMOR and dialog.tree.get_children())  # (the first: none wanted)
+        assert not dialog.off_var.get()  # (it changes two pieces of equipment)
+    finally:
+        release.set()
+        if not dialog.closed:
+            dialog.destroy()
+
+
+def test_the_mod_box_wheel_letters_and_list(env):
+    """The wheel over the closed 모드 or 원래 장비 box changes nothing (it would drop what was chosen); a letter
+    typed on the 모드 box picks the next mod whose name starts with it, in its open list it moves there; the
+    list is as wide as its longest name."""
+    from mhwmm.retargetview import MOD_BOX_STYLE, RetargetDialog
+
+    app, m, mods, fake = env
+    root = app.root
+    armor, palico, colors = mods["Armor"].id, mods["Palico"].id, mods["Colors"].id
+    dialog = RetargetDialog(root, app, armor)
+    try:
+        dialog.deiconify()
+        pump(root, lambda: dialog.tree.get_children())
+        dialog.tree.selection_set("0")
+        pump(root, lambda: enabled(dialog.create_button))
+        for box in (dialog.mod_box, dialog.source_box):
+            for key, extra in (("<MouseWheel>", {"delta": -120}), ("<Button-5>", {})):
+                box.event_generate(key, **extra)
+                root.update()
+        assert dialog.mod_id == armor and dialog.source == ARMOR and dialog.assigned
+
+        dialog.mod_box.focus_force()
+        pump(root, lambda: dialog.focus_get() is dialog.mod_box)
+        dialog.mod_box.event_generate("<KeyPress>", keysym="c")
+        root.update()
+        assert dialog.mod_id == colors and dialog.mod_box.current() == 3
+        dialog.mod_box.event_generate("<KeyPress>", keysym="P")
+        root.update()
+        assert dialog.mod_id == palico
+        assert dialog._next_named("p", 2) == 2 and dialog._next_named("z", 0) is None
+        assert dialog._next_named(" ", 0) is None and dialog._next_named("", 0) is None
+
+        dialog.mod_box.configure(values=[*dialog.mod_box.cget("values")[:-1], "A" * 200])  # (a long name)
+        dialog._widen_list()
+        offset = [int(v) for v in str(root.tk.call("ttk::style", "lookup", MOD_BOX_STYLE, "-postoffset")).split()]
+        assert offset[:2] == [0, 0] and offset[3] == 0 and offset[2] > 0
+        assert dialog.mod_box.winfo_rootx() + dialog.mod_box.winfo_width() + offset[2] <= dialog.winfo_screenwidth()
+        listbox = f"{root.tk.call('ttk::combobox::PopdownWindow', dialog.mod_box)}.f.l"
+        root.tk.call("ttk::combobox::Post", dialog.mod_box)  # (keys reach the list only while it is shown)
+        root.update()
+        root.tk.call(listbox, "activate", 0)
+        root.tk.call("event", "generate", listbox, "<KeyPress>", "-keysym", "h")
+        root.update()
+        assert int(root.tk.call(listbox, "index", "active")) == 1 and dialog.mod_id == palico  # (not picked yet)
+        root.tk.call("ttk::combobox::Unpost", dialog.mod_box)
+        root.update()
+    finally:
+        if not dialog.closed:
+            dialog.destroy()
+
+
+def test_the_mod_is_made_from_the_mod_picked_last(env, monkeypatch):
+    """Opened on one mod, another picked in the window: the new mod is made of the one picked."""
+    from mhwmm import retargetview
+
+    app, m, mods, fake = env
+    root = app.root
+    armor, helm = mods["Armor"].id, mods["Helm"].id
+    for name in ("check_materials_background", "warm_equipment", "request_apply"):
+        monkeypatch.setattr(app, name, lambda: None)
+    opened = []
+
+    def show(self):  # 모드: Helm, then 가나 갑옷 for every part, 새 모드 만들기
+        opened.append(self.mod_id)
+        pump(root, lambda: self.tree.get_children())
+        self.mod_box.current(self.mod_ids.index(helm))
+        self.mod_box.event_generate("<<ComboboxSelected>>")
+        pump(root, lambda: self.source == ARMOR and self.tree.get_children())
+        self.tree.selection_set("0")
+        pump(root, lambda: enabled(self.create_button))
+        self.ok()
+        return self.result
+
+    monkeypatch.setattr(retargetview.RetargetDialog, "show", show)
+    app.tree.selection_set(armor)
+    app.buttons["modtool"].invoke()
+    pump(root, lambda: fake.created and app.busy is None)
+    assert opened == [armor]
+    assert fake.created == [(helm, ARMOR, GANA, None, False, True)]  # (a script stays behind: Helm stays on)
+    new = m.mods[-1]
+    assert app.tree.selection() == (new.id,) and m.get(helm).enabled and m.get(armor).enabled
+    assert app.status_var.get() == f"새 모드를 만들었습니다: {new.name} · 원래 모드도 켜 두었습니다"

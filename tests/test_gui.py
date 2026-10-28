@@ -1299,6 +1299,29 @@ def test_gui_window_takes_its_minimum_and_default_size(root, manager):
     assert app.content.winfo_height() == root.winfo_height()
 
 
+def test_gui_toolbar_mod_tool_button(root, manager, tmp_path, monkeypatch):
+    """모드 수정 sits right after 장비 외형 on the toolbar; with no mod it can work on (a script mod has no game
+    files) it says so and opens no window."""
+    from mhwmm import gui, retargetview
+
+    with manager.prepare_install(make_zip(tmp_path / "S.zip", {"reframework/autorun/a.lua": "--"})) as s:
+        script = manager.install_variant(s, s.variants[0])
+    app = gui.App(root, manager, queue.Queue())
+    pump(root, lambda: True)
+    button = app.buttons["modtool"]
+    slaves = app.toolbar.pack_slaves()
+    assert button.cget("text") == gui.MOD_TOOL_TITLE == "모드 수정"
+    assert slaves.index(button) == slaves.index(app.buttons["equipment"]) + 1
+    assert str(button.cget("style")) == str(app.buttons["equipment"].cget("style"))
+    opened, told = [], []
+    monkeypatch.setattr(retargetview, "RetargetDialog", lambda *a, **k: opened.append(a))
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text, parent=None: told.append((title, text)))
+    app.tree.selection_set(script.id)
+    button.invoke()
+    assert opened == [] and len(told) == 1
+    assert told[0][0] == "모드 수정" and told[0][1].startswith("고칠 수 있는 모드가 없습니다.")
+
+
 def test_gui_window_default_size_and_sash(root, manager):
     from mhwmm import gui
 

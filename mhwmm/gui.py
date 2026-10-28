@@ -82,7 +82,11 @@ EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, MatfixE
 
 
 RETARGET_TITLE = "다른 장비로 옮기기"
-RETARGET_ACTION = RETARGET_TITLE + "..."  # (retargetview.RetargetDialog) in the context menu and the 장비 외형 window
+RETARGET_ACTION = RETARGET_TITLE + "..."  # the 장비 외형 window's link (to 모드 수정 on that mod and equipment)
+# the window where a mod is made into a new one (retargetview.RetargetDialog: for now 다른 장비로 옮기기), opened from
+# the toolbar and the list's context menu
+MOD_TOOL_TITLE = "모드 수정"
+MOD_TOOL_ACTION = MOD_TOOL_TITLE + "..."
 
 KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
 
@@ -2975,6 +2979,7 @@ class App:
         button("remove", "삭제", self.remove_selected, tip="Delete", padx=(0, px(14)))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(0, px(14)), pady=px(4))
         button("equipment", "장비 외형", lambda: self.show_equipment(), tip="모드가 어떤 장비의 모습을 바꾸는지 보기")
+        button("modtool", MOD_TOOL_TITLE, self.open_mod_tool, tip="고른 모드를 고쳐 새 모드 만들기 (다른 장비로 옮기기)")
 
         # the widgets on the right in one frame, as in the header (made after the ones on the left: Tab goes
         # through widgets in the order they were made)
@@ -3934,10 +3939,33 @@ class App:
 
         self.equipment_window = EquipmentWindow(self, mod_id)
 
+    def editable(self, mod: Mod) -> bool:
+        """Can 모드 수정 work on the mod: one with game files (in natives or a .pak), not REFramework itself (the
+        window says when nothing of them can be moved)."""
+        return mod.origin != refw.ORIGIN and bool(self.manager.mod_kinds(mod.id) & {"loose", "pak"})
+
+    def open_mod_tool(self):
+        """모드 수정 (the toolbar's button): the window on the first mod selected in the list that it can work on,
+        else on the first one selected (the window says what it cannot do with it), else on the first mod it can
+        work on that the list shows (then of all; another one can be picked in the window)."""
+        if self._search_blocks() or not self.can_mutate():
+            return
+        ids = [mod.id for mod in self.manager.mods if self.editable(mod)]
+        if not ids:
+            messagebox.showinfo(MOD_TOOL_TITLE, "고칠 수 있는 모드가 없습니다. 게임 파일(natives 폴더나 .pak 파일)이 든 모드를 "
+                                                "추가하면 고칠 수 있습니다.", parent=self.root)
+            return
+        selected = [i for i in self._selected_ids() if self.manager.get(i).origin != refw.ORIGIN]
+        shown = set(self.tree.get_children())
+        mod_id = next((i for i in ids if i in selected), None) or next(iter(selected), None) or \
+            next((i for i in ids if i in shown), ids[0])
+        self.open_retarget(mod_id)
+
     def open_retarget(self, mod_id: str, source=None, parent=None):
-        """다른 장비로 옮기기: the dialog (over ``parent``, by default the main window; ``source``: the
-        equipment picked first), then the new mod made from the mod's files for the equipment chosen. Over
-        another window (장비 외형) a refusal is told there: the main window's status bar may be hidden."""
+        """모드 수정 (for now 다른 장비로 옮기기): the window on mod ``mod_id`` (over ``parent``, by default the main
+        window; ``source``: the equipment picked first), then the new mod made from the files of the mod picked
+        in it (it may be another one) for the equipment chosen. Over another window (장비 외형) a refusal is told
+        there: the main window's status bar may be hidden."""
         window = parent if parent is not None and parent is not self.root else None
         if window is None:
             if self._search_blocks() or not self.can_mutate():
@@ -3952,9 +3980,10 @@ class App:
             return
         from .retargetview import RetargetDialog  # imports this module
 
-        choice = RetargetDialog(parent or self.root, self, mod_id, source).show()
+        dialog = RetargetDialog(parent or self.root, self, mod_id, source)
+        choice = dialog.show()
         if choice is not None:
-            self._create_retarget(mod_id, choice)
+            self._create_retarget(dialog.mod_id, choice)  # (the mod picked last)
 
     def _create_retarget(self, mod_id: str, choice, waited: bool = False):
         """Make the mod the dialog chose once no other task runs (an apply may have started meanwhile). While
@@ -5274,8 +5303,8 @@ class App:
                 menu.add_command(label="이름 변경", command=self.rename_selected)
                 menu.add_command(label="저장된 모드 폴더 열기", command=self.open_mod_folder)
                 menu.add_command(label="장비 외형 보기", command=lambda: self.show_equipment(ids[0]))
-                if self.manager.mod_kinds(ids[0]) & {"loose", "pak"}:  # (the dialog says when nothing can be moved)
-                    menu.add_command(label=RETARGET_ACTION, command=lambda: self.open_retarget(ids[0]))
+                if self.editable(mods[0]):
+                    menu.add_command(label=MOD_TOOL_ACTION, command=lambda: self.open_retarget(ids[0]))
                 if mods[0].origin != refw.ORIGIN:
                     menu.add_separator()
                     if mods[0].update:
