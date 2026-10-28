@@ -223,6 +223,10 @@ class Theme:
             s.configure(f"{prefix}.TLabel", background=p[bg], foreground=p["text"])
             s.configure(f"{prefix}Muted.TLabel", background=p[bg], foreground=p["muted"], font=f["small"])
         s.configure("FieldHint.TLabel", background=p["field"], foreground=p["subtle"], font=f["small"])
+        # what went wrong, in a dialog and in a card (모드 수정: a value that cannot be set), and a caution
+        s.configure("Danger.TLabel", background=p["bg"], foreground=p["danger"])
+        s.configure("CardDanger.TLabel", background=p["surface"], foreground=p["danger"])
+        s.configure("EditWarn.TLabel", background=p["bg"], foreground=p["warn"])
         s.configure("Thumb.TFrame", background=p["bg"])
         s.configure("Thumb.TLabel", background=p["bg"], foreground=p["subtle"], font=f["small"])
         # equipment window: tiles (one per piece of equipment), the selected one highlighted
@@ -367,6 +371,12 @@ class Theme:
               bordercolor=[("selected", p["border"]), ("active", p["hover"])],
               foreground=[("selected", p["text"]), ("active", p["text"])],
               expand=[("selected", (0, 0, 0, 0))])
+
+        # pages of one window without tabs (모드 수정: the column of tools picks the page)
+        s.configure("Pages.TNotebook", background=p["bg"], bordercolor=p["bg"], lightcolor=p["bg"],
+                    darkcolor=p["bg"], tabmargins=0, padding=0, borderwidth=0)
+        s.layout("Pages.TNotebook", [("Notebook.client", {"sticky": "nswe"})])
+        s.layout("Pages.TNotebook.Tab", [])
 
         # scrollbars, progress, panes, separators
         for orient in ("Vertical", "Horizontal"):

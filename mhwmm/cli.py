@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
 import logging
+import math
+import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
-from . import __version__, bisect, crashlog, fsutil, precheck, steam
-from .analyzer import classify, package_name
-from .deploy import DeployError, DeployReport
+from . import __version__, bisect, crashlog, fsutil, precheck, requirements, steam
+from .analyzer import classify, list_files, package_name
+from .constants import REFW_ORIGIN
+from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .equip.selftest import DEFAULT_ITEMS as SELFTEST_ITEMS
 from .manager import InstallError, ModManager, acquire_instance_lock, prepare_data_dir, setup_logging
 from .matfix import MatfixError
+from .modedit import BAD_SUFFIX, EDITS_RECORD, EditError, GameCopyChanged
+from .modedit import engines as edit_engines
+from .modedit import model as edit_model
 
 KIND_NAMES = {
     "reframework": "REFramework", "pak": "PAK", "loose": "루스", "script": "스크립트",
@@ -140,6 +149,8 @@ def cmd_install(manager: ModManager, args) -> int:
         if args.disabled and mod.enabled:
             manager.set_enabled(mod.id, False)
         print(f"설치: {mod.name}  ({_kinds(manager.mod_kinds(mod.id))}, {len(manager.mod_files(mod.id))}개 파일)")
+        if replace_id:
+            _print_carry(manager, mod)
         if mod.options:
             _print_options(manager, mod)
     if mod.nexus_id:
@@ -347,9 +358,13 @@ def cmd_materials(manager: ModManager, args) -> int:
     if args.action == "restore":
         if not mods:
             raise SystemExit("되돌릴 모드를 지정하세요: materials restore <모드>")
+        restored = []
         for mod in mods:
             changed = manager.restore_materials(mod.id)
             print(f"{'원래 재질 파일로 되돌림' if changed else '복구한 재질이 없음'}: {mod.name}")
+            if changed:
+                restored.append(mod.id)
+        _reapply_edits(manager, restored)
         return _maybe_deploy(manager, args)
     jobs = manager.material_jobs([m.id for m in mods] if mods else None)
     if not jobs:
@@ -408,6 +423,7 @@ def cmd_materials(manager: ModManager, args) -> int:
             print(f"     재질이 쓰는 {req['name']}: {where}")
     if not repair and any(manager.material_state(j.mod_id) == "stale" for j in jobs):
         print("\n복구하려면: materials repair [모드]")
+    _reapply_edits(manager, [j.mod_id for j in jobs])  # (a repair made, given up or no longer needed: a new base)
     code = _maybe_deploy(manager, args) if repair else 0
     return 1 if failed else code
 
@@ -676,6 +692,1301 @@ def cmd_retarget(manager: ModManager, args) -> int:
     if was_on and not mod.enabled:
         print(f"원래 모드를 껐습니다: {mod.name}")
     return _maybe_deploy(manager, args)
+
+
+# ---- 모드 수정 (edit) ---------------------------------------------------------------------------------------------
+EDIT_ACTIONS = ("status", "files", "exclude", "include", "use", "values", "set", "scale", "revert", "resolve",
+                "reapply", "clear-record")
+EDIT_WRITES = ("exclude", "include", "use", "set", "scale", "revert", "resolve", "reapply", "clear-record")
+EDIT_HELP = {
+    "status": "이 모드에 한 수정: 뺀 파일, 바꾼 값, 업데이트 뒤 확인할 값과 다시 적용하지 못한 파일",
+    "files": "모드의 파일과 그 상태 (넣음 · 뺌 · 덮임 · 옵션 꺼짐)",
+    "exclude": "파일을 게임에 넣지 않기 (텍스처·모델의 스트리밍 사본도 함께)",
+    "include": "뺀 파일을 다시 넣기",
+    "use": "켠 옵션 여럿에 같은 파일이 있을 때 쓸 옵션 고르기 (다른 켠 옵션의 같은 파일을 뺌)",
+    "values": "값을 바꿀 수 있는 파일 목록, 또는 한 파일의 값 (데이터 파일은 게임 값과 함께)",
+    "set": "값 바꾸기 (주소=값, 여러 개)",
+    "scale": "여러 값을 한꺼번에: 값 정하기 · 게임 값의 몇 배 · 모드가 바꾼 만큼의 몇 배",
+    "revert": "되돌리기: 값, 파일 하나, 또는 --all로 모든 수정",
+    "resolve": "업데이트 뒤 작성자가 바꾼 값: 내 값 유지(--keep) 또는 작성자 값 쓰기(--take)",
+    "reapply": "다시 적용하지 못했거나 기다리는 수정을 다시 적용 (확인할 값은 그대로)",
+    "clear-record": "읽지 못한 수정 기록을 옆으로 옮겨 두기 (edits.json.bad-<시각>)",
+}
+EDIT_TAGS = {"exclude": "[뺌]", "data": "[수치]", "config": "[설정]"}
+EDIT_FILE_STATES = {"in": "넣음", "excluded": "뺌", "overridden": "덮임", "option_off": "옵션 꺼짐",
+                    "conflict": "확인 필요", "needs_option": "옵션 고르기 전"}
+EDIT_PROFILES = "수정은 모든 프로필에 똑같이 쓰입니다."
+EDIT_OPTIONS = "옵션별 수정은 그 옵션을 켠 프로필에서만 게임에 들어갑니다."
+EDIT_FILTERS = {"data": "모드가 바꾼 값만", "config": "설정 같은 값만"}
+EDIT_MEMBER = re.compile(r"[0-9A-Fa-f]{16}")
+EDIT_HINTS = 5  # "게임에 쓰인 값" lines under a list of values
+EDIT_THOUSANDS = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")  # 1,000 / -12,345.5
+EDIT_UNKEYED = "게임과 행을 맞추지 못해 건너뛴 값"  # (the window's text: modeditview.UNKEYED)
+
+
+class _EditArgs(argparse.Action):
+    """What follows ``edit <모드> <동작>``, read by that action's own parser (_edit_parser) in any order: the
+    values of ``set`` may come before or after its options."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        action = getattr(namespace, "action", None) or "status"
+        sub = _edit_parser(action)
+        sub.parse_intermixed_args(list(values), namespace)
+        if action == "resolve" and bool(namespace.addresses) == bool(namespace.every):
+            sub.error("확인할 값의 주소를 적거나 --every를 붙이세요 (둘 중 하나만)")
+        if action == "use" and namespace.nth < 1:
+            sub.error("--nth는 1 이상이어야 합니다")
+
+
+def _edit_parser(action: str) -> argparse.ArgumentParser:
+    """The arguments of one ``edit`` action."""
+    p = argparse.ArgumentParser(prog=f"mhwmm edit <모드> {action}", description=EDIT_HELP[action])
+    option_help = "옵션이 있는 모드에서 그 옵션의 파일 (이름이 같은 옵션이 여럿이면 '이름 (2번째)')"
+    file_help = "게임 경로, 겹치지 않는 파일 이름, <pak>#<해시 16자리> 또는 'edit <모드> values'의 번호"
+
+    def writes(dry_run: bool = True, yes: str = "") -> None:
+        if yes:
+            p.add_argument("--yes", action="store_true", help=yes)
+        if dry_run:
+            p.add_argument("--dry-run", action="store_true", help="새 파일을 만들어 확인만 하고 저장하지 않음")
+        p.add_argument("--no-deploy", action="store_true", help="게임 폴더에 바로 적용하지 않음")
+
+    if action == "files":
+        p.add_argument("--option", metavar="이름", help=option_help)
+        p.add_argument("--find", metavar="글자", help="경로에 이 글자가 든 파일만")
+        p.add_argument("--excluded", action="store_true", help="뺀 파일만")
+        p.add_argument("--overlaps", action="store_true", help="켠 옵션 여럿에 있는 파일만 (use로 쓸 옵션을 고를 수 있음)")
+    elif action in ("exclude", "include"):
+        p.add_argument("paths", nargs="+", metavar="경로", help="게임 경로, 파일 이름 또는 * · ? 패턴 (대소문자 무시)")
+        scope = p.add_mutually_exclusive_group()
+        scope.add_argument("--option", metavar="이름", help=option_help)
+        scope.add_argument("--all-options", action="store_true", help="모든 옵션의 맞는 파일")
+        writes()
+    elif action == "use":
+        p.add_argument("path", metavar="경로", help="게임 경로, 파일 이름 또는 * · ? 패턴")
+        p.add_argument("--option", metavar="이름", required=True, help="쓸 옵션 (켜져 있어야 함)")
+        p.add_argument("--nth", type=int, default=1, metavar="N", help="이름이 같은 옵션이 여럿일 때 N번째")
+        writes()
+    elif action == "values":
+        p.add_argument("file", nargs="?", metavar="파일", help=file_help + " (생략하면 파일 목록)")
+        p.add_argument("--option", metavar="이름", help=option_help)
+        p.add_argument("--all", action="store_true", help="모든 값 (기본은 모드가 바꾼 값만, Lua는 설정 같은 값만)")
+        p.add_argument("--find", metavar="글자", help="주소나 이름에 이 글자가 든 값만")
+        p.add_argument("--limit", type=int, default=50, metavar="N", help="보여 줄 값의 수 (기본 50, 0은 모두)")
+    elif action == "set":
+        p.add_argument("file", metavar="파일", help=file_help)
+        p.add_argument("pairs", nargs="+", metavar="주소=값",
+                       help="값은 [...] 밖의 = 뒤부터 (켜기·끄기는 true/false/켬/끔, 벡터는 1,2,3)")
+        p.add_argument("--option", metavar="이름", help=option_help)
+        p.add_argument("--same", action="store_true",
+                       help="데이터 파일: 이 표에서 값이 같은 행 모두 (규칙으로 기록해 업데이트 뒤 새 행에도 씀)")
+        writes()
+    elif action == "scale":
+        p.add_argument("file", metavar="파일", help=file_help)
+        how = p.add_mutually_exclusive_group(required=True)
+        how.add_argument("--to", metavar="N", help="값 정하기")
+        how.add_argument("--times", metavar="K", help="게임 값의 K배")
+        how.add_argument("--change", metavar="K", help="모드가 바꾼 만큼의 K배 (게임 값 + K × (모드 값 - 게임 값))")
+        p.add_argument("--field", metavar="패턴",
+                       help="바꿀 값의 주소·규칙 주소·이름 (* · ? 패턴, 생략하면 모드가 바꾼 숫자 값 모두)")
+        p.add_argument("--option", metavar="이름", help=option_help)
+        writes()
+    elif action == "revert":
+        p.add_argument("file", nargs="?", metavar="파일", help=file_help + " (생략하면 --all로 모든 수정)")
+        p.add_argument("addresses", nargs="*", metavar="주소", help="되돌릴 값 (생략하면 파일의 수정 모두)")
+        p.add_argument("--option", metavar="이름", help=option_help)
+        p.add_argument("--all", action="store_true", help="이 모드의 모든 수정 되돌리기")
+        writes(yes="게임 폴더에서 바뀐 파일도 되돌리기 (게임 폴더에서 바뀐 내용은 사라짐)")
+    elif action == "resolve":
+        p.add_argument("file", metavar="파일", help=file_help)
+        p.add_argument("addresses", nargs="*", metavar="주소", help="확인할 값의 주소")
+        p.add_argument("--every", action="store_true", help="이 파일의 확인할 값 모두")
+        which = p.add_mutually_exclusive_group(required=True)
+        which.add_argument("--keep", action="store_true", help="내 값 유지")
+        which.add_argument("--take", action="store_true", help="작성자 값 쓰기 (내 수정을 지움)")
+        p.add_argument("--option", metavar="이름", help=option_help)
+        writes()
+    elif action == "reapply":
+        p.add_argument("files", nargs="*", metavar="파일", help=file_help + " (생략하면 기다리는 것 모두)")
+        writes(yes="게임 폴더에서 바뀐 파일도 다시 만들기 (게임 폴더에서 바뀐 내용은 사라짐)")
+    elif action == "clear-record":
+        p.add_argument("--yes", action="store_true", help="정말 옮기기 (지우지 않고 edits.json.bad-<시각>으로 옮겨 둠)")
+    return p
+
+
+def cmd_edit(manager: ModManager, args) -> int:
+    """모드 수정: leave files of a mod out (or choose which selected option's copy of a path is used), change the
+    values of its .user data files (loose or in its root PAKs) and of the settings files its scripts ship with,
+    see what was changed and undo it. Saved as the window saves (manager.apply_edit_plan: built into a temporary
+    folder and checked, then written all or nothing) and applied unless --no-deploy; --dry-run only builds and
+    checks. Exits with 1 on an error, and after reapply while values to check or files not applied are left."""
+    (mod,) = _resolve(manager, [args.mod])
+    if mod.origin == REFW_ORIGIN:
+        print("오류: REFramework는 모드 수정으로 고칠 수 없습니다.", file=sys.stderr)
+        return 1
+    try:
+        with _edit_registry(manager, mod, args.action):
+            return EDIT_COMMANDS[args.action](manager, mod, args)
+    except GameCopyChanged as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        if hasattr(args, "yes"):
+            print("매니저가 넣은 파일로 되돌리면 게임 폴더에서 바뀐 파일(스크립트가 저장한 설정 등)은 데이터 폴더의 "
+                  "edited\\에 따로 보관하고 게임에는 넣지 않습니다. 그래도 하려면 --yes를 붙이세요.", file=sys.stderr)
+        return 1
+    except EditError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+
+
+@contextlib.contextmanager
+def _edit_registry(manager: ModManager, mod, action: str):
+    """Hold the game's type registry for the whole command when it reads .user data (the window holds it while it
+    is open; each read, each listing of a PAK and the build would load it again otherwise)."""
+    need = False
+    if action in ("values", "set", "scale"):
+        need = any(edit_model.is_data_rel(rel) or is_root_pak(rel) for rel in _stored_rels(manager, mod))
+    elif action in ("revert", "resolve", "reapply"):
+        record = manager.edit_record(mod.id)
+        need = not record.error and any(edit_model.engine_tool(m.engine) == "data"
+                                        for item in record.items for m in item.members)
+    if not need:
+        yield
+        return
+    from .modedit import rszdata
+
+    rszdata.registry()
+    try:
+        yield
+    finally:
+        rszdata.release()
+
+
+def _stored_rels(manager: ModManager, mod) -> list[str]:
+    """The game paths of every stored file of a mod, of every option."""
+    if mod.options:
+        return [rel for o in mod.options for rel in manager.option_files(mod.id, o["id"])]
+    return list_files(manager.files_dir(mod.id))
+
+
+def _progress_printer():
+    """Progress lines on stderr, at most one a second and none for the first second (most edits take less)."""
+    shown = [time.time()]
+
+    def progress(done, total, msg):
+        if time.time() - shown[0] > 1.0:  # (a big PAK is read and written again)
+            shown[0] = time.time()
+            print(msg, file=sys.stderr)
+
+    return progress
+
+
+def _q(text: str) -> str:
+    """``text`` as the command line takes it back: in double quotes when it has spaces or characters a shell
+    reads."""
+    if text and not re.search(r"[\s\"'\[\]*?&|<>;()=#$`^%!,]", text):
+        return text
+    return '"' + text.replace('"', '\\"') + '"'
+
+
+def _width(text: str) -> int:
+    """Columns ``text`` takes in a terminal (Korean letters take two)."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(1, width - _width(text))
+
+
+def _scope_name(source) -> str:
+    """How ``--option`` names a Source's option ('이름 (2번째)' for the second option with that name)."""
+    return source.option if not source.n else f"{source.option} ({source.n + 1}번째)"
+
+
+def _option_test(name: str | None):
+    """Which Sources ``--option NAME`` means (any without it)."""
+    if name is None:
+        return lambda source: True
+    name = name.strip()
+    nth = re.fullmatch(r"(.+?) \((\d+)번째\)", name)
+
+    def test(source) -> bool:
+        if source.option == name:
+            return True
+        return nth is not None and source.option == nth.group(1) and source.n == int(nth.group(2)) - 1
+
+    return test
+
+
+def _no_option(mod, name: str) -> EditError:
+    if not mod.options:
+        return EditError(f"이 모드에는 옵션이 없습니다 (--option {_q(name)})")
+    return EditError(f"옵션을 찾지 못했습니다: {name} (옵션: {', '.join(repr(o['name']) for o in mod.options)})")
+
+
+def _check_option(manager: ModManager, snap, name: str | None) -> None:
+    """_no_option when ``--option NAME`` names none of the mod's options."""
+    if name is not None and not any(_option_test(name)(edit_model.Source(o.name, o.n)) for o in snap.options):
+        raise _no_option(manager.get(snap.mod_id), name)
+
+
+def _numbered_in(manager: ModManager, snap, target, ref: str, option: str | None):
+    """The target numbered ``ref`` when ``--option`` (if given) names its option: a number is of one file, and
+    the option given with it has to agree with it."""
+    if option is None or _option_test(option)(target.source):
+        return target
+    _check_option(manager, snap, option)
+    where = f"옵션 '{_scope_name(target.source)}'의 파일" if target.source.option else "옵션에 들지 않은 파일"
+    raise EditError(f"{ref.strip()}번 파일은 {where}입니다 (옵션 '{option}'의 파일 번호: edit <모드> values "
+                    f"--option {_q(option)})")
+
+
+def _glob(pattern: str):
+    """A case-insensitive test against a pattern in which * and ? are wildcards and everything else, brackets too,
+    is literal (addresses such as ``_Values[*]._SellPrice`` are written as they are)."""
+    rx = re.compile("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pattern.strip()),
+                    re.IGNORECASE | re.DOTALL)
+    return lambda text: rx.fullmatch(text) is not None
+
+
+def _path_test(pattern: str):
+    """경로: a game path or a pattern, case-insensitive; one without a folder also matches file names."""
+    pattern = pattern.strip().replace("\\", "/").strip("/")
+    test = _glob(pattern)
+    names = "/" not in pattern
+    return lambda rel: test(rel) or (names and test(rel.rsplit("/", 1)[-1]))
+
+
+def _path_rank(rel: str, path: str) -> int:
+    """How well 파일 names a game path: 2 the whole path, 1 its end (a file name, or more of the path), 0 not."""
+    a, b = rel.casefold(), path.casefold()
+    return 2 if a == b else 1 if b and a.endswith("/" + b) else 0
+
+
+def _split_ref(ref: str) -> tuple[str, str]:
+    """(path, PAK entry ``#HASH16`` or "") of 파일."""
+    ref = ref.strip().replace("\\", "/").strip("/")
+    path, sep, tail = ref.rpartition("#")
+    if sep and EDIT_MEMBER.fullmatch(tail):
+        return path.strip("/"), "#" + tail.upper()
+    return ref, ""
+
+
+def _only_file(found: list, ref: str, option: str | None, many: bool = False) -> list:
+    """``found`` (things with a ``source``) when they are one file in one option (or ``many``: in several),
+    else EditError saying what to add."""
+    if not found:
+        raise EditError(f"파일을 찾지 못했습니다: {ref}" + (f" (옵션 '{option}')" if option else ""))
+    rels = sorted({e.source.rel.casefold(): e.source.rel for e in found}.values(), key=str.casefold)
+    if len(rels) > 1:
+        raise EditError("이름이 같은 파일이 여러 개입니다. 경로를 더 적어 주세요: " + ", ".join(rels[:6])
+                        + (" …" if len(rels) > 6 else ""))
+    scopes = list(dict.fromkeys(e.source for e in found if e.source.option))
+    if len(scopes) > 1 and not many:
+        names = ", ".join(f"'{_scope_name(s)}'" for s in scopes)
+        raise EditError(f"여러 옵션에 있는 파일입니다. --option으로 고르세요: {names}")
+    return found
+
+
+def _targets(manager: ModManager, snap, ref: str | None = None) -> list:
+    """The files (and PAK entries) whose values the command line shows and changes, numbered in this order by
+    ``values``: 게임 수치's, then 스크립트 설정's. A 파일 that cannot name a PAK entry does not read the PAKs."""
+    data = snap
+    if ref is not None and not ref.strip().isdigit() and "#" not in ref and ".pak" not in ref.lower():
+        data = dataclasses.replace(snap, files=[f for f in snap.files if not is_root_pak(f.rel)])
+    return [*manager.edit_targets(data, "data", _progress_printer()), *manager.edit_targets(snap, "config")]
+
+
+def _numbered(targets: list, ref: str):
+    n = int(ref.strip())
+    if not 1 <= n <= len(targets):
+        raise EditError(f"{n}번 파일이 없습니다 (번호는 edit <모드> values로 확인)")
+    return targets[n - 1]
+
+
+def _target_name(target) -> str:
+    """A target as the command line shows it: [option: ]path[#HASH]."""
+    return target.source.label() + target.member
+
+
+def _find_targets(manager: ModManager, snap, ref: str, option: str | None, targets=None) -> list:
+    """The targets 파일 names: one file (with every PAK entry when only the PAK is named)."""
+    targets = targets if targets is not None else _targets(manager, snap, ref)
+    if ref.strip().isdigit():
+        return [_numbered_in(manager, snap, _numbered(targets, ref), ref, option)]
+    path, member = _split_ref(ref)
+    wanted = _option_test(option)
+    ranked = [(t, _path_rank(t.source.rel, path)) for t in targets
+              if wanted(t.source) and (not member or t.member == member)]
+    best = max((r for _t, r in ranked), default=0)
+    found = [t for t, r in ranked if r and r == best]
+    if not found:
+        _check_option(manager, snap, option)
+        raise EditError(f"값을 바꿀 수 있는 파일 가운데 맞는 것이 없습니다: {ref}"
+                        + (f" (옵션 '{option}')" if option else "") + " (목록: edit <모드> values)")
+    return _only_file(found, ref, option)
+
+
+def _one_target(manager: ModManager, snap, ref: str, option: str | None):
+    found = _find_targets(manager, snap, ref, option)
+    if len(found) > 1:
+        raise EditError("PAK 안에 값을 바꿀 수 있는 파일이 여러 개입니다. #해시까지 적어 주세요: "
+                        + ", ".join(f"{t.source.rel}{t.member}" for t in found))
+    return found[0]
+
+
+def _record_items(manager: ModManager, snap, record, ref: str, option: str | None, many: bool = False) -> list:
+    """(record item, PAK entry or "") for 파일 among the files the record has edits of (also those an update took
+    away). ``many``: every option the file is in."""
+    if ref.strip().isdigit():
+        target = _numbered_in(manager, snap, _numbered(_targets(manager, snap), ref), ref, option)
+        item = record.item(target.source)
+        if item is None or (target.member and item.member(target.member) is None):
+            raise EditError(f"{ref}번 파일에는 수정한 값이 없습니다: {_target_name(target)}")
+        return [(item, target.member)]
+    path, member = _split_ref(ref)
+    wanted = _option_test(option)
+    ranked = [(i, _path_rank(i.source.rel, path)) for i in record.items if wanted(i.source)]
+    best = max((r for _i, r in ranked), default=0)
+    if not best:
+        _check_option(manager, snap, option)
+        raise EditError(f"수정한 파일 가운데 맞는 것이 없습니다: {ref}" + (f" (옵션 '{option}')" if option else "")
+                        + " (수정 내용: edit <모드>)")
+    found = _only_file([i for i, r in ranked if r == best], ref, option, many)
+    for item in found:
+        if member and item.member(member) is None:
+            raise EditError(f"이 PAK 안 파일에는 수정한 값이 없습니다: {item.source.rel}{member}")
+    return [(item, member) for item in found]
+
+
+def _ref_args(items: list, source, member: str = "") -> str:
+    """파일 (and --option) that names ``source`` among the record's items again: its file name when no other
+    edited file has that name."""
+    name = source.rel.rsplit("/", 1)[-1]
+    same = {i.source.rel.casefold() for i in items if _path_rank(i.source.rel, name)}
+    out = _q((name if len(same) <= 1 else source.rel) + (member or ""))
+    if source.option:
+        out += f" --option {_q(_scope_name(source))}"
+    return out
+
+
+def _refuse_bad(record) -> None:
+    if record.error:
+        raise EditError(f"모드 수정 기록을 읽지 못해 고칠 수 없습니다 ({record.error}). 기록을 옆으로 옮기려면 "
+                        "clear-record --yes, 모든 수정을 되돌리려면 revert --all")
+
+
+def _left_text(result) -> str:
+    parts = []
+    if result.conflicts:
+        parts.append(f"확인할 값 {result.conflicts}개")
+    if result.pending:
+        parts.append(f"다시 적용하지 못한 파일 {result.pending}개")
+    return " · ".join(parts)
+
+
+def _save_edits(manager: ModManager, mod, snap, pending, args, what: str, force: bool = False):
+    """Save what ``pending`` asks for (apply_edit_plan) and apply it: (exit code, EditResult or None)."""
+    plan = pending.plan(mod.id, snap.stamp, snap.rev)
+    if plan.empty():
+        print("바뀐 것이 없습니다.")
+        return 0, None
+    result = manager.apply_edit_plan(plan, force=force, dry_run=getattr(args, "dry_run", False),
+                                     progress=_progress_printer())
+    for note in result.notes:
+        print(f"  참고: {note}")
+    if getattr(args, "dry_run", False):
+        print("(--dry-run: 저장하지 않았습니다)")
+        return 0, result
+    if not result.changed:
+        print("바뀐 것이 없습니다.")
+        return 0, result
+    print(f"모드 수정을 저장했습니다: {mod.name} ({what})")
+    left = _left_text(result)
+    if left:
+        print(f"{left} (확인: edit {_q(mod.name)})")
+    if result.materials:
+        print(f"뺀 파일이 바뀌어 재질 점검 결과는 다시 점검할 때까지 '점검 전'입니다: materials check {_q(mod.name)}")
+    return _maybe_deploy(manager, args), result
+
+
+# -- reading
+def _edit_status(manager: ModManager, mod, args) -> int:
+    summary = manager.edit_summary(mod.id)
+    record = manager.edit_record(mod.id)
+    name = _q(mod.name)
+    print(f"{mod.name}: {summary.text()}")
+    if record.error:
+        for line in manager.edit_issues(mod.id):
+            print(f"  {line}")
+        print(f"기록을 옆으로 옮기려면: edit {name} clear-record --yes · 모든 수정을 되돌리려면: edit {name} revert --all")
+        return 0
+    notice = record.notice
+    if notice.get("kind") == "update":
+        if notice.get("error"):
+            print(f"지난 업데이트: {notice['error']}")
+        else:
+            report = edit_model.CarryReport.from_notice(notice)
+            print(f"지난 업데이트: {report.text()}")
+            for label in report.dropped:
+                print(f"  없어진 파일 (빼 두었던 것): {label}")
+    for view in manager.edit_items(mod.id):
+        _print_edit_item(view, record, name)
+    if not summary.empty:
+        print(EDIT_PROFILES)
+        if any(i.source.option for i in record.items):
+            print(EDIT_OPTIONS)
+    if notice:
+        try:  # (shown once, as the window's 수정 내용 shows it; what is left to check stays in the list above)
+            manager.drop_edit_notice(mod.id)
+        except OSError as exc:
+            logging.getLogger(__name__).info("업데이트 알림을 지우지 못했습니다: %s", exc)
+    return 0
+
+
+def _print_edit_item(view, record, name: str) -> None:
+    """One line of 수정 내용 with its values, what is wrong with it and the command that settles it."""
+    ref = _ref_args(record.items, view.source, view.member)
+    state = {"inactive_option": " (옵션이 꺼져 있어 지금은 게임에 들어가지 않습니다)",
+             "inactive_excluded": " (뺀 파일이라 지금은 게임에 들어가지 않습니다)",
+             "pending": f" (다시 적용하지 못했습니다: {view.why})", "waiting": " (다시 적용 대기)",
+             "item_conflict": f" ✕ {view.why}"}.get(view.state, "")
+    print(f"  {_pad(EDIT_TAGS.get(view.kind, '[수치]'), 8)}{view.source.label()}{view.member}{state}")
+    for c in view.changes:
+        print(f"          {c.at}: {c.before} → {c.after}" + (f" (행 {c.count}개)" if c.rule else ""))
+    for x in view.conflicts:
+        print(f"        ✕ {x.change.at}: {x.text()}")
+    if view.state == "item_conflict":
+        print(f"          (지우기: edit {name} revert {ref})")
+    elif len(view.conflicts) == 1:
+        print(f"          (edit {name} resolve {ref} {_q(view.conflicts[0].change.at)} --keep|--take)")
+    elif view.conflicts:
+        print(f"          (edit {name} resolve {ref} --every --keep|--take, 값마다 고르려면 --every 대신 주소)")
+    if view.state in ("pending", "waiting"):
+        print(f"          (다시 적용: edit {name} reapply {ref.split(' --option ')[0]})")
+
+
+def _edit_files(manager: ModManager, mod, args) -> int:
+    snap = manager.edit_snapshot(mod.id)
+    wanted = _option_test(args.option)
+    rows = [f for f in snap.files if wanted(f.source)]
+    if args.option is not None and not rows:
+        raise _no_option(mod, args.option)
+    if args.find:
+        rows = [f for f in rows if args.find.casefold() in f.rel.casefold()]
+    if args.excluded:
+        rows = [f for f in rows if f.state == "excluded"]
+    if args.overlaps:
+        rows = [f for f in rows if len(f.overlap) > 1]
+    head = f"{mod.name}: 파일 {len(snap.files)}개"
+    if snap.options:
+        head += " · 켠 옵션: " + (", ".join(_scope_name(edit_model.Source(o.name, o.n)) for o in snap.options
+                                          if o.selected) or "없음")
+    excluded = sum(1 for f in snap.files if f.state == "excluded")
+    if excluded:
+        head += f" · 뺀 파일 {excluded}개"
+    print(head)
+    width = max((_width(f"[{EDIT_FILE_STATES.get(f.state, f.state)}]") for f in rows), default=0) + 2
+    for f in rows:
+        extras = [f.kind]
+        if f.values:
+            extras.append(f"바꾼 값 {f.values}개")
+        if f.key in snap.pending:
+            extras.append("다시 적용 대기")
+        if f.repaired:
+            extras.append("재질 복구본")
+        if f.placed in ("changed", "stash"):
+            extras.append("게임 폴더에서 바뀜")
+        if f.overridden_by:
+            extras.append(f"아래쪽 옵션 '{f.overridden_by}'의 파일이 덮어씀")
+        if len(f.overlap) > 1:
+            extras.append("켠 옵션 " + ", ".join(f.overlap) + "에 있음")
+        other = snap.overlaps.get(path_key(f.rel)) if f.state == "in" else None
+        if other:
+            extras.append(f"다른 모드 '{other}'이(가) 덮어씀")
+        print(f"  {_pad('[' + EDIT_FILE_STATES.get(f.state, f.state) + ']', width)}{f.source.label()}  "
+              f"({' · '.join(extras)})")
+    if not rows:
+        print("  (맞는 파일이 없습니다)")
+    elif args.overlaps:
+        print(f"쓸 옵션을 고르려면: edit {_q(mod.name)} use <경로> --option <이름>")
+    return 0
+
+
+def _member_what(target) -> str:
+    """What a PAK entry is, from its label ("TestItemData", "ItemData (ItemData.user.3)"), without the hash its
+    name already shows."""
+    what = target.label.removeprefix(f"{target.source.rel} · ").split(" (옵션 ")[0]
+    return re.sub(r" \(#[0-9A-Fa-f]+\)$", "", what)
+
+
+def _list_targets(mod, targets: list, shown: list, none: str = "") -> None:
+    """The numbered list of ``values`` (``shown``: the targets to list, numbered by their place in ``targets``;
+    ``none``: what to say when that is none of them)."""
+    if not targets:
+        print(f"{mod.name}: 값을 바꿀 수 있는 파일이 없습니다 (natives 폴더의 .user 데이터 파일, 모드 PAK 안의 데이터 "
+              "파일, reframework 폴더의 스크립트 설정 파일만 바꿀 수 있습니다).")
+        return
+    print(f"{mod.name}: 값을 바꿀 수 있는 파일 {len(targets)}개")
+    if not shown and none:
+        print(f"  ({none})")
+    numbers = {id(t): n for n, t in enumerate(targets, 1)}
+    for t in shown:
+        kind = "[데이터]" if t.tool == "data" else "[설정]"
+        what = _member_what(t) if t.member else ""
+        extra = (f" · {what}" if what else "") + (" (수정함)" if t.edited else "")
+        print(f"  {numbers[id(t)]:3d}. {_pad(kind, 9)}{_target_name(t)}{extra}")
+        if t.readonly:
+            print(f"        바꿀 수 없음: {t.readonly}")
+        if t.note:
+            print(f"        참고: {t.note}")
+    print(f"값을 보려면: edit {_q(mod.name)} values <번호 또는 파일>")
+
+
+def _differs(view, engine) -> list[bool]:
+    """Whether each row's mod value differs from the game's (or the game has no such row): 모드가 바꾼 값. A value
+    without a game value in a row the game has was not paired (row numbers, arrays of another length): not."""
+    out = []
+    for row in view.rows:
+        if not view.compared:
+            out.append(False)
+        elif row.game is None:
+            out.append(row.value.group in view.added)
+        else:
+            out.append(row.game != row.base and not engine.same(row.value, row.base, row.game))
+    return out
+
+
+def _current(row) -> str:
+    """The value the game gets now: the user's, a rule's or the mod's."""
+    if row.mine is not None:
+        return row.mine.after
+    if row.rule is not None:
+        return row.rule.after
+    return row.base
+
+
+def _hint_values(hint: str) -> list[str]:
+    """The values of a "게임에 쓰인 값: 0, 1, 2" hint."""
+    _head, sep, rest = hint.partition(": ")
+    return [x for x in rest.split(", ") if x] if sep else []
+
+
+def _row_text(row, compared: bool, added=frozenset()) -> str:
+    v = row.value
+    game = row.game if row.game is not None else "없음" if v.group in added else "알 수 없음"
+    parts = [f"게임 {game}", f"모드 {row.base}"] if compared else [row.base]
+    if row.mine is not None:
+        parts.append(row.mine.after)
+    elif row.rule is not None:
+        parts.append(f"{row.rule.after} (규칙: 값이 {row.rule.before}인 행 모두)")
+    text = " → ".join(parts)
+    if row.conflict is not None:
+        text += f"  ✕ {row.conflict.text()}"
+    if not v.editable:
+        text += f"  (바꿀 수 없음: {v.why})" if v.why else "  (바꿀 수 없음)"
+    if v.warn:
+        text += " ⚠"
+    return text
+
+
+def _edit_values(manager: ModManager, mod, args) -> int:
+    snap = manager.edit_snapshot(mod.id)
+    if args.file is None:
+        targets = _targets(manager, snap)
+        wanted = _option_test(args.option)
+        shown = [t for t in targets if wanted(t.source)]
+        if args.option is not None and not shown:
+            _check_option(manager, snap, args.option)
+        _list_targets(mod, targets, shown,
+                      f"옵션 '{args.option}'에는 값을 바꿀 수 있는 파일이 없습니다" if args.option is not None else "")
+        return 0
+    targets = _targets(manager, snap, args.file)
+    found = _find_targets(manager, snap, args.file, args.option, targets)
+    if len(found) > 1:  # a PAK with several data files (named without "#": every PAK was read, numbers hold)
+        print("PAK 안에 값을 바꿀 수 있는 파일이 여러 개입니다. #해시까지 적거나 번호로 고르세요.")
+        _list_targets(mod, targets, found)
+        return 0
+    target = found[0]
+    view = manager.open_values(snap, target, _progress_printer())
+    engine = edit_engines.get(target.engine)
+    data = target.tool == "data"
+    differs = _differs(view, engine)
+    title = _target_name(target)
+    if data and not view.readonly:
+        title += f" ({_root_type(manager, target, view)})"
+    parts = [f"값 {view.total:,}개"]
+    if data and view.compared:
+        parts.append(f"모드가 바꾼 값 {sum(differs):,}개")
+    elif not data and target.engine == "lua":
+        parts.append(f"설정 같은 값 {sum(1 for r in view.rows if r.value.settings):,}개")
+    print(f"{title} · {' · '.join(parts)}")
+    if view.readonly:
+        print(f"바꿀 수 없음: {view.readonly}")
+        return 0
+    for note in [target.note, *view.notes]:
+        if note:
+            print(f"참고: {note}")
+
+    def edited(row) -> bool:
+        return row.mine is not None or row.conflict is not None or row.rule is not None
+
+    if args.all or (data and not view.compared):
+        rows = list(view.rows)
+    elif data:
+        rows = [r for r, d in zip(view.rows, differs) if d or edited(r)]
+    else:
+        rows = [r for r in view.rows if r.value.settings or edited(r)]
+    filtered = len(rows) < len(view.rows)
+    if args.find:
+        key = args.find.casefold()
+        rows = [r for r in rows if key in r.value.at.casefold() or key in r.value.label.casefold()]
+    total = len(rows)
+    if args.limit > 0:
+        rows = rows[:args.limit]
+    width = min(max((_width(r.value.at) for r in rows), default=0), 60)
+    kinds = max((len(r.value.kind) for r in rows), default=0)
+    for r in rows:
+        print(f"  {_pad(r.value.at, width + 2)}{r.value.kind:<{kinds}}   {_row_text(r, view.compared, view.added)}")
+    if not rows:
+        print("  (맞는 값이 없습니다)")
+    if total > len(rows):
+        print(f"  … {total:,}개 중 {len(rows):,}개 (--limit으로 더 보기)")
+    if filtered:
+        print(f"({EDIT_FILTERS[target.tool]} 보여 줍니다. 모두 보기: --all)")
+    hints = list(dict.fromkeys((r.value.rule_at, r.hint) for r in rows if r.hint and r.value.rule_at))
+    for rule_at, hint in hints[:EDIT_HINTS]:
+        print(f"  {hint} ({rule_at})")
+    return 0
+
+
+def _root_type(manager: ModManager, target, view) -> str:
+    """The data file's (or PAK entry's) type (app.user_data.ItemData)."""
+    from .modedit import pakedit, rszdata
+
+    try:
+        if target.member:
+            data = pakedit.read_member(Path(view.base.path), pakedit.member_hash(target.member))
+        else:
+            data = Path(view.base.path).read_bytes()
+        reg = rszdata.registry()
+        try:
+            return rszdata.root_type(data, reg) or "데이터"
+        finally:
+            rszdata.release()
+    except (OSError, KeyError, EditError):
+        return "데이터"
+
+
+# -- writing
+def _edit_exclude(manager: ModManager, mod, args) -> int:
+    flag = args.action == "exclude"
+    snap = manager.edit_snapshot(mod.id)
+    _refuse_bad(snap.record)
+    wanted = _option_test(args.option)
+    scope = [f for f in snap.files if wanted(f.source)]
+    if args.option is not None and not scope:
+        raise _no_option(mod, args.option)
+    chosen: dict[str, object] = {}
+    for pattern in args.paths:
+        test = _path_test(pattern)
+        hits = [f for f in scope if test(f.rel)]
+        if not hits:
+            raise EditError(f"맞는 파일이 없습니다: {pattern}" + (f" (옵션 '{args.option}')" if args.option else ""))
+        scopes = list(dict.fromkeys(f.source.option and _scope_name(f.source) for f in hits))
+        if len(scopes) > 1 and args.option is None and not args.all_options:
+            raise EditError(f"여러 옵션에 있는 파일입니다: {pattern}. --option으로 고르거나, 모든 옵션에서 "
+                            f"{'빼' if flag else '넣'}려면 --all-options를 붙이세요 (옵션: "
+                            + ", ".join(f"'{s}'" for s in scopes) + ")")
+        for f in hits:
+            chosen.setdefault(f.key, f)
+    by_rel = {(f.source.option, f.source.n, f.rel): f for f in snap.files}
+    twins = set()
+    for f in list(chosen.values()):
+        twin = by_rel.get((f.source.option, f.source.n, f.twin)) if f.twin else None
+        if twin is not None and twin.key not in chosen:
+            chosen[twin.key] = twin
+            twins.add(twin.key)
+    pending = edit_model.Pending(snap.record)
+    count = 0
+    for f in chosen.values():
+        if pending.excluded(f.source) == flag:
+            if f.key not in twins:  # (a twin that already follows says nothing)
+                print(f"  {'이미 뺀' if flag else '빼지 않은'} 파일입니다: {f.source.label()}")
+            continue
+        pending.exclude(f.source, flag)
+        count += 1
+        twin = f" (스트리밍 사본도 함께 {'뺍니다' if flag else '넣습니다'})" if f.key in twins else ""
+        print(f"  {'뺌' if flag else '다시 넣음'}: {f.source.label()}{twin}")
+    for line in _exclude_notes(manager, mod, snap, pending, list(chosen.values()), flag):
+        print(line)
+    code, _result = _save_edits(manager, mod, snap, pending, args,
+                                f"{'뺀' if flag else '다시 넣은'} 파일 {count}개")
+    return code
+
+
+def _exclude_notes(manager: ModManager, mod, snap, pending, chosen: list, flag: bool) -> list[str]:
+    """What the window would point out about the files left out or put back (shown, never enforced)."""
+    out = []
+    after = {f.key: pending.excluded(f.source) for f in snap.files}
+    live = [f for f in snap.files if not f.option_id or f.option_id in mod.selected] or snap.files
+    if flag and all(after[f.key] for f in live):
+        out.append("경고: 모든 파일을 빼면 이 모드는 게임에 아무것도 넣지 않습니다.")
+    for f in chosen:
+        if f.state == "option_off" and flag:
+            out.append(f"참고: {f.source.label()}: 이 옵션은 지금 꺼져 있어 빼도 게임에는 달라지는 것이 없습니다.")
+        elif f.state == "overridden":
+            out.append(f"참고: {f.source.label()}: 아래쪽 옵션 '{f.overridden_by}'의 파일이 이 파일을 덮어씁니다. 그 옵션의 "
+                       "파일을 빼면 이 파일이 들어갑니다.")
+        other = snap.overlaps.get(path_key(f.rel))
+        if other and not flag:
+            out.append(f"참고: {f.source.label()}: 다른 모드 '{other}'이(가) 이 파일을 덮어씁니다.")
+    groups: dict[tuple, list] = {}  # (scope, folder, stem) -> files: .sbnk/.spck, .mesh/.mdf2 go together
+    for f in snap.files:
+        folder, _, name = f.rel.rpartition("/")
+        groups.setdefault((f.source.option, f.source.n, folder.casefold(), name.split(".")[0].casefold()), []).append(f)
+    seen = set()
+    for f in chosen:
+        folder, _, name = f.rel.rpartition("/")
+        key = (f.source.option, f.source.n, folder.casefold(), name.split(".")[0].casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        group = groups.get(key, [])
+        kept = [g.rel.rsplit("/", 1)[-1] for g in group if not after[g.key]]
+        left = [g.rel.rsplit("/", 1)[-1] for g in group if after[g.key]]
+        if kept and left:
+            stem = name.split(".")[0]
+            again = f"edit {_q(mod.name)} exclude {_q((folder + '/' if folder else '') + stem + '.*')}" + (
+                f" --option {_q(_scope_name(f.source))}" if f.source.option else "")
+            out.append(f"참고: 같은 이름의 파일 가운데 일부만 뺐습니다: {stem} ({', '.join(kept)}은 넣고 "
+                       f"{', '.join(left)}은 뺌). 함께 빼야 할 수 있습니다. (함께 빼기: {again})")
+    if flag:
+        scripts = [f for f in chosen if f.rel.lower().endswith(".lua")]
+        users = [g for g in snap.files if g.rel.lower().endswith(".lua") and g.state == "in" and not after[g.key]]
+        for f in scripts:
+            provided = requirements.provided_modules([f.rel])
+            for g in users:
+                if any(requirements.module_key(n) in provided for n in requirements.required_modules({g.rel: g.path})):
+                    out.append(f"참고: {f.source.label()}: 다른 스크립트({g.rel.rsplit('/', 1)[-1]})가 이 파일을 "
+                               "불러옵니다.")
+                    break
+    return out
+
+
+def _edit_use(manager: ModManager, mod, args) -> int:
+    snap = manager.edit_snapshot(mod.id)
+    _refuse_bad(snap.record)
+    if not snap.options:
+        raise EditError("옵션이 없는 모드입니다.")
+    name, n = args.option.strip(), args.nth - 1
+    nth = re.fullmatch(r"(.+?) \((\d+)번째\)", name)
+    if nth is not None and not any(o.name == name for o in snap.options):
+        name, n = nth.group(1), int(nth.group(2)) - 1
+    ref = next((o for o in snap.options if o.name == name and o.n == n), None)
+    if ref is None:
+        raise _no_option(mod, name if not n else f"{name} ({n + 1}번째)")
+    label = _scope_name(edit_model.Source(ref.name, ref.n))
+    if not ref.selected:
+        raise EditError(f"옵션 '{label}'이(가) 꺼져 있습니다. 켠 옵션 가운데에서만 고를 수 있습니다 (켜기: options "
+                        f"{_q(mod.name)} --set <번호>).")
+    selected = {o.id for o in snap.options if o.selected}
+    test = _path_test(args.path)
+    mine = [f for f in snap.files if f.option_id == ref.id and test(f.rel)]
+    if not mine:
+        raise EditError(f"옵션 '{label}'에 맞는 파일이 없습니다: {args.path}")
+    by_rel = {(f.source.option, f.source.n, f.rel): f for f in snap.files}
+    pending = edit_model.Pending(snap.record)
+    count, offered = 0, 0
+    for f in mine:
+        others = [g for g in snap.files if g.option_id in selected and g.option_id != ref.id
+                  and path_key(g.rel) == path_key(f.rel)]
+        if not others:
+            print(f"  켠 옵션 가운데 '{label}'에만 있는 파일이라 그대로 둡니다: {f.rel}")
+            continue
+        offered += 1
+        wanted = [(f, False)] + [(g, True) for g in others]  # (the chosen copy goes in, the others' are left out)
+        wanted += [(by_rel[(g.source.option, g.source.n, g.twin)], flag) for g, flag in list(wanted)
+                   if g.twin and (g.source.option, g.source.n, g.twin) in by_rel]
+        changed = False
+        for g, flag in wanted:
+            if pending.excluded(g.source) != flag:
+                pending.exclude(g.source, flag)
+                count += flag
+                changed = True
+        if changed:
+            print(f"  {f.rel}: 옵션 '{label}'의 파일을 씁니다 (뺌: "
+                  + ", ".join(f"'{_scope_name(g.source)}'" for g in others) + ")")
+        else:
+            print(f"  {f.rel}: 이미 옵션 '{label}'의 파일을 쓰고 있습니다")
+    if not offered:
+        raise EditError(f"다른 켠 옵션에 같은 파일이 없어 고를 것이 없습니다: {args.path}")
+    print(f"(자동으로 아래쪽 옵션의 파일을 쓰려면: edit {_q(mod.name)} include {_q(args.path)} --all-options)")
+    code, _result = _save_edits(manager, mod, snap, pending, args, f"옵션 '{label}'의 파일 쓰기 · 뺀 파일 {count}개")
+    return code
+
+
+def _split_pair(pair: str, known) -> tuple[str, str]:
+    """(address, value) of 주소=값: the value starts after an = outside [...] (and outside quotes in them); of
+    several, the one after an address the file has."""
+    cuts, depth, quoted, escaped = [], 0, False, False
+    for i, ch in enumerate(pair):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quoted = False
+        elif ch == '"' and depth:
+            quoted = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif ch == "=" and not depth:
+            cuts.append(i)
+    if not cuts:
+        raise EditError(f"'주소=값' 꼴로 적어 주세요: {pair}")
+    for i in cuts:
+        if pair[:i].strip() in known:
+            return pair[:i].strip(), pair[i + 1:]
+    raise EditError(f"이 파일에 없는 주소입니다: {pair[:cuts[-1]].strip()} (주소 확인: edit <모드> values <파일> --all)")
+
+
+def _typed(v, text: str) -> str:
+    """켬/끔 for a bool of any engine (the config engines take true/false)."""
+    if v.kind in edit_engines.BOOL_KINDS:
+        return {"켬": "true", "끔": "false"}.get(text.strip(), text)
+    return text
+
+
+def _print_target_note(target) -> None:
+    """Why the values of the file do not reach the game now (another option's copy, its option off, the file
+    left out) or what saving a big PAK takes: the window shows it on its values page."""
+    if target.note:
+        print(f"참고: {target.note}")
+
+
+def _value_view(manager: ModManager, mod, snap, args):
+    """(target, its ValueView, engine) of 파일, refused when its values cannot be changed."""
+    _refuse_bad(snap.record)
+    target = _one_target(manager, snap, args.file, args.option)
+    if target.readonly:
+        raise EditError(f"{_target_name(target)}: {target.readonly}")
+    view = manager.open_values(snap, target, _progress_printer())
+    if view.readonly:
+        raise EditError(f"{_target_name(target)}: {view.readonly}")
+    return target, view, edit_engines.get(target.engine)
+
+
+def _edit_set(manager: ModManager, mod, args) -> int:
+    from .modedit import rszdata
+
+    snap = manager.edit_snapshot(mod.id)
+    target, view, engine = _value_view(manager, mod, snap, args)
+    data = target.tool == "data"
+    if args.same and not data:
+        raise EditError("--same은 데이터 파일(.user)에서만 쓸 수 있습니다.")
+    rows = {r.value.at: r for r in view.rows}
+    pending = edit_model.Pending(snap.record)
+    count, ints = 0, False
+    for pair in args.pairs:
+        at, text = _split_pair(pair, rows)
+        row = rows[at]
+        v = row.value
+        if not v.editable:
+            raise EditError(f"바꿀 수 없는 값입니다: {at}" + (f" ({v.why})" if v.why else ""))
+        after = engine.parse(v, _typed(v, text))
+        if args.same:
+            if not v.rule_at:
+                raise EditError(f"표의 행 값이 아니라 --same을 쓸 수 없습니다: {at}")
+            n = sum(1 for r in view.rows if r.value.rule_at == v.rule_at and r.value.editable
+                    and engine.same(r.value, r.value.text, v.text))
+            pending.set_value(target.source, target.member, target.engine, target.label, at=v.rule_at, kind=v.kind,
+                              before=v.text, after=after, rule=True, name=v.label)
+            print(f"  {v.rule_at} (값이 {v.text}인 행 {n}개): {v.text} → {after}")
+        else:
+            if row.rule is not None and row.mine is None and engine.same(v, after, v.text):
+                raise EditError(f"{at}: 이 값은 '값이 {row.rule.before}인 행 모두 → {row.rule.after}' 규칙으로 바뀝니다. "
+                                f"원래 값으로 하려면 규칙을 되돌리세요: edit {_q(mod.name)} revert "
+                                f"{_ref_args(snap.record.items, target.source, target.member)} {_q(row.rule.at)}")
+            pending.set_value(target.source, target.member, target.engine, target.label, at=v.at, kind=v.kind,
+                              before=v.text, after=after, raw=v.raw, name=v.label)
+            back = " (원래 값)" if engine.same(v, after, v.text) and row.mine is not None else ""
+            print(f"  {at}: {_current(row)} → {after}{back}")
+        if v.warn:
+            print(f"    참고: {v.warn}")
+        if data and v.kind in rszdata.INTS:
+            ints = True
+            used = _hint_values(row.hint)
+            if used and not any(engine.same(v, after, x) for x in used):
+                print(f"    경고: {rszdata.NOT_IN_HINT} ({row.hint})")
+        count += 1
+    if data:
+        if ints:
+            print(f"참고: {rszdata.INT_CAUTION}")
+        print(f"참고: {rszdata.ONLINE_CAUTION}")
+    _print_target_note(target)
+    code, _result = _save_edits(manager, mod, snap, pending, args, f"바꾼 값 {count}개")
+    return code
+
+
+def _plain_number(text: str, flag: str) -> str:
+    """K of --times/--change (or N of --to for number values) with its thousands separators taken out (1,000);
+    any other comma is refused, not dropped: a decimal comma (0,5) would read as 5."""
+    text = text.strip()
+    if "," not in text:
+        return text
+    if not EDIT_THOUSANDS.fullmatch(text):
+        raise EditError(f"--{flag}에는 숫자를 적어 주세요: {text} (소수점은 .으로)")
+    return text.replace(",", "")
+
+
+def _number_like(text: str) -> bool:
+    """Whether the number values read ``text`` as a number once its commas are dropped (engines.scaled)."""
+    text = text.strip().replace(",", "")
+    try:
+        if text.lower().lstrip("+-").startswith("0x"):
+            int(text, 16)
+        else:
+            float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _skip_text(reason: str, n: int) -> str:
+    """Values scale skipped for one reason: a reason that names the values ("게임 값이 없어 건너뛴 값") with the count
+    after it, a sentence (an engine's why: "켜기·끄기 값은 ...") in brackets after "건너뛴 값 n개"."""
+    if reason.endswith("값"):
+        return f"{reason} {n:,}개"
+    return f"건너뛴 값 {n:,}개 ({reason.rstrip('. ')})"
+
+
+def _edit_scale(manager: ModManager, mod, args) -> int:
+    from .modedit import rszdata
+
+    snap = manager.edit_snapshot(mod.id)
+    target, view, engine = _value_view(manager, mod, snap, args)
+    mode, k = ("set", args.to) if args.to is not None else ("times", args.times) if args.times is not None \
+        else ("change", args.change)
+    if mode != "set":
+        k = _plain_number(k, mode)
+        try:
+            factor = float(k)
+        except ValueError:
+            factor = float("nan")
+        if not math.isfinite(factor):
+            raise EditError(f"--{mode}에는 숫자를 적어 주세요: {k}")
+        if not view.compared:
+            raise EditError("게임 파일과 비교하지 못해 --times/--change를 쓸 수 없습니다")
+    elif not view.compared and not args.field:
+        raise EditError("게임 파일과 비교하지 못해 모드가 바꾼 값을 알 수 없습니다. 바꿀 값을 --field로 고르세요")
+    field = _glob(args.field) if args.field else None
+    numeric = set(edit_engines.INT_RANGES) | set(edit_engines.FLOAT_KINDS)
+    rows = []
+    for row, differs in zip(view.rows, _differs(view, engine)):
+        v = row.value
+        if not v.editable:
+            continue
+        if field is not None and not (field(v.at) or (v.rule_at and field(v.rule_at)) or field(v.label)):
+            continue
+        if field is None and v.kind not in numeric:
+            continue
+        if view.compared and (row.game is None or not differs):
+            continue  # (values paired with the game's that the mod changed)
+        rows.append(row)
+    if not rows:
+        which = ("모드가 바꾼 값 가운데 --field에 맞는 값이 없습니다" if view.compared else "--field에 맞는 값이 없습니다") \
+            if args.field else "모드가 바꾼 숫자 값이 없습니다"
+        raise EditError(f"바꿀 값이 없습니다: {which} (값 하나는 set으로 바꿀 수 있습니다)")
+    if mode == "set" and _number_like(k) and any(r.value.kind in numeric for r in rows):
+        k = _plain_number(k, "to")  # (a number for the number values: 1,000 is 1000, 0,5 is refused)
+    pending = edit_model.Pending(snap.record)
+    count, skipped, ints = 0, {}, False
+    for row in rows:
+        v = row.value
+        text, note = edit_engines.scaled(engine, v, mode, k, row.base, row.game)
+        if text is None:
+            skipped[note] = skipped.get(note, 0) + 1
+            continue
+        if mode != "set" and v.at not in view.keyed:  # (its game value may be another row's: rows paired by place)
+            skipped[EDIT_UNKEYED] = skipped.get(EDIT_UNKEYED, 0) + 1
+            continue
+        if row.rule is not None and row.mine is None and engine.same(v, text, v.text):
+            skipped["규칙으로 바뀌는 값이라 건너뛴 값"] = skipped.get("규칙으로 바뀌는 값이라 건너뛴 값", 0) + 1
+            continue
+        if engine.same(v, text, _current(row)):
+            skipped["이미 그 값이라 건너뛴 값"] = skipped.get("이미 그 값이라 건너뛴 값", 0) + 1
+            continue
+        how = {"mode": mode, "k": k} if mode == "set" else {"mode": mode, "k": factor, "game": row.game}
+        pending.set_value(target.source, target.member, target.engine, target.label, at=v.at, kind=v.kind,
+                          before=v.text, after=text, how=how, raw=v.raw, name=v.label)
+        print(f"  {v.at}: {_current(row)} → {text}" + (f" ({note})" if note else ""))
+        ints = ints or v.kind in rszdata.INTS
+        count += 1
+    for note, n in skipped.items():
+        print(f"  {_skip_text(note, n)}")
+    if EDIT_UNKEYED in skipped:
+        print("  (게임과 행을 맞추지 못한 값은 --to나 set으로 바꿀 수 있습니다)")
+    if target.tool == "data":
+        if ints:
+            print(f"참고: {rszdata.INT_CAUTION}")
+        print(f"참고: {rszdata.ONLINE_CAUTION}")
+    _print_target_note(target)
+    code, _result = _save_edits(manager, mod, snap, pending, args, f"바꾼 값 {count}개")
+    return code
+
+
+def _rule_of_row(manager: ModManager, snap, source, member: str, at: str):
+    """The rule of the record that covers the row ``at`` (None when none does), read in the file."""
+    target = next((t for t in _targets(manager, snap, source.rel + member)
+                   if t.source == source and t.member == member), None)
+    if target is None:
+        return None
+    view = manager.open_values(snap, target, _progress_printer())
+    return next((r.rule for r in view.rows if r.value.at == at), None)
+
+
+def _twin_out(snap, pending, source):
+    """The streaming copy of a stored file (or the file a streaming copy is of), in the same option, when it is
+    left out too: put back with it."""
+    f = next((g for g in snap.files if g.source == source), None)
+    if f is None or not f.twin:
+        return None
+    twin = next((g for g in snap.files if g.option_id == f.option_id and path_key(g.rel) == path_key(f.twin)), None)
+    return twin if twin is not None and twin.state != "conflict" and pending.excluded(twin.source) else None
+
+
+def _option_revert_error(manager: ModManager, mod, snap, option: str, everything: bool) -> EditError:
+    """revert without 파일 but with ``--option``: --all is every option's edits (as 모든 수정 되돌리기), so
+    an option's edits are reverted file by file; the files the record has edits of in that option."""
+    _check_option(manager, snap, option)
+    _refuse_bad(snap.record)
+    name, items = _q(mod.name), snap.record.items
+    mine = [i for i in items if _option_test(option)(i.source)]
+    head = ("--all은 모든 옵션의 수정을 되돌리므로 --option과 함께 쓸 수 없습니다. " if everything
+            else "되돌릴 파일을 적어 주세요. ")
+    if not mine:
+        tail = f"옵션 '{option.strip()}'에는 수정한 파일이 없습니다"
+    else:
+        tail = (f"옵션 '{option.strip()}'의 수정은 파일마다 되돌립니다: "
+                + " · ".join(f"edit {name} revert {_ref_args(items, i.source)}" for i in mine[:3])
+                + (" …" if len(mine) > 3 else ""))
+    if not everything:
+        tail += f" (모든 옵션의 수정을 되돌리려면: edit {name} revert --all)"
+    return EditError(head + tail)
+
+
+def _edit_revert(manager: ModManager, mod, args) -> int:
+    snap = manager.edit_snapshot(mod.id)
+    record = snap.record
+    pending = edit_model.Pending(record)
+    if args.file is None:
+        if args.option is not None:  # (refused, not dropped: --all would revert the other options' edits too)
+            raise _option_revert_error(manager, mod, snap, args.option, args.all)
+        if not args.all:
+            raise EditError(f"모든 수정을 되돌리려면 --all을 붙이세요: edit {_q(mod.name)} revert --all")
+        summary = manager.edit_summary(mod.id)
+        if summary.empty and not record.error:
+            print("되돌릴 수정이 없습니다.")
+            return 0
+        pending.reset_all()
+        print(f"  모든 수정을 되돌립니다: {summary.text()}")
+        if record.error:
+            print(f"  (읽지 못한 기록은 {EDITS_RECORD}{BAD_SUFFIX}<시각>으로 옮겨 둡니다)")
+        code, _result = _save_edits(manager, mod, snap, pending, args, "모든 수정 되돌리기", force=args.yes)
+        return code
+    _refuse_bad(record)
+    ((item, member),) = _record_items(manager, snap, record, args.file, args.option)
+    where = item.source.label()
+    count = 0
+    if not args.addresses:
+        if member:  # one entry of a PAK
+            m = item.member(member)
+            for c in [*m.changes, *(x.change for x in m.conflicts)]:
+                pending.revert_value(item.source, member, c.at, c.before if c.rule else None)
+            count = len(m.changes) + len(m.conflicts)
+            print(f"  되돌림: {where}{member} (값 {count}개)")
+        else:
+            pending.drop(item.source)
+            what = [w for w in ("뺀 파일" if item.exclude else "", f"바꾼 값 {item.changes()}개" if item.changes() else "",
+                                f"확인할 값 {item.conflicts()}개" if item.conflicts() else "") if w]
+            count = 1
+            print(f"  되돌림: {where} ({' · '.join(what) or '수정 기록'})")
+            twin = _twin_out(snap, pending, item.source) if item.exclude else None
+            if twin is not None:  # (a texture or model and its streaming copy go in together, as include puts them)
+                pending.exclude(twin.source, False)
+                count += 1
+                print(f"  다시 넣음: {twin.source.label()} (스트리밍 사본도 함께 넣습니다)")
+    else:
+        names = [m.member for m in item.members]
+        if not names:
+            raise EditError(f"이 파일에는 바꾼 값이 없습니다: {where} (파일을 다시 넣으려면 include)")
+        if not member:
+            if len(names) != 1:
+                raise EditError("PAK 안 파일을 #해시까지 적어 주세요: "
+                                + ", ".join(f"{item.source.rel}{n}" for n in names))
+            member = names[0]
+        m = item.member(member)
+        for at in args.addresses:
+            at = at.strip()
+            mine = [(c, None) for c in m.changes if c.at == at] + [(x.change, x) for x in m.conflicts
+                                                                    if x.change.at == at]
+            if mine:
+                pending.revert_value(item.source, member, at)
+                for c, x in mine:
+                    if c.rule:
+                        print(f"  {at}: 규칙 '값이 {c.before}인 행 모두 → {c.after}'를 되돌립니다")
+                    elif x is not None:  # (never applied: the game gets what the file has now, as resolve --take)
+                        print(f"  {at}: 작성자 값 쓰기" + (f" ({x.now})" if x.now is not None else " (내 수정을 지움)"))
+                    else:
+                        print(f"  {at}: {c.after} → {c.before} (원래 값)")
+                count += 1
+                continue
+            rule = None
+            if edit_model.engine_tool(m.engine) == "data" and any(c.rule for c in m.changes):
+                rule = _rule_of_row(manager, snap, item.source, member, at)
+            if rule is None:
+                raise EditError(f"수정한 값이 아닙니다: {at}")
+            pending.revert_value(item.source, member, at, rule.before)
+            print(f"  {at}: 이 값은 '값이 {rule.before}인 행 모두 → {rule.after}' 규칙으로 바뀌었습니다. 원래 값으로 하면 "
+                  f"규칙 전체를 되돌립니다 (행 {rule.count}개).")
+            count += 1
+    code, _result = _save_edits(manager, mod, snap, pending, args, f"되돌린 수정 {count}개", force=args.yes)
+    return code
+
+
+def _edit_resolve(manager: ModManager, mod, args) -> int:
+    snap = manager.edit_snapshot(mod.id)
+    record = snap.record
+    _refuse_bad(record)
+    ((item, member),) = _record_items(manager, snap, record, args.file, args.option)
+    members = [m for m in item.members if m.conflicts and (not member or m.member == member)]
+    if not members:
+        raise EditError(f"확인할 값이 없습니다: {item.source.label()}{member}")
+    if args.addresses and len(members) > 1:
+        raise EditError("PAK 안 파일을 #해시까지 적어 주세요: "
+                        + ", ".join(f"{item.source.rel}{m.member}" for m in members))
+    pending = edit_model.Pending(record)
+    count = 0
+    for m in members:
+        if args.every:
+            chosen = list(m.conflicts)
+        else:
+            chosen = []
+            for at in args.addresses:
+                hits = [x for x in m.conflicts if x.change.at == at.strip()]
+                if not hits:
+                    raise EditError(f"확인할 값이 아닙니다: {at}")
+                chosen += hits
+        for x in chosen:
+            at, before = x.change.at, x.change.before if x.change.rule else None
+            if args.keep:
+                if x.why != "changed" or x.now is None:
+                    if args.every:
+                        print(f"  {at}: {x.text()} - 내 값을 유지할 수 없어 그대로 둡니다 (--take로 지우기)")
+                        continue
+                pending.keep_mine(item.source, m.member, at, before)
+                print(f"  {at}: 내 값 유지 ({x.now} → {x.change.after})")
+            else:
+                pending.take_author(item.source, m.member, at, before)
+                print(f"  {at}: 작성자 값 쓰기" + (f" ({x.now})" if x.now is not None else " (내 수정을 지움)"))
+            count += 1
+    code, _result = _save_edits(manager, mod, snap, pending, args, f"확인한 값 {count}개")
+    return code
+
+
+def _edit_reapply(manager: ModManager, mod, args) -> int:
+    snap = manager.edit_snapshot(mod.id)
+    record = snap.record
+    _refuse_bad(record)
+    sources = []
+    if args.files:
+        for ref in args.files:
+            sources += [item.source for item, _m in _record_items(manager, snap, record, ref, None, many=True)]
+    else:
+        sources = [v.source for v in manager.edit_items(mod.id) if v.state in ("pending", "waiting")]
+    sources = list(dict.fromkeys(sources))
+    if not sources:
+        print("다시 적용할 수정이 없습니다.")
+        summary = manager.edit_summary(mod.id)
+        left = [x for x in (f"확인할 값 {summary.conflicts}개" if summary.conflicts else "",
+                            f"다시 적용하지 못한 파일 {summary.pending}개" if summary.pending else "") if x]
+        if left:
+            print(f"{' · '.join(left)} (확인: edit {_q(mod.name)})")
+            return 1
+        return 0
+    pending = edit_model.Pending(record)
+    for source in sources:
+        pending.reapply(source)
+        print(f"  다시 적용: {source.label()}")
+    code, result = _save_edits(manager, mod, snap, pending, args, f"다시 적용한 파일 {len(sources)}개",
+                               force=args.yes)
+    if result is not None and getattr(args, "dry_run", False) and _left_text(result):
+        print(f"{_left_text(result)} (확인: edit {_q(mod.name)})")
+    return 1 if result is not None and (result.conflicts or result.pending) else code
+
+
+def _edit_clear(manager: ModManager, mod, args) -> int:
+    record = manager.edit_record(mod.id)
+    if not record.error:
+        raise EditError("수정 기록을 읽을 수 있어 옮길 필요가 없습니다. 모든 수정을 되돌리려면: "
+                        f"edit {_q(mod.name)} revert --all")
+    if not args.yes:
+        raise EditError(f"읽지 못한 수정 기록({record.error})을 {EDITS_RECORD}{BAD_SUFFIX}<시각>으로 옮기려면 "
+                        "--yes를 붙이세요 (그 기록의 수정은 쓰지 않게 됩니다).")
+    snap = manager.edit_snapshot(mod.id)
+    pending = edit_model.Pending(record)
+    pending.clear_bad()
+    code, result = _save_edits(manager, mod, snap, pending, args, "읽지 못한 기록을 옆으로 옮김")
+    if result is not None and result.changed:
+        print(f"읽지 못한 기록은 모드 폴더의 {EDITS_RECORD}{BAD_SUFFIX}<시각>으로 옮겨 두었습니다.")
+    return code
+
+
+EDIT_COMMANDS = {
+    "status": _edit_status, "files": _edit_files, "exclude": _edit_exclude, "include": _edit_exclude,
+    "use": _edit_use, "values": _edit_values, "set": _edit_set, "scale": _edit_scale, "revert": _edit_revert,
+    "resolve": _edit_resolve, "reapply": _edit_reapply, "clear-record": _edit_clear,
+}
+
+
+def _print_carry(manager: ModManager, mod) -> None:
+    """What an update did to the mod's 모드 수정 (the record's notice; the window shows it once more)."""
+    record = manager.edit_record(mod.id)
+    notice = {} if record.error else record.notice
+    if notice.get("kind") != "update":
+        return
+    if notice.get("error"):
+        print(f"  모드 수정: {notice['error']}")
+        return
+    report = edit_model.CarryReport.from_notice(notice)
+    print(f"  모드 수정: {report.text()}")
+    for label in report.dropped:
+        print(f"    없어진 파일 (빼 두었던 것): {label}")
+    if report.problems:
+        print(f"  확인하려면: edit {_q(mod.name)}")
+
+
+def _reapply_edits(manager: ModManager, mod_ids) -> None:
+    """Build again the 모드 수정 whose base a material check, repair or restore changed (the window does it when
+    idle); not while 원인 모드 찾기 runs."""
+    wanted = set(mod_ids)
+    waiting = [i for i in manager.edits_pending() if i in wanted]
+    if not waiting:
+        return
+    names = ", ".join(manager.get(i).name for i in waiting)
+    if bisect.active(manager.data_dir):
+        print(f"원인 모드 찾기 중이라 모드 수정은 다시 적용하지 않았습니다: {names} (마친 뒤: edit <모드> reapply)")
+        return
+    for result in manager.reapply_edits(waiting, _progress_printer()):
+        if result.changed:
+            left = _left_text(result)
+            print(f"모드 수정을 다시 적용했습니다: {manager.get(result.mod_id).name}" + (f" · {left}" if left else ""))
+    still = [manager.get(i).name for i in manager.edits_pending() if i in wanted]
+    if still:
+        print(f"모드 수정을 다시 적용하지 못했습니다: {', '.join(still)} (확인: edit <모드>)")
 
 
 def _print_findings(findings) -> None:
@@ -1133,6 +2444,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="무엇을 옮기는지만 보여 주고 새 모드는 만들지 않음")
     p.add_argument("--no-deploy", action="store_true", help="게임 폴더에 바로 적용하지 않음")
 
+    p = sub.add_parser("edit", aliases=["modedit"],
+                       help="모드 수정: 파일 빼기 · 쓸 옵션 고르기 · 데이터 파일과 스크립트 설정의 값 바꾸기 · 되돌리기 "
+                            "(모드의 원래 파일은 그대로 두고 수정본을 따로 만듦)")
+    p.add_argument("mod", help="모드 id, 번호 또는 이름")
+    p.add_argument("action", nargs="?", default="status", choices=EDIT_ACTIONS, metavar="동작",
+                   help=" · ".join(f"{a}: {EDIT_HELP[a]}" for a in EDIT_ACTIONS) + " (기본값 status)")
+    p.add_argument("rest", nargs=argparse.REMAINDER, action=_EditArgs, metavar="...",
+                   help="동작의 인자와 옵션 (동작마다: edit <모드> <동작> --help)")
+
     p = sub.add_parser("crash", help="게임 튕김 기록: REFramework 기록 모으기 · 의심되는 원인 · 진단 파일")
     p.add_argument("action", choices=("list", "show", "report", "lua"),
                    help="list: 기록 목록 · show [번호]: 의심되는 원인 · report [번호] --out 파일.zip: 진단 파일 저장 · "
@@ -1182,19 +2502,21 @@ COMMANDS = {
     "remove": cmd_remove, "move": cmd_move, "deploy": cmd_deploy, "purge": cmd_purge,
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
     "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview, "crash": cmd_crash,
-    "bisect": cmd_bisect, "check": cmd_check, "retarget": cmd_retarget,
+    "bisect": cmd_bisect, "check": cmd_check, "retarget": cmd_retarget, "edit": cmd_edit, "modedit": cmd_edit,
 }
 
 
 def changes_mods(args) -> bool:
-    """The command turns mods on or off, installs, removes or reorders them, or changes the profile or
-    the game folder: it waits while 원인 모드 찾기 runs (bisect.BLOCKED)."""
+    """The command turns mods on or off, installs, removes or reorders them, changes what a mod puts into the
+    game (모드 수정), or changes the profile or the game folder: it waits while 원인 모드 찾기 runs
+    (bisect.BLOCKED)."""
     if args.cmd in ("install", "enable", "disable", "remove", "move", "purge", "game"):
         return True
     return (args.cmd == "options" and args.set is not None) or (args.cmd == "profile" and bool(args.name)) \
         or (args.cmd == "refw" and args.install) or (args.cmd in ("materials", "matfix")
                                                        and args.action in ("repair", "restore")) \
-        or (args.cmd == "retarget" and not args.dry_run)
+        or (args.cmd == "retarget" and not args.dry_run) \
+        or (args.cmd in ("edit", "modedit") and args.action in EDIT_WRITES and not getattr(args, "dry_run", False))
 
 
 def main(argv=None) -> int:

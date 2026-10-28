@@ -73,13 +73,34 @@
     다른 대상으로 가는 부위들이 함께 쓰면 거절. 기록은 `RETARGET_FORMAT` 2("to"가 문자열이거나 {부위: 키}, 모두 같으면 문자열로
     저장, 형식 1도 읽음). 옮긴 모드를 다시 옮기면 `_chained_recipe`가 처음 장비부터의 기록 하나로 합침(그대로 둔 파일 `kept`도 —
     PAK 항목은 해시와 이름 둘 다). 창은 부위 표(고른 행에 목록에서 고른 장비를 입힘), 명령줄은 `--to 부위=장비` 여러 번.
-    창은 '모드 수정'(툴바의 **모드 수정** 버튼 `App.open_mod_tool`, 오른쪽 클릭 '모드 수정...', 장비 외형 창의 링크가 모두
-    `open_retarget`으로 같은 창을 염. 고칠 수 있는 모드는 `App.editable`). 창 맨 위의 모드 상자로 그 자리에서 다른 모드로
-    바꾸고(`_set_mod`가 모드에 따른 상태·위젯을 모두 되돌림, 앞 모드의 작업 결과는 `_generation`으로 버림), 만들 때는 창에서
-    마지막으로 고른 모드(`dialog.mod_id`)로 만든다. 닫힌 상자 위의 휠은 막음.
+    창은 모드 수정 창의 '다른 장비로 옮기기' 페이지(`retargetview.RetargetPage`; `RetargetDialog`는 그 페이지로 연 창).
+    만들 때는 창에서 마지막으로 고른 모드(`dialog.mod_id`)로 만든다.
     무기는 본체·보조를 한 무기로만. avp/wvp·소리 파일은 옮기지 않는다
     (avp의 GUID를 옮기면 장비 화면이 튕길 수 있다는 커뮤니티 보고, 무기 소리 뱅크는 이름만 바꾸면 게임이 읽지 않음).
     규칙 대부분은 게임 안에서 확인하지 못했고 커뮤니티 도구(MHWmodfixer, Equip Slot Converter)·게임 파일 목록에서 가져왔다
+  - 모드 수정(다른 사람이 만든 모드 고치기): `mhwmm/modedit/`(Tk·매니저를 가져오지 않음, 작업 스레드에서 안전). `model.py` 기록
+    (`mods/<id>/edits.json`, 형식 `EDITS_FORMAT`; 고친 파일은 `edits/NNNN_<이름>`, 번호는 다시 쓰지 않음; 옵션은 id가 아니라 이름+n;
+    읽지 못하거나 더 새 형식이면 쓰지도 덮어쓰지도 않음), `Pending`/`EditPlan`, `engines.py` 엔진 규약과 다시 적용 규칙(바꾸기 전
+    값이 그대로면 적용, 이미 그 값이면 그대로, 작성자가 바꿨으면 충돌 — 예전 충돌도 매번 지금 파일로 다시 판단)·`scaled`·숫자
+    읽기(쉼표는 천 단위만), `rszdata.py` .user 값(제자리 바이트만 바꿈: 길이·레이아웃·문자열·경로 그대로라 재질 점검 판정이 바뀌지
+    않음; 쓸 때마다 V1–V6 검사, 열 때 selfcheck; 주소는 파일이 부르는 지금의 철자로; 게임 파일과 행은 id 같은 칸·`_Index`·Guid·
+    문자열로만 짝짓고 값 칸으로는 짝짓지 않음, 몇 배 계산은 키로 짝지은 값만 `keyed`), `textconfig.py` Lua·JSON·INI·TOML 값
+    하나만 바꿔 쓰고 다시 읽어 그 값만 달라졌는지 확인, `pakedit.py` PAK 다시 만들기(P1–P6, 빈 공간), `build.py`(commit/reapply/
+    carry; 값을 빼기만 하는 저장은 쓰기에 실패해도 거절하지 않고 기다림). 매니저: `mod_entries`에서 저장된 파일 → 뺀 파일 제외(나중
+    옵션이 이기는 규칙보다 먼저) → 재질 복구 → 값 수정(`_edit_overlay`; 결과는 바탕이 그대로일 때만 쓰고, 아니면 수정 없이 바탕을
+    쓰며 다시 적용 대기 `edits_pending` → `App._reapply_soon`). `mod_entries`를 거치지 않는 읽기(material_files·material_jobs의
+    provided·`_stored_files`/lua·`_shader_sources`)도 뺀 파일을 뺀다. `Mod.files_stamp`(재질 점검 입력)와 `Mod.stamp`(+`edited_at`,
+    게임에 들어가는 것: 장비 스캔·셰이더·튕김 기록·원인 찾기). matfix.json의 `"excluded"` digest가 다르면 '점검 전', 뺀 파일의 복구본은
+    지우지 않음. 업데이트 때 `_carry_edits`가 옛 폴더를 지우기 전에 새 파일에 다시 적용(실패해도 설치는 됨, 모두 대기로). 게임 폴더의
+    사본이 바뀐 루스 파일(`Deployer.placed`: changed/stash)은 값 바꾸기 거절, 되돌리기는 물음(`GameCopyChanged`, 명령줄 `--yes`),
+    옵션 사본 바꾸기(쓸 옵션 등)는 묻지 않음(배포가 같은 모드의 출처가 바뀌어도 바뀐 게임 사본을 `edited\`에 보관).
+    `TypeRegistry.hold`/`unhold`(잡혀 있는 동안 release는 아무것도 안 함). 창은 `mhwmm/modtool.py`(`ModToolDialog`: 모드 상자 `_set_mod`/`_generation`, 할 일 열,
+    탭 없는 페이지, `_first_page`; 저장하면 `EditChoice` → `App._commit_edits`가 run_task "modedit", FOLDER_TASKS라 그동안 실행 막음),
+    페이지는 `mhwmm/modeditview.py`(FilesPage·ValuesPage·SummaryPage·ValuePanel). 툴바 **모드 수정** `App.open_mod_tool`, 오른쪽 클릭
+    '모드 수정...', 장비 외형 창 링크는 `open_retarget`. 고칠 수 있는 모드는 `App.editable`(REFramework 말고 파일이 있는 모드). 명령줄
+    `edit`(쓰는 동작은 원인 찾기 중 막음, `--dry-run`). 레시피의 뜻이 바뀌면 `modedit.EDITS_FORMAT`을 올린다. 파일을 통째로 바꾸는
+    수정이 생기면 저장된 파일 → 수정 → 복구 순서와 키별 digest가 필요. 게임 폴더에 직접 쓰는 기능을 더하면 무조건
+    `is_game_running()`이면 거절. 값 바꾸기는 직접 만든 시험 파일로만 확인(진짜 게임 파일 시험은 `MHWMM_RSZ_SAMPLES`)
   - `mhwmm/crashlog.py`: REFramework 기록(re2_framework_log·reframework_faulty_files·re2_fw_config) 읽기, 게임 오류 창·
     이벤트 뷰어 문구 인식, 게임 자체 오류 보고서(`<게임>\CrashReport\*.zip`의 CrashReport.txt; 그래픽 오류 등은 이것만 남고
     게임은 종료 코드 0으로 끝남) 읽기. `mhwmm/crashes.py`: 게임 튕김 기록 — 매니저를 켤 때와 게임 실행 직전에 데이터 폴더 `crashes\`로 복사

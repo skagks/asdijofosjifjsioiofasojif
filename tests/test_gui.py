@@ -1300,12 +1300,12 @@ def test_gui_window_takes_its_minimum_and_default_size(root, manager):
 
 
 def test_gui_toolbar_mod_tool_button(root, manager, tmp_path, monkeypatch):
-    """모드 수정 sits right after 장비 외형 on the toolbar; with no mod it can work on (a script mod has no game
-    files) it says so and opens no window."""
-    from mhwmm import gui, retargetview
+    """모드 수정 sits right after 장비 외형 on the toolbar; it works on any mod but REFramework (a script mod too:
+    the window says which tools work on it); with no such mod it says so and opens no window."""
+    from test_modtool_gui import patch_window
 
-    with manager.prepare_install(make_zip(tmp_path / "S.zip", {"reframework/autorun/a.lua": "--"})) as s:
-        script = manager.install_variant(s, s.variants[0])
+    from mhwmm import gui, refw
+
     app = gui.App(root, manager, queue.Queue())
     pump(root, lambda: True)
     button = app.buttons["modtool"]
@@ -1314,12 +1314,33 @@ def test_gui_toolbar_mod_tool_button(root, manager, tmp_path, monkeypatch):
     assert slaves.index(button) == slaves.index(app.buttons["equipment"]) + 1
     assert str(button.cget("style")) == str(app.buttons["equipment"].cget("style"))
     opened, told = [], []
-    monkeypatch.setattr(retargetview, "RetargetDialog", lambda *a, **k: opened.append(a))
+
+    class Dialog:
+        def __init__(self, parent, app, mod_id, page=None, source=None, pending=None):
+            opened.append((mod_id, page))
+
+        def show(self):
+            return None
+
+    patch_window(monkeypatch, Dialog)
     monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text, parent=None: told.append((title, text)))
+    button.invoke()  # (no mod at all)
+    assert opened == [] and told == [("모드 수정", "고칠 수 있는 모드가 없습니다. 모드를 추가하면 고칠 수 있습니다.")]
+
+    with manager.prepare_install(make_zip(tmp_path / "R.zip", {"dinput8.dll": "dll"})) as s:
+        framework = manager.install_variant(s, s.variants[0])
+    framework.origin = refw.ORIGIN  # (REFramework itself: nothing to change)
+    app.refresh()
+    app.tree.selection_set(framework.id)
+    button.invoke()
+    assert opened == [] and len(told) == 2
+
+    with manager.prepare_install(make_zip(tmp_path / "S.zip", {"reframework/autorun/a.lua": "--"})) as s:
+        script = manager.install_variant(s, s.variants[0])
+    app.refresh()
     app.tree.selection_set(script.id)
     button.invoke()
-    assert opened == [] and len(told) == 1
-    assert told[0][0] == "모드 수정" and told[0][1].startswith("고칠 수 있는 모드가 없습니다.")
+    assert opened == [(script.id, None)] and len(told) == 2
 
 
 def test_gui_window_default_size_and_sash(root, manager):

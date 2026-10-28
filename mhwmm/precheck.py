@@ -139,7 +139,7 @@ class ModState:
     id: str
     name: str
     enabled: bool
-    stamp: str = ""  # f"{installed_at}|{updated_at}", as in the crash records' context
+    stamp: str = ""  # Mod.stamp (installed_at|updated_at[|edited_at]), as in the crash records' context
     kinds: frozenset = frozenset()  # analyzer.classify of the files it applies ("loose", "pak", "script"...)
     files: Sequence[str] = ()  # game paths it applies (manager.mod_files)
     needs_option: bool = False
@@ -149,6 +149,7 @@ class ModState:
     stuck: Sequence[dict] = ()  # manager.material_stuck: [{"label", "kind", "reason"}]
     hidden: bool = False  # every file loses to other mods
     refw: bool = False  # the mod that provides REFramework's dinput8.dll
+    edit_issues: Sequence[str] = ()  # manager.edit_issues: what of its 모드 수정 does not reach the game (enabled mods)
 
 
 @dataclass
@@ -204,6 +205,8 @@ def mod_problems(mods: Sequence[ModState]) -> dict[str, list[str]]:
         if mod.stuck:
             reasons.append(f"현재 게임과 맞지 않지만 고칠 수 없는 {stuck_summary(mod.stuck)}이 있어 게임이 멈출 수 "
                            "있습니다 (정보 탭 참고)")
+        if mod.edit_issues:
+            reasons.append(f"모드 수정 내용 일부가 적용되지 않았습니다: {mod.edit_issues[0]} (모드 수정 → 수정 내용)")
         if reasons:
             problems[mod.id] = reasons
     for mod in mods:
@@ -1256,18 +1259,19 @@ def mod_states(manager, conflicts=None, missing: dict | None = None) -> list[Mod
     version = manager.game_version()
     out = []
     for m in manager.mods:
-        reqs, state, stuck, updated = [], "", [], False
+        reqs, state, stuck, updated, edits = [], "", [], False, []
         if m.enabled:
             reqs = missing.get(m.id, []) if missing is not None else manager.missing_requirements(m.id)
             state = manager.material_state(m.id)
             stuck = manager.material_stuck(m.id)
             checked = manager.material_checked_for(m.id) if state == "unchecked" else ""
             updated = bool(checked) and checked != version
+            edits = manager.edit_issues(m.id)
         files = manager.mod_files(m.id)
-        out.append(ModState(m.id, m.name, m.enabled, f"{m.installed_at}|{m.updated_at}",
+        out.append(ModState(m.id, m.name, m.enabled, m.stamp,
                             frozenset(manager.mod_kinds(m.id)), list(files), m.needs_option,
                             [requirement_label(r) for r in reqs], state, updated, list(stuck), m.id in hidden,
-                            refw is not None and refw.id == m.id))
+                            refw is not None and refw.id == m.id, list(edits)))
     return out
 
 

@@ -81,9 +81,9 @@ class World:
         self.stuck: dict[str, list[str]] = {}
 
     def add(self, mod_id: str, files, enabled: bool = True, stamp_: str = "2026-10-01T10:00:00|", refw: bool = False,
-            changed_at: float | None = None, updated: bool = False, digest: str = "") -> ModInfo:
+            changed_at: float | None = None, updated: bool = False, digest: str = "", edited: bool = False) -> ModInfo:
         info = ModInfo(mod_id, f"모드 {mod_id}", enabled, stamp_, digest, frozenset(classify(files)), tuple(files), refw,
-                       changed_at, updated)
+                       changed_at, updated, edited)
         self.mods.append(info)
         for f in files if enabled else ():
             if f.lower().endswith(".pak") and "/" not in f:
@@ -423,11 +423,13 @@ def test_mods_installed_or_updated_shortly_before_the_crash(world):
     world.add("B", ["natives/STM/Art/x.mesh.241111606"], changed_at=CRASH - 3 * 86400, updated=True)
     world.add("C", ["natives/STM/Art/y.mesh.241111606"], changed_at=CRASH - 30 * 86400)
     world.add("D", ["natives/STM/Art/z.mesh.241111606"], changed_at=CRASH + 600)  # (after the crash)
+    world.add("E", ["natives/STM/Art/w.mesh.241111606"], changed_at=CRASH - 2 * 3600, updated=True, edited=True)
     world.record(log_text(world.game, crash=str(world.game / "MonsterHunterWilds.exe")))
     ev = world.build()
-    assert ev.weights == {"A": 2.0, "B": 1.3}
-    assert ev.reasons == {"A": ["튕기기 5시간 전에 설치했습니다"], "B": ["튕기기 3일 전에 업데이트했습니다"]}
-    assert "최근 설치·업데이트한 모드 2개" in ev.notes
+    assert ev.weights == {"A": 2.0, "B": 1.3, "E": 2.0}
+    assert ev.reasons == {"A": ["튕기기 5시간 전에 설치했습니다"], "B": ["튕기기 3일 전에 업데이트했습니다"],
+                          "E": ["튕기기 2시간 전에 모드 수정에서 바꿨습니다"]}
+    assert "최근 설치·업데이트·수정한 모드 3개" in ev.notes
     # a last normal exit says exactly what changed: no guess from install times
     assert world.build(last_good={"time": T0 - 86400, "context": {"mods": []}}).weights == {}
 

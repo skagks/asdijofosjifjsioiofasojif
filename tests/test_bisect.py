@@ -1648,3 +1648,18 @@ def test_the_command_line_notes_and_a_pending_setting(manager, mods, game_dir, c
     assert main(["--data-dir", data, "list"]) == 0
     assert accessed.RESTORED in capsys.readouterr().out and accessed.pending(manager.data_dir) is None
     assert config.read_bytes() == b"FontSize=16\r\nLooseFileLoader_Enabled=true\r\nLooseFileLoader_LogAccessedFiles=false\r\n"
+
+
+def test_facts_use_the_mod_stamp_with_its_edits(manager, tmp_path):
+    """A mod never edited keeps the stamp older crash records and bisect.json have; a 모드 수정 changes it, so
+    the last normal exit counts the mod as changed."""
+    with manager.prepare_install(make_zip(tmp_path / "Edit.zip", {"natives/STM/a.tex": "a"})) as s:
+        mod = manager.install_variant(s, s.variants[0])
+    (found,) = bisect.facts(manager)
+    assert found.stamp == f"{mod.installed_at}|{mod.updated_at}" == mod.files_stamp == mod.stamp
+    last_good = {"context": {"mods": [{"id": mod.id, "enabled": True, "stamp": found.stamp}]}}
+    assert bisect.changes_since(last_good, [found]).updated == []
+    mod.edited_at = "2026-10-28T10:00:00"
+    (edited,) = bisect.facts(manager)
+    assert edited.stamp == f"{mod.installed_at}|{mod.updated_at}|2026-10-28T10:00:00" and mod.files_stamp == found.stamp
+    assert bisect.changes_since(last_good, [edited]).updated == [mod.id]

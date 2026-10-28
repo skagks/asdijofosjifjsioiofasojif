@@ -1120,3 +1120,25 @@ def test_the_manager_writes_only_reframeworks_settings_files(manager, tmp_path, 
     target = tmp_path / "Roaming" / "REFramework" / "MonsterHunterWilds" / crashlog.CONFIG_FILE
     assert manager.set_refw_option(LOOSE, True, path=target)  # (REFramework used %APPDATA% the last time)
     assert target.read_bytes() == f"{LOOSE}=true\r\n".encode() and not (game_dir / crashlog.CONFIG_FILE).exists()
+
+
+def test_edit_issues_are_a_mod_problem(manager, tmp_path):
+    """What of a 모드 수정 does not reach the game is one of the mod's ⚠ problems (enabled mods only)."""
+    states = [ModState("a", "A", True, edit_issues=["확인할 값 2개", "다시 적용 대기 1개"]),
+              ModState("b", "B", False, edit_issues=["확인할 값 1개"])]
+    assert precheck.mod_problems(states) == {
+        "a": ["모드 수정 내용 일부가 적용되지 않았습니다: 확인할 값 2개 (모드 수정 → 수정 내용)"]}
+
+    mod = install(manager, tmp_path, "Edited", {"natives/STM/a.tex": "a"})
+    (state,) = precheck.mod_states(manager)
+    assert state.edit_issues == [] and state.stamp == f"{mod.installed_at}|{mod.updated_at}"
+    write(manager.mod_dir(mod.id) / "edits.json", "{not json")  # an unreadable record is never used
+    manager._invalidate(mod.id)
+    mod.edited_at = "2026-10-28T10:00:00"
+    (state,) = precheck.mod_states(manager)
+    assert state.stamp == mod.stamp == f"{mod.installed_at}|{mod.updated_at}|2026-10-28T10:00:00"
+    assert state.edit_issues[0].startswith("모드 수정 기록을 읽지 못해 쓰지 않고 있습니다: 기록이 손상되었습니다")
+    assert manager.problems()[mod.id] == [f"모드 수정 내용 일부가 적용되지 않았습니다: {state.edit_issues[0]} "
+                                          "(모드 수정 → 수정 내용)"]
+    manager.set_enabled(mod.id, False)
+    assert precheck.mod_states(manager)[0].edit_issues == [] and manager.problems() == {}

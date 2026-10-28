@@ -112,13 +112,14 @@ class ModInfo:
     id: str
     name: str
     enabled: bool
-    stamp: str  # f"{installed_at}|{updated_at}", as in the crash records' context
+    stamp: str  # Mod.stamp (installed_at|updated_at[|edited_at]), as in the crash records' context
     digest: str  # options_digest of the chosen options
     kinds: frozenset  # analyzer.classify of the files it applies
     files: tuple[str, ...]  # game paths it applies (manager.mod_files)
     refw: bool  # the mod that provides REFramework
-    changed_at: float | None  # its last install or update (epoch)
+    changed_at: float | None  # its last install, update or 모드 수정 (epoch)
     updated: bool = False  # that was an update (not the first install)
+    edited: bool = False  # that was a 모드 수정 (Mod.edited_at, the latest of the three)
 
 
 @dataclass
@@ -160,12 +161,14 @@ def gather(manager, record_id: str = "", owners: dict | None = None) -> Inputs:
     mods = []
     for m in manager.mods:
         installed, updated = _epoch_iso(m.installed_at), _epoch_iso(m.updated_at)
-        changed = max((t for t in (installed, updated) if t is not None), default=None)
-        mods.append(ModInfo(m.id, m.name, m.enabled, f"{m.installed_at}|{m.updated_at}",
+        edited = _epoch_iso(getattr(m, "edited_at", ""))
+        changed = max((t for t in (installed, updated, edited) if t is not None), default=None)
+        mods.append(ModInfo(m.id, m.name, m.enabled, m.stamp,
                             options_digest(o["name"] for o in m.options if o["id"] in m.selected),
                             frozenset(manager.mod_kinds(m.id)), tuple(manager.mod_files(m.id)),
                             refw is not None and refw.id == m.id, changed,
-                            updated is not None and (installed is None or updated > installed)))
+                            updated is not None and (installed is None or updated > installed),
+                            edited is not None and edited == changed))
     facts = None
     try:
         facts = precheck.gather(manager, conflicts=conflicts, verify=False)
@@ -612,11 +615,12 @@ class _Builder:
             ago = (f"{max(1, round(hours * 60))}분" if hours < 1 else f"{round(hours)}시간" if hours < 48
                    else f"{round(hours / 24)}일")
             before = f"튕기기 {ago} 전에" if self.crash_at is not None else f"{ago} 전에"
-            text = before + (" 업데이트했습니다" if info.updated else " 설치했습니다")
+            text = before + (" 모드 수정에서 바꿨습니다" if info.edited else " 업데이트했습니다" if info.updated
+                             else " 설치했습니다")
             self.weight(x, "W18", 2.0 if hours <= RECENT_HOURS else 1.3, text)
             count += 1
         if count:
-            self.ev.notes.append(f"최근 설치·업데이트한 모드 {count}개")
+            self.ev.notes.append(f"최근 설치·업데이트·수정한 모드 {count}개")
 
     def refw_age(self) -> None:
         """REFramework older than the game (실행 전 점검's refw_old)."""

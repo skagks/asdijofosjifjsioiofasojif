@@ -456,7 +456,7 @@ class ModFacts:
     provides: frozenset = frozenset()  # Lua modules it provides (requirements.provided_modules)
     needs_refw: bool = False  # loose files, scripts or PAKs: only work with REFramework
     refw: bool = False  # it is REFramework (manager.refw_mod())
-    stamp: str = ""  # installed_at|updated_at: changes with every install of another version
+    stamp: str = ""  # Mod.stamp (installed_at|updated_at[|edited_at]): changes with another version or a 모드 수정
     options: Sequence[str] = ()  # names of the chosen options
     kinds: frozenset = frozenset()  # manager.mod_kinds: "loose", "pak", "script", "reframework", "dll", "other"
     hidden: bool = False  # every file loses to another mod: nothing of it reaches the game (manager.hidden_mods)
@@ -1021,7 +1021,7 @@ def facts(manager, owners: dict | None = None) -> list[ModFacts]:
             requirements=list(m.requirements), lua_requires=list(m.lua_requires),
             provides=frozenset(requirements.provided_modules(files)),
             needs_refw=bool(kinds & {"loose", "script", "pak"}),
-            refw=refw is not None and refw.id == m.id, stamp=f"{m.installed_at}|{m.updated_at}",
+            refw=refw is not None and refw.id == m.id, stamp=m.stamp,
             options=[o["name"] for o in m.options if o["id"] in m.selected], kinds=frozenset(kinds),
             hidden=m.id in hidden, shaders_needed=needs.get(m.id, frozenset()), shaders_provided=provided))
     return out

@@ -1,4 +1,4 @@
-"""모드 수정: the window that makes a new mod of a mod picked in it - for now 다른 장비로 옮기기, a new mod of an
+"""모드 수정 → 다른 장비로 옮기기: a page of the 모드 수정 window (modtool.ModToolDialog) that makes a new mod of an
 appearance mod for other equipment (equip/retarget.py does the work through the manager).
 
 Each armor part can go to equipment of its own (부위마다 다른 장비로: the helm to one design, the body to
@@ -8,18 +8,18 @@ equipment). A weapon is one row: its main and sub models move together.
 
 What the mod can be moved from, the equipment it can go to (the game's names, read once and kept)
 and what the new mod would hold are all worked out off the GUI thread from the mod's files as they
-were when it was picked (read here: the mod's state is the GUI thread's); their results come back
-through the app's events (those for a mod picked before dropped). The dialog only chooses: the app makes
-the mod (App.open_retarget)."""
+were when it was picked (read by the window: the mod's state is the GUI thread's); their results come back
+through the app's events (those for a mod picked before dropped). The new mod gets the mod's files as the game
+gets them: with what 모드 수정 changed in it. The window only chooses: the app makes the mod
+(App.open_mod_tool)."""
 
 from __future__ import annotations
 
 import logging
 import re
-import threading
 import tkinter as tk
-import traceback
 from collections import Counter
+from itertools import combinations
 from tkinter import ttk
 from typing import NamedTuple
 
@@ -27,15 +27,17 @@ from .equip import overview as ov
 from .equip.model import ARMOR_PARTS, PART_LABELS, Target, parse_armor_key, parse_weapon_key
 from .equip.paths import classify
 from .equip.retarget import Renamer, RetargetError, Slot, parts_on, sources_of
-from .gui import EXPECTED_ERRORS, MOD_TOOL_TITLE, RETARGET_ACTION, RETARGET_TITLE, Dialog, autohide
+from .gui import MOD_TOOL_TITLE, RETARGET_ACTION, RETARGET_TITLE, autohide
+from . import modtool
+from .modtool import PAGE_WIDTH, ModToolDialog, Page, steady
 
 log = logging.getLogger(__name__)
 
 WINDOW_TITLE = MOD_TOOL_TITLE  # the window (the toolbar's button, the context menu's entry)
 TITLE = RETARGET_TITLE  # what it does for now (its first line)
 ACTION = RETARGET_ACTION  # the 장비 외형 window's link (the window on that mod and equipment)
-MOD_BOX_STYLE = "ModPick.TCombobox"  # the 모드 box (its list made wider: _widen_list)
-MOD_LIST_ROWS = 15  # names its list shows at once
+MOD_BOX_STYLE = modtool.MOD_BOX_STYLE  # the 모드 box (the window's)
+MOD_LIST_ROWS = modtool.MOD_LIST_ROWS
 PLAN_DELAY = 150  # ms: a plan is worked out once the clicks stop
 MOVES_SHOWN = 3  # moved files named as examples
 OPTIONS_SHOWN = 3  # chosen options named
@@ -249,112 +251,99 @@ def options_line(mod) -> str:
     return f"지금 켠 옵션({shown})의 파일만 옮깁니다. 새 모드에는 옵션이 없습니다."
 
 
-class RetargetDialog(Dialog):
-    """모드 수정: for now 다른 장비로 옮기기 of the mod picked in it (모드: the mods it can work on, App.editable;
-    the one it was opened with first): 원래 장비, the table 부위별로 옮길 장비 (a row per armor part the mod
-    changes there, one for a weapon) given equipment from a searchable list, and what the new mod would hold.
-    Another mod picked switches the window to it in place (_set_mod). Result: a Choice for the mod picked last
-    (``mod_id``), or None."""
+# what the page says above its columns: how armor and weapons move
+ARMOR_NOTE = "방어구는 남성용·여성용 파일을 함께 옮깁니다. 남성용은 남성용 장비로, 여성용은 여성용 장비로 갑니다."
+UNKNOWN_PARTS_NOTE = " 부위를 알 수 없어 모드가 바꾸는 부위를 모두 옮깁니다."
+WEAPON_NOTE = "무기는 본체와 보조 모델을 함께 옮깁니다. 같은 종류의 무기로만 옮길 수 있습니다."
+# 원래 모드 끄기: what each choice does, and the line for a mod that is off (nothing to switch off)
+OFF_NOTE = ("끄면 원래 장비는 게임 모습으로 돌아가고, 원래 모드가 바꾸던 다른 장비·부위·스크립트도 함께 꺼집니다.\n"
+            "끄지 않으면 원래 장비와 옮긴 장비가 모두 모드 모습입니다.")
+OFF_MOD_NOTE = "원래 모드는 꺼져 있습니다. 새 모드는 켠 상태로 만듭니다."
+# a mod changed with 모드 수정: the new mod gets its files as the game gets them
+EDITED_NOTE = "이 모드에 한 수정(뺀 파일 · 바꾼 값)도 새 모드에 그대로 들어갑니다."
+WAITING_NOTE = "다시 적용을 기다리는 수정은 새 모드에 들어가지 않습니다."
 
-    def __init__(self, parent, app, mod_id: str, source: Target | None = None):
-        super().__init__(parent, app.theme, WINDOW_TITLE)
+
+class RetargetPage(Page):
+    """다른 장비로 옮기기 of the mod picked in the window: 원래 장비 (in the window's top row), the table 부위별로 옮길
+    장비 (a row per armor part the mod changes there, one for a weapon) given equipment from a searchable list,
+    and what the new mod would hold. Another mod picked switches the page to it in place (set_mod). What it can
+    be moved from is read when the page is shown for the mod. Result: a Choice."""
+
+    key = "retarget"
+    title = TITLE
+    intro = (f"{TITLE}: 모드가 바꾼 장비 모습을 다른 장비에 입힌 새 모드를 만듭니다. 부위마다 다른 장비를 고를 수 "
+             "있고, 원래 모드는 지우지 않습니다.")
+    ok_text = "새 모드 만들기"
+    top_text = "원래 장비"
+    ANY_GENERATION = frozenset({"choices"})  # (the equipment's lists: kept whichever mod asked)
+
+    def __init__(self, shell, frame):
+        super().__init__(shell, frame)
         t, px, f, p = self.theme, self.theme.px, self.theme.fonts, self.theme.p
-        self.app, self.manager = app, app.manager
-        self.closed = False
-        # the mods it can work on, in the list's order (and the one it was opened with)
-        self.mod_ids = [mod.id for mod in app.manager.mods if mod.id == mod_id or app.editable(mod)]
-        # which mod the work on other threads was started for: what comes back for one shown before is dropped
-        self._generation = 0
         self._plan_after = None
-        self._list_keys = False  # the 모드 box's open list finds a typed letter (bound once: _widen_list)
+        self._loaded: int | None = None  # the window's _generation the sources were asked for
+        self._reading = "장비 정보를 읽는 중... 처음 한 번은 조금 걸립니다."
+        self.notes: list[str] = []  # about the mod's own edits, above what the new mod would hold
         # of the equipment, whichever mod asked (kept when another mod is picked)
         self.choices: dict[Target, object] = {}  # source -> [(Target, name)] or the exception, once read
         self.names: dict[Target, str] = {}  # names of the equipment in the lists read so far
-        wrap = px(900)
+        self._reset(None)
 
-        ttk.Label(self.body, text=WINDOW_TITLE, style="DialogTitle.TLabel").pack(anchor="w")
-        # (one line at 100% and 150%: the window fits a 768-pixel screen)
-        self.intro = ttk.Label(self.body, text=f"{TITLE}: 모드가 바꾼 장비 모습을 다른 장비에 입힌 새 모드를 만듭니다. "
-                                               "부위마다 다른 장비를 고를 수 있고, 원래 모드는 지우지 않습니다.",
-                               style="Muted.TLabel", wraplength=wrap, justify="left")
-        self.intro.pack(anchor="w", pady=(px(4), 0))
-        # (packed for a mod with options, under the line above: _set_mod)
-        self.options_note = ttk.Label(self.body, text="", style="Muted.TLabel", wraplength=wrap, justify="left")
-
-        # 모드 | 원래 장비 in one row (the window fits a 768-pixel screen); the mod first for Tab
-        top = ttk.Frame(self.body)
-        top.pack(fill="x", pady=(px(14), 0))
-        ttk.Label(top, text="모드", style="DialogSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, px(4)))
-        self.mod_var = tk.StringVar(self)
-        # its list as wide as the longest name (_widen_list) and long enough to look through; a letter typed on
-        # it goes to the next mod whose name starts with it (_find_mod)
-        self.mod_box = ttk.Combobox(top, textvariable=self.mod_var, state="readonly", width=42,
-                                    style=MOD_BOX_STYLE, height=min(MOD_LIST_ROWS, max(1, len(self.mod_ids))),
-                                    values=[self._mod_label(i) for i in self.mod_ids], postcommand=self._widen_list)
-        self.mod_box.grid(row=1, column=0, sticky="w")
-        self.mod_box.bind("<<ComboboxSelected>>", lambda e: (self.mod_box.selection_clear(),
-                                                             self._pick_mod(self.mod_box.current())))
-        for key in ("<Return>", "<KP_Enter>"):  # (not the dialog's Return: it would make the mod shown so far)
-            self.mod_box.bind(key, lambda e: "break")
-        self.mod_box.bind("<KeyPress>", self._find_mod)
-        ttk.Label(top, text="원래 장비", style="DialogSection.TLabel").grid(row=0, column=1, sticky="w",
-                                                                         padx=(px(16), 0), pady=(0, px(4)))
-        self.source_var = tk.StringVar(self, value="읽는 중...")
-        self.source_box = ttk.Combobox(top, textvariable=self.source_var, state="disabled", width=56)
-        self.source_box.grid(row=1, column=1, sticky="w", padx=(px(16), 0))
+        self.source_var = tk.StringVar(shell, value="읽는 중...")
+        self.source_box = ttk.Combobox(shell.top, textvariable=self.source_var, state="disabled", width=56)
+        self.place_top(self.source_box)
         self.source_box.bind("<<ComboboxSelected>>", lambda e: (self.source_box.selection_clear(),
                                                                 self._set_source(self.source_box.current())))
-        # the wheel over a closed box would pick the next mod or equipment (and drop what was chosen for it)
-        for box in (self.mod_box, self.source_box):
-            for key in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<TouchpadScroll>"):
-                try:
-                    box.bind(key, lambda e: "break")
-                except tk.TclError:  # (<TouchpadScroll>: Tk 9 only)
-                    pass
-        self.kind_note = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"], wraplength=wrap,
-                                   justify="left")
-        self.kind_note.pack(anchor="w", pady=(px(6), 0))
+        shell.guard_box(self.source_box)  # (the wheel over it would pick other equipment: what was chosen goes)
 
         # three columns, read from the left: the parts, the equipment picked for them, what the new mod holds
-        columns = ttk.Frame(self.body)
-        columns.pack(fill="both", expand=True, pady=(px(14), 0))
+        columns = ttk.Frame(frame)
+        columns.pack(fill="both", expand=True, pady=(px(8), 0))
 
         table = ttk.Frame(columns)
         table.pack(side="left", fill="y")
         ttk.Label(table, text=PARTS_TITLE, style="DialogSection.TLabel").pack(anchor="w", pady=(0, px(4)))
         card = t.mark(tk.Frame(table), "card")
-        card.pack(fill="x")
+        card.pack(fill="both", expand=True)
         # rows start selected (a pick goes to every part); keyboard: Tab reaches it, the arrows move the selection
         self.parts_tree = ttk.Treeview(card, columns=("part", "target", "code"), show="headings", height=1,
                                        selectmode="extended", takefocus=True)
-        for col, text, width in (("part", "부위", 74), ("target", "옮길 장비", 124), ("code", "번호", 70)):
+        for col, text, width in (("part", "부위", 64), ("target", "옮길 장비", 110), ("code", "번호", 64)):
             self.parts_tree.heading(col, text=text, anchor="w")
             self.parts_tree.column(col, width=px(width), anchor="w", stretch=col == "target")
         self.parts_tree.tag_configure("odd", background=p["row_alt"])
         self.parts_tree.tag_configure("none", foreground=p["muted"])
-        self.parts_tree.pack(fill="x")
+        parts_bar = ttk.Scrollbar(card, orient="vertical", command=self.parts_tree.yview)
+        self.parts_tree.configure(yscrollcommand=autohide(parts_bar, side="right", fill="y"))
+        self.parts_tree.pack(side="left", fill="both", expand=True)
         self.parts_tree.bind("<<TreeviewSelect>>", lambda e: self._rows_selected())
         buttons = ttk.Frame(table)
         buttons.pack(anchor="w", pady=(px(8), 0))
-        self.all_button = ttk.Button(buttons, text=SELECT_ALL, command=self.select_all_rows)  # (packed for 2+ rows)
+        # (both always there: the window keeps its size; 모든 부위 고르기 is off for one row)
+        self.all_button = ttk.Button(buttons, text=SELECT_ALL, command=self.select_all_rows)
+        self.all_button.pack(side="left", padx=(0, px(8)))
         self.clear_button = ttk.Button(buttons, text=CLEAR, command=self.clear_rows)
         self.clear_button.pack(side="left")
 
         middle = ttk.Frame(columns)
         middle.pack(side="left", fill="both", expand=True, padx=(px(16), 0))
         ttk.Label(middle, text="옮길 장비", style="DialogSection.TLabel").pack(anchor="w", pady=(0, px(2)))
-        # which rows of the table the pick goes to
-        self.pick_hint = ttk.Label(middle, text="", wraplength=px(310), justify="left")
-        self.pick_hint.pack(anchor="w", pady=(0, px(6)))
-        self.search_var = tk.StringVar(self)
+        # which rows of the table the pick goes to (one line: the window does not grow while rows are clicked)
+        hints = [f"'{PARTS_TITLE}'에서 부위를 고르세요", "이 무기의 모습을 입힐 무기를 고르세요",
+                 "모든 부위에 입힐 장비를 고르세요", f"부위 {len(ARMOR_PARTS)}개에 입힐 장비를 고르세요"]
+        hints += [f"{' · '.join(row_label(r) for r in rows)}에 입힐 장비를 고르세요"
+                  for n in range(1, MANY_PARTS + 1) for rows in combinations(ARMOR_PARTS, n)]
+        self.pick_hint = steady(middle, hints, px(290))
+        self.pick_hint.master.pack(fill="x", pady=(0, px(6)))
+        self.search_var = tk.StringVar(shell)
         self.search = ttk.Entry(middle, textvariable=self.search_var)
         self.search.pack(fill="x", pady=(0, px(6)), ipady=px(1))
         self._search_hint(middle)
         card = t.mark(tk.Frame(middle), "card")
         card.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(card, columns=("name", "code"), show="headings", height=self._list_rows(False),
-                                 selectmode="browse")
-        for col, text, width, anchor in (("name", "장비", 236, "w"), ("code", "번호", 80, "w")):
+        self.tree = ttk.Treeview(card, columns=("name", "code"), show="headings", height=1, selectmode="browse")
+        for col, text, width, anchor in (("name", "장비", 210, "w"), ("code", "번호", 70, "w")):
             self.tree.heading(col, text=text, anchor=anchor)
             self.tree.column(col, width=px(width), anchor=anchor, stretch=col == "name")
         self.tree.tag_configure("odd", background=p["row_alt"])
@@ -366,15 +355,17 @@ class RetargetDialog(Dialog):
         # arrows move away from it, and its Return only opens tree items)
         for key in ("<Down>", "<Up>", "<Return>", "<KP_Enter>"):
             self.tree.bind(key, self._key_in_list)
-        self.list_note = ttk.Label(middle, text="", style="Muted.TLabel", font=f["small"])
-        self.list_note.pack(anchor="w", pady=(px(4), 0))
+        self.list_note = steady(middle, ["장비 목록을 읽는 중...", "장비 1000개 (전체 1000개)"], px(290),
+                                style="Muted.TLabel", font=f["small"])
+        self.list_note.master.pack(fill="x", pady=(px(4), 0))
 
         right = ttk.Frame(columns)
         right.pack(side="left", fill="both", expand=True, padx=(px(16), 0))
         ttk.Label(right, text="새 모드에 들어갈 내용", style="DialogSection.TLabel").pack(anchor="w", pady=(0, px(4)))
         box = t.mark(tk.Frame(right), "card")
         box.pack(fill="both", expand=True)
-        self.text = t.mark(tk.Text(box, wrap="word", width=36, height=8, font=f["base"], padx=px(14), pady=px(10),
+        # (one line asked for: it fills the column the list makes as high as the screen allows)
+        self.text = t.mark(tk.Text(box, wrap="word", width=30, height=1, font=f["base"], padx=px(14), pady=px(10),
                                    cursor="arrow", spacing1=px(2)), "text")
         text_bar = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=autohide(text_bar, side="right", fill="y"))
@@ -391,105 +382,49 @@ class RetargetDialog(Dialog):
         tx.tag_configure("hint", spacing1=px(4))
         tx.configure(state="disabled")
 
+        # the lines above the columns, as wide as the columns ask for: a mod with options (only the chosen ones'
+        # files move: as tall as that line is for any mod of the window), how armor and weapons move
+        frame.update_idletasks()
+        wrap = min(columns.winfo_reqwidth(), px(PAGE_WIDTH))
+        self.options_note = steady(frame, [options_line(shell.manager.get(i)) for i in shell.mod_ids], wrap,
+                                   style="Muted.TLabel")
+        self.options_note.master.pack(fill="x", before=columns)
+        self.kind_note = steady(frame, [ARMOR_NOTE, ARMOR_NOTE + UNKNOWN_PARTS_NOTE, WEAPON_NOTE], wrap,
+                                style="Muted.TLabel", font=f["small"])
+        self.kind_note.master.pack(fill="x", before=columns)
+
         # 원래 모드 끄기: on only when the new mod holds everything the original changes but the original
-        # equipment (left_behind), worked out again with each plan until the user ticks it themselves (the row,
-        # or the note alone for a mod that is off, packed above the buttons by _set_mod)
-        self.off_var = tk.BooleanVar(self, value=False)
-        self.off_row = ttk.Frame(self.body)
+        # equipment (left_behind), worked out again with each plan until the user ticks it themselves; off (and
+        # not usable) for a mod that is off. The row and its note are always there (the window keeps its size).
+        self.off_var = tk.BooleanVar(shell, value=False)
+        self.off_row = ttk.Frame(frame)
         self.off_check = t.checkbutton(self.off_row, "원래 모드 끄기", self.off_var, command=self._off_ticked)
         self.off_check.pack(side="left")
         self.off_why = ttk.Label(self.off_row, text="", style="Muted.TLabel", font=f["small"])  # why it is unticked
         self.off_why.pack(side="left", padx=(px(12), 0))
-        self.off_note = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"], wraplength=wrap,
-                                  justify="left")
-        self.button_row = row = ttk.Frame(self.body)
-        row.pack(fill="x", pady=(px(16), 0))
-        cancel = ttk.Button(row, text="취소", command=self.cancel)
-        cancel.pack(side="right")
-        self.create_button = ttk.Button(row, text="새 모드 만들기", style="Accent.TButton", command=self.ok)
-        self.create_button.pack(side="right", padx=(0, px(8)))
-        self.bind("<Return>", lambda e: self.ok())
-        self.bind("<KP_Enter>", lambda e: self.ok())
-        for button in (self.all_button, self.clear_button, cancel):  # Return on one of them presses it (as on
-            for key in ("<Return>", "<KP_Enter>"):  # Windows), not 새 모드 만들기
-                button.bind(key, lambda e, b=button: (b.invoke(), "break")[1])
+        self.off_row.configure(height=max(self.off_check.winfo_reqheight(), self.off_why.winfo_reqheight()),
+                               width=1)
+        self.off_row.pack_propagate(False)  # (a long reason is cut off: it asks for no width)
+        self.off_row.pack(fill="x", pady=(px(8), 0))
+        self.off_note = steady(frame, [OFF_NOTE, OFF_MOD_NOTE], wrap, style="Muted.TLabel", font=f["small"])
+        self.off_note.master.pack(fill="x")
 
-        self._set_mod(mod_id, source, "장비 정보를 읽는 중... 처음 한 번은 조금 걸립니다.")
+    # ---- the window's mod
+    @property
+    def mod_id(self) -> str:
+        return self.shell.mod_id
 
-    def _mod_label(self, mod_id: str) -> str:
-        """A mod in the 모드 box: its name, (꺼짐) when it is off."""
-        mod = self.manager.get(mod_id)
-        return mod.name if mod.enabled else f"{mod.name} (꺼짐)"
+    @property
+    def mod(self):
+        return self.shell.mod
 
-    def _list_rows(self, options: bool) -> int:
-        """The list's height in rows: the window fits a 768-pixel screen (with the taskbar), also with the
-        options line, and a lower one (1080 pixels at 150%)."""
-        px, high = self.theme.px, self.winfo_screenheight()
-        return 9 if high >= px(900) else (5 if options else 6) if high >= px(760) else 3 if options else 4
+    @property
+    def job(self):
+        """The mod's files as they were when it was picked (the selected options, repaired materials, edits): the
+        scan and every plan work from these."""
+        return self.shell.equip_job
 
-    def _widen_list(self):
-        """The 모드 box's list as wide as its longest name (within the screen), so that names that start the
-        same and (꺼짐) can be read."""
-        px, box = self.theme.px, self.mod_box
-        font = self.theme.fonts["base"]
-        widest = max((font.measure(label) for label in box.cget("values")), default=0) + px(40)  # (scrollbar)
-        room = self.winfo_screenwidth() - box.winfo_rootx() - px(8)
-        extra = max(0, min(widest, room) - box.winfo_width())
-        ttk.Style(self).configure(MOD_BOX_STYLE, postoffset=(0, 0, extra, 0))
-        if not self._list_keys:  # a letter typed in the open list: the next name starting with it (not picked yet)
-            self._list_keys = True
-            popdown = self.tk.call("ttk::combobox::PopdownWindow", box)
-            listbox = f"{popdown}.f.l"
-
-            def find(char):
-                found = self._next_named(char, int(self.tk.call(listbox, "index", "active")))
-                if found is not None:
-                    self.tk.call(listbox, "selection", "clear", 0, "end")
-                    self.tk.call(listbox, "selection", "set", found)
-                    self.tk.call(listbox, "activate", found)
-                    self.tk.call(listbox, "see", found)
-
-            self.tk.call("bind", listbox, "<KeyPress>", f"+{self.register(find)} %A")
-
-    def _find_mod(self, event):
-        """A letter typed on the 모드 box: the next mod whose name starts with it (after the one shown)."""
-        found = self._next_named(event.char, self.mod_box.current())
-        if found is not None:
-            self.mod_box.current(found)
-            self._pick_mod(found)
-        return "break" if event.char and event.char.isprintable() else None
-
-    def _next_named(self, char: str, after: int) -> int | None:
-        """The index of the next mod (after ``after``, round) whose name starts with ``char`` (any case)."""
-        if not char or not char.isprintable() or char.isspace():
-            return None
-        char = char.casefold()
-        count = len(self.mod_ids)
-        for step in range(1, count + 1):
-            i = (after + step) % count
-            if self.manager.get(self.mod_ids[i]).name.casefold().startswith(char):
-                return i
-        return None
-
-    def _pick_mod(self, index: int):
-        """Another mod picked in the 모드 box."""
-        if 0 <= index < len(self.mod_ids) and self.mod_ids[index] != self.mod_id:
-            self._set_mod(self.mod_ids[index])
-
-    def _set_mod(self, mod_id: str, source: Target | None = None, reading: str = "장비 정보를 읽는 중..."):
-        """The window for mod ``mod_id`` (``source``: the equipment picked first when the mod changes it), its
-        sources read again: what was chosen for the mod before goes, and what is still being worked out for it
-        is dropped when it comes back (_generation). The equipment's lists and names stay."""
-        px = self.theme.px
-        self._generation += 1
-        if self._plan_after is not None:
-            self.after_cancel(self._plan_after)
-            self._plan_after = None
-        self.mod_id = mod_id
-        self.mod = self.manager.get(mod_id)
-        # the mod's files as they are now (the selected options, repaired materials): read on this thread, the
-        # mod's state is the GUI thread's; the scan and every plan work from these
-        self.job = self.manager.equipment_job(mod_id)
+    def _reset(self, source: Target | None):
         self.wanted = source  # picked once the sources are known (when the mod changes it)
         self.sources: list[Target] = []
         self.parts_of: dict[Target, list[str]] = {}
@@ -503,49 +438,70 @@ class RetargetDialog(Dialog):
         self.plans: dict[tuple, object] = {}  # (source, move, parts) -> retarget.Plan or the exception
         self._planning: tuple | None = None  # the plan being worked out
         self._off_touched = False  # the user ticked '원래 모드 끄기' themselves: the plans no longer change it
-        self.off_var.set(False)
-        self.mod_box.current(self.mod_ids.index(mod_id))
 
-        options = options_line(self.mod)
-        self.options_note.configure(text=options)
-        if options:
-            self.options_note.pack(anchor="w", pady=(px(2), 0), after=self.intro)
-        else:
-            self.options_note.pack_forget()
-        self.tree.configure(height=self._list_rows(bool(options)))
+    def set_mod(self, snap):
+        """The page for the window's mod (the equipment the window was opened with picked first when the mod
+        changes it): what was chosen for the mod before goes, and its sources are read again once the page is
+        shown. The equipment's lists and names stay."""
+        self._cancel_plan()
+        self._reset(self.shell.initial_source)
+        self.shell.initial_source = None
+        self.off_var.set(False)
+        self.notes = self._edit_notes(snap)
+        self.options_note.configure(text=options_line(self.mod))
         self.source_box.configure(values=(), state="disabled")
         self.source_var.set("읽는 중...")
         self.kind_note.configure(text="")
         if self.search_var.get():
             self.search_var.set("")
         self.parts_tree.delete(*self.parts_tree.get_children())
-        self.parts_tree.configure(height=1)
-        self.all_button.pack_forget()
         for button in (self.all_button, self.clear_button):
             button.state(["disabled"])
         self.pick_hint.configure(text="")
         self.tree.delete(*self.tree.get_children())
         self.list_note.configure(text="")
         self._place_off()
-        self.create_button.state(["disabled"])
-        self._show([(reading, ("muted",))])
+        self._show([(self._reading, ("muted",))])
+        self._reading = "장비 정보를 읽는 중..."
+        self._loaded = None
+        if self.shell.page is self:
+            self._load()
+        self._update_button()
+
+    @staticmethod
+    def _edit_notes(snap) -> list[str]:
+        """What becomes of the mod's own edits (모드 수정) in the new mod: it is made from the files as the game
+        gets them, so they are in it, except those still waiting to be applied again."""
+        record = getattr(snap, "record", None)
+        if record is None:
+            return []
+        notes = []
+        if any(item.exclude or item.members for item in record.items):
+            notes.append(EDITED_NOTE)
+        if snap.pending or any(m.pending for item in record.items for m in item.members):
+            notes.append(WAITING_NOTE)
+        return notes
+
+    def show(self):
+        super().show()
+        if self._loaded != self.shell._generation:
+            self._load()
+
+    def _load(self):
+        self._loaded = self.shell._generation
         self._load_sources()
 
     def _place_off(self):
-        """원래 모드 끄기 and its note above the buttons; for a mod that is off only the note (switching it off would
+        """원래 모드 끄기 and its note; for a mod that is off the box is off and not usable (switching it off would
         change nothing)."""
-        px = self.theme.px
-        self.off_row.pack_forget()
-        self.off_note.pack_forget()
         self.off_why.configure(text="")
         if self.mod.enabled:
-            self.off_row.pack(fill="x", pady=(px(12), 0), before=self.button_row)
-            self.off_note.pack(anchor="w", before=self.button_row)
-            self.off_note.configure(text="끄면 원래 장비는 게임 모습으로 돌아가고, 원래 모드가 바꾸던 다른 장비·부위·스크립트도 "
-                                         "함께 꺼집니다.\n끄지 않으면 원래 장비와 옮긴 장비가 모두 모드 모습입니다.")
+            self.off_check.state(["!disabled"])
+            self.off_note.configure(text=OFF_NOTE)
         else:
-            self.off_note.configure(text="원래 모드는 꺼져 있습니다. 새 모드는 켠 상태로 만듭니다.")
-            self.off_note.pack(anchor="w", pady=(px(12), 0), before=self.button_row)
+            self.off_var.set(False)
+            self.off_check.state(["disabled"])
+            self.off_note.configure(text=OFF_MOD_NOTE)
 
     def _search_hint(self, parent):
         """The placeholder of the search box (like the 장비 외형 window's)."""
@@ -557,7 +513,7 @@ class RetargetDialog(Dialog):
         def update(*_args):
             if self.closed:
                 return
-            if self.search_var.get() or self.focus_get() is search:
+            if self.search_var.get() or self.shell.focus_get() is search:
                 hint.place_forget()
             else:
                 hint.place(in_=search, x=px(10), rely=0.5, anchor="w")
@@ -575,32 +531,34 @@ class RetargetDialog(Dialog):
             search.bind(key, self._into_list)
         self.search_var.trace_add("write", update)
         self.search_var.trace_add("write", lambda *a: self._fill_list())
-        self.after_idle(update)
+        self.frame.after_idle(update)
+
+    def fit(self, rows: int):
+        """The list ``rows`` high; the table of parts as high (up to a row per armor part; it scrolls when the
+        mod changes more parts than that)."""
+        self.tree.configure(height=rows)
+        self.parts_tree.configure(height=max(1, min(rows, len(ARMOR_PARTS))))
+
+    def first_focus(self):
+        return self.source_box if self.source_box.instate(["!disabled"]) else self.parts_tree
+
+    def close(self):
+        self._cancel_plan()
+
+    def _cancel_plan(self):
+        if self._plan_after is not None:
+            self.frame.after_cancel(self._plan_after)
+            self._plan_after = None
 
     # ---- background work
     def _run(self, kind: str, func, tag=None):
-        """``func()`` on another thread; its result (or exception) comes back to _done on this one, with the
-        mod's _generation it was started for."""
-        events, generation = self.app.events, self._generation
+        """``func()`` on another thread; its result (or exception) comes back to done() on this one, unless
+        another mod was picked meanwhile."""
+        self.run(kind, func, tag)
 
-        def worker():
-            try:
-                result = func()
-            except Exception as exc:  # shown in the dialog
-                if not isinstance(exc, (*EXPECTED_ERRORS, RetargetError)):
-                    log.error("다른 장비로 옮기기를 준비하다가 오류가 났습니다:\n%s", traceback.format_exc())
-                result = exc
-            events.put(("call", self._done, kind, tag, result, generation))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _done(self, kind: str, tag, result, generation: int):
-        if self.closed:
-            return
+    def done(self, kind: str, tag, result):
         if kind == "choices":  # (the equipment's: kept whichever mod asked)
             self._choices_ready(tag, result)
-        elif generation != self._generation:
-            return  # for a mod picked before (its plan may have the key of one of this mod's)
         elif kind == "sources":
             self._sources_ready(result)
         elif kind == "plan":
@@ -611,7 +569,7 @@ class RetargetDialog(Dialog):
         m, mod_id, job = self.manager, self.mod_id, self.job
 
         def work():
-            # the equipment the mod's files change (equipment_scans: from the files read when the dialog opened,
+            # the equipment the mod's files change (equipment_scans: from the files read when the mod was picked,
             # kept until they change) and among it what can be moved, with the parts to tick
             scan = m.equipment_scans([job]).get(mod_id)
             sources = sources_of(scan.targets) if scan is not None else []
@@ -664,23 +622,19 @@ class RetargetDialog(Dialog):
         self.assigned = {}
         if self.source.kind == "armor":
             self.part_rows = list(self.parts_of.get(self.source) or []) or [ALL_ROW]
-            note = "방어구는 남성용·여성용 파일을 함께 옮깁니다. 남성용은 남성용 장비로, 여성용은 여성용 장비로 갑니다."
+            note = ARMOR_NOTE
             if self.part_rows == [ALL_ROW]:
-                note += " 부위를 알 수 없어 모드가 바꾸는 부위를 모두 옮깁니다."
+                note += UNKNOWN_PARTS_NOTE
         else:
             self.part_rows = [WEAPON_ROW]
-            note = "무기는 본체와 보조 모델을 함께 옮깁니다. 같은 종류의 무기로만 옮길 수 있습니다."
+            note = WEAPON_NOTE
         self.kind_note.configure(text=note)
         for row in self.part_rows:
             tree.insert("", "end", iid=row)
-        if len(self.part_rows) > 1:
-            self.all_button.pack(side="left", padx=(0, self.theme.px(8)), before=self.clear_button)
-        else:  # (one row: nothing else to choose)
-            self.all_button.pack_forget()
         self._show_rows()
-        tree.configure(height=len(self.part_rows))
         tree.selection_set(self.part_rows)
         tree.focus(self.part_rows[0])  # (the row Tk's arrow keys start from)
+        tree.see(self.part_rows[0])
         self._parts_changed()
 
     def _show_rows(self):
@@ -873,9 +827,7 @@ class RetargetDialog(Dialog):
         """Work out what the chosen move would do, shortly (several clicks in a row cost one plan)."""
         if self.closed:
             return
-        if self._plan_after is not None:
-            self.after_cancel(self._plan_after)
-            self._plan_after = None
+        self._cancel_plan()
         key = self._key()
         self._update_button()
         if key is None:
@@ -886,7 +838,7 @@ class RetargetDialog(Dialog):
             self._render_plan(key)
             return
         self._show([("확인 중...", ("muted",))])
-        self._plan_after = self.after(PLAN_DELAY, self._start_plan)
+        self._plan_after = self.frame.after(PLAN_DELAY, self._start_plan)
 
     def _start_plan(self):
         """One plan at a time: the newest choice is planned once the running one is done."""
@@ -954,13 +906,19 @@ class RetargetDialog(Dialog):
         plan = self.plans.get(key) if key is not None else None
         return plan is not None and not isinstance(plan, Exception) and bool(plan.ok)
 
+    def ready(self) -> bool:
+        return self._ready()
+
     def _update_button(self):
-        self.create_button.state(["!disabled"] if self._ready() else ["disabled"])
+        self.shell.update_ok()
 
     def _show(self, pieces):
+        """What the new mod would hold (``pieces``: (text, tags)), under what becomes of the mod's own edits."""
         tx = self.text
         tx.configure(state="normal")
         tx.delete("1.0", "end")
+        for note in self.notes:
+            tx.insert("end", f"{note}\n", ("muted",))
         for text, tags in pieces:
             tx.insert("end", text, tags)
         if tx.get("end-2c", "end-1c") == "\n":  # (no empty line below the last one)
@@ -973,18 +931,16 @@ class RetargetDialog(Dialog):
         return self.text.get("1.0", "end-1c")
 
     # ---- result
-    def ok(self):
-        if not self._ready():
-            self.bell()
-            return
+    def result(self):
         source, move, parts = self._key()
-        self.result = Choice(source, self._target(move), parts, bool(self.off_var.get()) and self.mod.enabled,
-                             self.new_names.get(move, ""))
-        self.destroy()
+        return Choice(source, self._target(move), parts, bool(self.off_var.get()) and self.mod.enabled,
+                      self.new_names.get(move, ""))
 
-    def destroy(self):
-        self.closed = True
-        if self._plan_after is not None:
-            self.after_cancel(self._plan_after)
-            self._plan_after = None
-        super().destroy()  # (Dialog drops its Tk variables)
+
+class RetargetDialog(ModToolDialog):
+    """모드 수정 opened on 다른 장비로 옮기기 (``source``: the equipment picked first when the mod changes it): the
+    window the 장비 외형 window's link opens (App.open_retarget). The page's attributes read through the window
+    (dialog.tree, dialog.source_box, ...: ModToolDialog.__getattr__)."""
+
+    def __init__(self, parent, app, mod_id: str, source: Target | None = None):
+        super().__init__(parent, app, mod_id, page="retarget", source=source)

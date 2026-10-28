@@ -28,6 +28,7 @@ import json
 import lzma
 import re
 import struct
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +66,9 @@ class TypeRegistry:
 
     _loaded: "TypeRegistry | None" = None
     _from_file = False
+    _source: Path | None = None  # the file _loaded was read from
+    _holds = 0  # hold() calls not yet matched by unhold(): release() leaves the registry loaded meanwhile
+    _lock = threading.Lock()  # load/release/hold/unhold run on worker threads (the background check, 모드 수정)
     updates: Path | None = None  # folder that may hold a newer registry than the bundled one
 
     @classmethod
@@ -79,17 +83,61 @@ class TypeRegistry:
 
     @classmethod
     def load(cls) -> "TypeRegistry":
-        """The registry, kept until release() (it takes some 50 MB)."""
+        """The registry, kept until release() (it takes some 110 MB)."""
+        with cls._lock:
+            return cls._load_locked()
+
+    @classmethod
+    def _load_locked(cls) -> "TypeRegistry":
         if cls._loaded is None:
-            with lzma.open(cls.path(), "rt", encoding="utf-8") as f:
+            path = cls.path()
+            with lzma.open(path, "rt", encoding="utf-8") as f:
                 cls._loaded = cls(json.load(f))
-            cls._from_file = True
+            cls._from_file, cls._source = True, path
         return cls._loaded
 
     @classmethod
+    def date_in_use(cls) -> str:
+        """The date of the registry load() gives now: the one loaded from file (held, it may be older than
+        the newest file), else the newest file's (registry_date)."""
+        with cls._lock:
+            source = cls._source if cls._loaded is not None and cls._from_file else None
+        return registry_date(source or cls.path())
+
+    @classmethod
     def release(cls) -> None:
-        if cls._from_file:
-            cls._loaded, cls._from_file = None, False
+        """Drop the registry loaded from file; nothing while someone holds it (hold())."""
+        with cls._lock:
+            if cls._holds == 0 and cls._from_file:
+                cls._loaded, cls._from_file = None, False
+
+    @classmethod
+    def reload(cls) -> None:
+        """Drop the registry loaded from file even while it is held: the next load() or hold() reads the
+        newest file (a download). Holders keep the one they have; their unhold() is counted as before."""
+        with cls._lock:
+            if cls._from_file:
+                cls._loaded, cls._from_file = None, False
+
+    @classmethod
+    def hold(cls) -> "TypeRegistry":
+        """The registry, kept loaded until the matching unhold() even when others release() it
+        (모드 수정 keeps it while its window is open, beside the background material check)."""
+        with cls._lock:
+            registry = cls._load_locked()
+            cls._holds += 1
+            return registry
+
+    @classmethod
+    def unhold(cls) -> None:
+        """End one hold(); the last one drops a registry loaded from file. An unhold() without a
+        hold() does nothing."""
+        with cls._lock:
+            if cls._holds == 0:
+                return
+            cls._holds -= 1
+            if cls._holds == 0 and cls._from_file:
+                cls._loaded, cls._from_file = None, False
 
     @staticmethod
     def _key(type_id: int) -> str:

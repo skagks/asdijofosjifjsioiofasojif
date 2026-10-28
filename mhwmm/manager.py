@@ -21,8 +21,8 @@ import urllib.parse
 import uuid
 import zipfile
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime
+from dataclasses import asdict, dataclass, field, fields, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import crashes, fsutil, matfix, nexus, precheck, requirements, steam
@@ -44,10 +44,16 @@ from .equip import userdata as equip_userdata
 from .equip.model import ARMOR_PARTS, BODIES, PART_LABELS, WEAPON_PARTS, Target, fallback_label
 from .equip.paths import normalize as normalize_path
 from .matfix import MatfixError, rsz
+from .matfix.donors import candidate_paths
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
 from .matfix.pak import PakFile, path_hash
 from .matfix.repair import MMTR_VERSIONS, RSZ_RE, Aliases, FileResult, RszContext, check_mod, is_material_file, \
     rsz_sources, shader_file
+from .modedit import EDITS_DIR, EDITS_PREFIX, EDITS_RECORD, EditError, GameCopyChanged
+from .modedit import build as edit_build
+from .modedit import engines as edit_engines
+from .modedit import model as edit_model
+from .modedit import pakedit
 
 log = logging.getLogger(__name__)
 
@@ -283,6 +289,22 @@ def _children(folder: Path) -> list[Path]:
             return [Path(e.path) for e in it]
     except OSError:
         return []
+
+
+def _sha1_file(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(fsutil.longpath(path), "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _edit_file_kind(rel: str) -> str:
+    """What a stored file is, as 파일 고르기 names it (텍스처, 재질, 데이터...; PAK for a root .pak)."""
+    if is_root_pak(rel):
+        return "PAK"
+    parts = rel.rsplit("/", 1)[-1].lower().split(".")[1:]
+    return next((kind for ext, kind in EDIT_FILE_KINDS if ext in parts), "기타")
 
 
 def app_directory() -> Path:
@@ -545,6 +567,18 @@ class Mod:
     #  parts moved to different equipment, format 2: {part: key}), "parts" (the parts moved), "source_mod",
     #  "source_name", "moves": [[new game path, old one]], "pak_moves": [[new pak entry hash, old one]]}
     retarget: dict = field(default_factory=dict)
+    edited_at: str = ""  # the last 모드 수정 saved or applied again (edits.json): "" for a mod never edited
+
+    @property
+    def files_stamp(self) -> str:
+        """Changes with every install of other files (the stored files: what the material check reads)."""
+        return f"{self.installed_at}|{self.updated_at}"
+
+    @property
+    def stamp(self) -> str:
+        """Changes with the stored files and with every 모드 수정 (what the game gets); the same as
+        files_stamp for a mod never edited, as older crash records and bisect.json have it."""
+        return self.files_stamp + (f"|{self.edited_at}" if self.edited_at else "")
 
     @property
     def nexus_url(self) -> str:
@@ -623,6 +657,8 @@ class MaterialJob:
     provided: set = field(default_factory=set)  # names of all the mod's files (no version number), lower case
     stage: Path | None = None  # where the repaired files are written (repairs only)
     retarget: dict = field(default_factory=dict)  # Mod.retarget: compared with the original equipment's files
+    excluded: str = ""  # _exclusion_digest of the files 모드 수정 left out (kept in the record: another set is unchecked)
+    left_out: frozenset = frozenset()  # their source keys (their repairs stay: the check does not look at them)
 
 
 @dataclass
@@ -632,7 +668,8 @@ class MaterialRun:
     results: dict = field(default_factory=dict)  # mod id -> [FileResult]
     errors: dict = field(default_factory=dict)  # mod id -> why it could not be checked
     registry: str = ""  # date of the .user/.pfb type data used
-    registry_updated: str = ""  # newer type data downloaded during the run (used from the next check)
+    registry_updated: str = ""  # newer type data downloaded during the run (read by it when that was before its
+    # jobs, else from the next check)
 
 
 @dataclass
@@ -644,6 +681,93 @@ class EquipJob:
     order: int  # place in the load order (later mods win)
     stamp: str  # changes when the mod's files change
     files: dict  # game path -> stored file (selected options, repaired materials)
+
+
+# ---- 모드 수정 (mhwmm/modedit): the overlay in mods/<id>/edits.json and edits/ -------------------------------
+EDIT_WAS_CHANGED = "모드 수정 기록이 그사이 바뀌었습니다. 창을 다시 열어 주세요."
+EDIT_MOD_CHANGED = "모드가 그사이 바뀌어 저장하지 않았습니다. 창을 다시 열어 고쳐 주세요."
+EDIT_OPTIONS_CHANGED = "옵션 구성이 바뀌었습니다"
+# the carry-over of an update (install_package): what a member that could not be applied again says
+CARRY_STALE = "지금 게임과 형식이 달라 다시 적용하지 못했습니다. 재질 점검에서 복구하면 다시 적용합니다."
+CARRY_FAILED = "업데이트 뒤 다시 적용하지 못했습니다"
+CARRY_UNREADABLE = "수정 기록을 읽지 못해 다시 적용하지 않았습니다"
+# a loose data file whose copy in the game folder changed since it was placed (I11; config files: textconfig's text)
+GAME_COPY_DATA = ("게임 폴더의 이 파일은 매니저가 넣은 뒤에 바뀌었습니다. 여기서 값을 바꾸면 게임 폴더에서 바뀐 내용이 "
+                  "사라지므로 바꿀 수 없습니다.")
+_MEMBER_LABEL = re.compile(r"#([0-9A-Fa-f]{16})(?![0-9A-Fa-f])")  # the entry of a PAK in matfix's labels
+EDIT_FILE_KINDS = (  # EditFile.kind by the file's extensions (the first that matches)
+    ("tex", "텍스처"), ("mdf2", "재질"), ("mmtr", "재질"), ("mesh", "모델"), ("user", "데이터"), ("pfb", "프리팹"),
+    ("scn", "프리팹"), ("efx", "이펙트"), ("sbnk", "소리"), ("spck", "소리"), ("bnk", "소리"), ("pck", "소리"),
+    ("wem", "소리"), ("msg", "글"), ("lua", "스크립트"), ("json", "설정"), ("ini", "설정"), ("toml", "설정"),
+    ("cfg", "설정"), ("dll", "플러그인"), ("asi", "플러그인"),
+)
+
+
+@dataclass(frozen=True)
+class OutRef:
+    """An output of the record as mod_entries uses it: only while its base is still the effective base."""
+    path: Path
+    base_key: str
+    base_size: int
+    base_mtime_ns: int
+    size: int
+
+    def fits(self, eff: tuple[Path, str]) -> bool:
+        """``eff`` (effective base file, its source key) is what the output was built from and the output is
+        there with its recorded size (I4)."""
+        if eff[1] != self.base_key:
+            return False
+        st = fsutil.stat_or_none(eff[0])
+        if st is None or (st.st_size, st.st_mtime_ns) != (self.base_size, self.base_mtime_ns):
+            return False
+        out = fsutil.stat_or_none(self.path)
+        return out is not None and out.st_size == self.size
+
+
+@dataclass
+class EditOverlay:
+    """A mod's edits as mod_entries applies them, resolved to today's option ids (_edit_overlay)."""
+    excluded: set = field(default_factory=set)  # source keys left out
+    outputs: dict = field(default_factory=dict)  # source key -> OutRef
+    error: str = ""  # an unreadable record: nothing of it is used
+
+
+@dataclass
+class EditJob:
+    """One mod's save (``commit``, from an EditPlan) or re-apply: taken on the GUI thread (edit_job,
+    reapply_job), built on a worker into a temporary stage (build_edit), written by finish_edit."""
+    mod_id: str
+    name: str
+    stamp: str
+    rev: int
+    mode: str  # "commit" | "reapply"
+    record: edit_model.Record  # desired, normalized
+    inputs: list
+    prev: edit_model.Record
+    force: bool = False
+    dry_run: bool = False
+    stage: Path | None = None
+    built: list = field(default_factory=list)
+    exclusion_changed: bool = False
+    lua_changed: bool = False
+    notes: list = field(default_factory=list)
+    guarded: list = field(default_factory=list)  # [(source key, game path, "values" | "revert")]: I11, checked again
+    next: int = 0  # the output counter after build_edit
+
+
+@dataclass
+class EditResult:
+    mod_id: str
+    changed: bool
+    deploy: bool  # what the enabled mod puts into the game changed: apply again
+    materials: bool  # the files left out changed and the mod has materials: check them again
+    equipment: bool  # a natives/ file or a root PAK was involved
+    lua: bool  # a .lua file was left out or put back (lua_requires computed again)
+    summary: str
+    conflicts: int
+    pending: int
+    notes: list
+    skipped: bool = False  # a re-apply whose mod changed meanwhile: dropped (edits_pending still lists it)
 
 
 class InstallSession:
@@ -711,6 +835,9 @@ class ModManager:
         self._equip_failed: set[tuple[str, int]] = set()  # pictures that could not be read
         self._preview_failed: dict[tuple[str, str], str] = {}  # (cache folder, key) of failed 3D previews -> why
         self._preview_textures = None  # equip_look.Textures shared by the 3D previews
+        self._edit_records: dict[str, edit_model.Record] = {}  # mod id -> its 모드 수정 record (edits.json)
+        self._edits_cache: dict[str, EditOverlay] = {}  # mod id -> the record resolved for mod_entries
+        self._pending_cache: tuple[int, list[str]] | None = None  # (revision, edits_pending())
         self.data_dir.mkdir(parents=True, exist_ok=True)
         rsz.TypeRegistry.updates = self.data_dir / "cache"
         self.mods_dir.mkdir(exist_ok=True)
@@ -744,6 +871,9 @@ class ModManager:
             mods.append(m)
             log.warning("목록에 없던 모드를 복구했습니다: %s", m.name)
         self.mods = mods
+        for m in mods:  # outputs of 모드 수정 no record refers to any more (no worker holds one at startup)
+            if (self.mod_dir(m.id) / EDITS_DIR).is_dir():
+                self._gc_edits(m.id)
         raw_profiles = data.get("profiles")
         self.profiles = {k: v for k, v in raw_profiles.items()
                          if isinstance(k, str) and k.strip() and isinstance(v, dict)} if isinstance(raw_profiles, dict) else {}
@@ -762,6 +892,9 @@ class ModManager:
         self._size_cache.pop(mod_id, None)
         self._material_cache.pop(mod_id, None)
         self._record_cache.pop(mod_id, None)
+        self._edit_records.pop(mod_id, None)
+        self._edits_cache.pop(mod_id, None)
+        self._pending_cache = None
         for key in [k for k in self._option_cache if k[0] == mod_id]:
             del self._option_cache[key]
 
@@ -960,23 +1093,36 @@ class ModManager:
 
         For a mod with options these are the files of the selected options; when two
         options contain the same path the later option wins. Repaired materials take
-        the place of the mod's own files (under the game path the current game uses)."""
+        the place of the mod's own files (under the game path the current game uses).
+
+        모드 수정 (edits.json) applies in the order stored file → (files left out) → matfix
+        repair → value edit: a file left out is skipped before the later-wins rule (so an
+        earlier option's copy wins then), and a value edit's output (source key
+        ``edits/<key>``) takes the place of the effective base only while it was built from it."""
         entries = self._entries_cache.get(mod_id)
         if entries is not None:
             return entries
         mod = self.get(mod_id)
         repaired = self.repaired_materials(mod_id)
+        overlay = self._edit_overlay(mod_id)
 
-        def entry(base: Path, rel: str, key: str) -> tuple[str, tuple[Path, str]]:
+        def entry(base: Path, rel: str, key: str) -> tuple[str, tuple[Path, str]] | None:
+            if key in overlay.excluded:
+                return None
             if key in repaired:
                 new_rel, path = repaired[key]
-                return new_rel, (path, f"{MATFIX_DIR}/{key}")
-            return rel, (base / rel, key)
+                eff = (path, f"{MATFIX_DIR}/{key}")
+            else:
+                new_rel, eff = rel, (base / rel, key)
+            out = overlay.outputs.get(key)
+            if out is not None and out.fits(eff):
+                return new_rel, (out.path, f"{EDITS_PREFIX}{key}")
+            return new_rel, eff
 
         entries = {}
         if not mod.options:
             base = self.files_dir(mod_id)
-            entries = dict(entry(base, rel, rel) for rel in list_files(base))
+            entries = dict(e for e in (entry(base, rel, rel) for rel in list_files(base)) if e is not None)
         else:
             by_key: dict[str, str] = {}
             for opt in mod.options:
@@ -984,7 +1130,10 @@ class ModManager:
                     continue
                 base = self.option_dir(mod_id, opt["id"])
                 for rel in self.option_files(mod_id, opt["id"]):
-                    rel, item = entry(base, rel, f"{opt['id']}/{rel}")
+                    found = entry(base, rel, f"{opt['id']}/{rel}")
+                    if found is None:  # (an earlier option's copy stays)
+                        continue
+                    rel, item = found
                     k = path_key(rel)
                     if k in by_key:
                         del entries[by_key[k]]
@@ -1158,11 +1307,13 @@ class ModManager:
         return self.install_package(session, [variant], replace_id)
 
     def install_package(self, session: InstallSession, variants: list[Variant], replace_id: str | None = None,
-                        selected: list[int] | None = None) -> Mod:
+                        selected: list[int] | None = None, progress: ProgressFn | None = None) -> Mod:
         """Install ``variants`` as one mod. Several variants become options of that mod.
 
         ``selected`` lists the indexes of options to switch on; by default none are, and
-        an updated mod keeps the options (by name) that were on before."""
+        an updated mod keeps the options (by name) that were on before. An update carries
+        the mod's 모드 수정 over to the new files (_carry_edits: re-applied, what could not be
+        is left to check; the record's ``notice`` says what happened)."""
         variants = [v for v in variants if v.files]
         if not variants:
             raise InstallError("설치할 파일이 없습니다.")
@@ -1192,8 +1343,10 @@ class ModManager:
             version = next((v.version for v in variants if v.version), "")
             now = _now()
             old_selected: set[str] = set()
+            old_options: list[dict] = []
             if replace_id:
                 mod = self.get(replace_id)
+                old_options = copy.deepcopy(mod.options)  # (before anything of the mod changes: edits name them)
                 mod.updated_at = now
                 old_selected = {o["name"] for o in mod.options if o["id"] in mod.selected}
                 if mod.retarget:  # the files are the archive's now, at the paths it has them
@@ -1224,7 +1377,11 @@ class ModManager:
             mod.source = session.source.name
             mod.screenshot = screenshot
             mod.pictures_read = True
-            mod.lua_requires = requirements.required_modules(self._stored_files(stage))
+            carried = None
+            if replace_id and (self.mod_dir(mod_id) / EDITS_RECORD).exists():  # (still the old folder)
+                _report, carried = self._carry_edits(mod_id, self.mod_dir(mod_id), stage, old_options, options,
+                                                     progress)
+            mod.lua_requires = requirements.required_modules(self._effective_stage_files(stage, options, carried))
             mod.lua_scanned = True
             self._write_mod_meta(mod, stage)
 
@@ -1369,7 +1526,8 @@ class ModManager:
     def material_files(self, mod_id: str) -> list[tuple[str, str, Path]]:
         """(source key, game path, original file) of the mod's materials (.mdf2), RSZ files (.user, .pfb,
         .scn) and PAKs, every option included. Of several versions of one file only the newest counts:
-        the game reads one of them."""
+        the game reads one of them. The files 모드 수정 left out are not among them; value edits do not
+        count (the stored files are checked: a value edit keeps a file's layout, so its verdict too)."""
         cached = self._material_cache.get(mod_id)
         if cached is not None:
             return cached
@@ -1379,11 +1537,12 @@ class ModManager:
                       for o in mod.options]
         else:
             scopes = [("", self.files_dir(mod_id), list_files(self.files_dir(mod_id)))]
+        excluded = self._edit_overlay(mod_id).excluded
         found = []
         for prefix, base, rels in scopes:
             newest: dict[tuple[str, str], tuple[int, str]] = {}
             for rel in rels:
-                if not is_material_file(rel):
+                if not is_material_file(rel) or prefix + rel in excluded:
                     continue
                 m = VERSIONED_RE.search(rel)
                 if m is None:
@@ -1453,6 +1612,8 @@ class ModManager:
         game = self.game_version()
         if not game or record.get("game") != game or record.get("format", 1) < MATFIX_FORMAT:
             return "unchecked"
+        if record.get("excluded", "") != self._exclusion_digest(mod_id):
+            return "unchecked"  # checked with other files left out (모드 수정); records without the key: none
         results = self.material_results(mod_id)
         if any(r.stuck for r in results) and record.get("registry", "") < self.registry_date():
             return "unchecked"  # newer .user/.pfb type data may repair what could not be repaired
@@ -1482,10 +1643,6 @@ class ModManager:
                 record["offered"] = key
                 self._save_material_record(m.id, record)
 
-    @staticmethod
-    def _stamp(mod: Mod) -> str:
-        return f"{mod.installed_at}|{mod.updated_at}"
-
     def material_jobs(self, mod_ids: list[str] | None = None, unchecked_only: bool = False) -> list[MaterialJob]:
         """Mods to check (or repair): the given ones, or all; with ``unchecked_only`` only those not
         checked against the current game yet."""
@@ -1497,12 +1654,13 @@ class ModManager:
             files = self.material_files(mod_id)
             if files and not (unchecked_only and self.material_state(mod_id) != "unchecked"):
                 provided = {re.sub(r"\.\d+$", "", Path(rel).name).lower()  # as resource paths name them
-                            for rel in self._stored_files(self.mod_dir(mod_id))}
+                            for rel in self._effective_stored_files(mod_id)}
                 if mod.retarget:  # (its RSZ files are looked at as the original shipped them)
                     provided |= {re.sub(r"\.\d+$", "", Path(str(move[1])).name).lower()
                                  for move in mod.retarget.get("moves") or () if isinstance(move, list) and len(move) == 2}
-                jobs.append(MaterialJob(mod_id, mod.name, self._stamp(mod), list(files), provided,
-                                        retarget=copy.deepcopy(mod.retarget)))
+                jobs.append(MaterialJob(mod_id, mod.name, mod.files_stamp, list(files), provided,
+                                        retarget=copy.deepcopy(mod.retarget), excluded=self._exclusion_digest(mod_id),
+                                        left_out=frozenset(self._edit_overlay(mod_id).excluded)))
         return jobs
 
     def run_materials(self, jobs: list[MaterialJob], repair: bool = False,
@@ -1524,7 +1682,11 @@ class ModManager:
         try:
             if any(RSZ_RE.search(rel) or is_root_pak(rel) for job in jobs for _key, rel, _path in job.files):
                 self._update_registry(game, context, run, progress, only_if_outdated=True)
-            run.registry = rsz.registry_date(rsz.TypeRegistry.path())
+                if run.registry_updated:  # (the run reads the new type data, not the one it compared the game with)
+                    context = RszContext(game)
+            # the date of the type data this run reads (모드 수정 may hold an older one: what is stuck with it is
+            # checked again with the newer one, material_state)
+            run.registry = rsz.TypeRegistry.date_in_use()
             self._run_jobs(jobs, game, shaders, run, verb, progress, context)
             if (context.game_unreadable or context.registry_outdated) and not run.registry_updated:
                 self._update_registry(game, context, run, progress)
@@ -1563,7 +1725,7 @@ class ModManager:
             log.info("새 .user·.pfb 형식 정보를 받지 못했습니다: %s", exc)
             return
         if date:
-            rsz.TypeRegistry.release()
+            rsz.TypeRegistry.reload()  # (even while 모드 수정 holds the old one: the next load reads the new file)
             run.registry_updated = date
             log.info("새 .user·.pfb 형식 정보를 받았습니다 (%s 기준)", date)
 
@@ -1662,16 +1824,24 @@ class ModManager:
                 mod = None
             results = run.results.get(job.mod_id)
             try:
-                if mod is None or results is None or self._stamp(mod) != job.stamp:
-                    continue  # removed or reinstalled meanwhile, or could not be read
+                if mod is None or results is None or mod.files_stamp != job.stamp:
+                    continue  # removed or reinstalled meanwhile, or could not be read (a value edit changes no input)
                 record = dict(self._material_record(mod.id))
+                if record.get("excluded", "") != job.excluded:  # other files left out: a stale one may be new
+                    record.pop("offered", None)
                 record.update(game=run.game, format=MATFIX_FORMAT, registry=run.registry, checked=now,
-                              results=[r.to_dict() for r in results])
-                had = bool(self.repaired_materials(mod.id))
+                              results=[r.to_dict() for r in results], excluded=job.excluded)
+                repaired = self.repaired_materials(mod.id)
+                had = bool(repaired)
                 target = self.mod_dir(mod.id) / MATFIX_DIR
+                # the repairs of the files 모드 수정 left out stay in use (the run did not look at them): put back,
+                # those files are not the old layout again (§2.7)
+                kept = {k: dict(record["applied"][k]) for k in repaired if k in job.left_out}
                 if run.repair:
                     applied = {r.key: {"rel": r.new_rel, "file": f"{MATFIX_DIR}/{r.file.name}"}
                                for r in results if r.state == "fixable" and r.file is not None}
+                    if kept and job.stage is not None and record.get("applied_game") == run.game:  # (else they go)
+                        applied.update(self._keep_repairs(kept, repaired, job.stage))
                     fsutil.rmtree(target)
                     if applied:
                         os.replace(job.stage, target)
@@ -1682,9 +1852,15 @@ class ModManager:
                         log.info("재질 복구: %s (%d개 파일)", mod.name, len(applied))
                 elif had and not any(r.state == "fixable" for r in results):
                     # the mod's own files fit this game version: the repaired copies are not needed now
-                    fsutil.rmtree(target)
-                    record.update(applied={}, applied_game="")
-                    changed.append(mod)
+                    if kept:
+                        for key, (_rel, path) in repaired.items():
+                            if key not in kept:
+                                fsutil.remove_file(path)
+                    else:
+                        fsutil.rmtree(target)
+                    record.update(applied=kept, applied_game=record.get("applied_game", "") if kept else "")
+                    if len(kept) < len(repaired):
+                        changed.append(mod)
                 self._save_material_record(mod.id, record)
             except OSError as exc:
                 log.error("%s: 재질 복구 결과를 저장하지 못했습니다: %s", job.name, exc)
@@ -1696,6 +1872,20 @@ class ModManager:
             self.dirty = self.dirty or any(m.enabled for m in changed)
             self.save()
         return changed
+
+    @staticmethod
+    def _keep_repairs(kept: dict, repaired: dict, stage: Path) -> dict:
+        """The repairs in use ``kept`` (source key -> applied entry) copied into a repair run's ``stage`` (under
+        names its own files do not use), as its applied entries."""
+        fsutil.makedirs(stage)
+        out = {}
+        for key, entry in kept.items():
+            path = repaired[key][1]
+            tail = path.name.partition("_")[2] or path.name
+            name = next(n for n in (f"{i:03d}_{tail}" for i in itertools.count(1)) if not (stage / n).exists())
+            fsutil.copy_file(path, stage / name)
+            out[key] = {**entry, "file": f"{MATFIX_DIR}/{name}"}
+        return out
 
     def restore_materials(self, mod_id: str) -> bool:
         """Use the mod's own material files again (it no longer counts as a problem).
@@ -1724,7 +1914,7 @@ class ModManager:
 
     def _equip_job(self, order: int, mod: Mod) -> EquipJob:
         files = {rel: path for rel, (path, _key) in self.mod_entries(mod.id).items()}
-        stamp = f"{self._stamp(mod)}|{','.join(mod.selected)}|{len(files)}"
+        stamp = f"{mod.stamp}|{','.join(mod.selected)}|{len(files)}"
         return EquipJob(mod.id, mod.name, mod.enabled, order, stamp, files)
 
     def _equip_game(self, progress: ProgressFn | None = None) -> GameIndex | None:
@@ -2407,6 +2597,1257 @@ class ModManager:
                  "켜짐" if mod.enabled else "꺼짐", ", 원래 모드는 끔" if switched_off else "")
         return mod
 
+    # ------------------------------------------------------------- 모드 수정
+    # The overlay in mods/<id>/: edits.json (the recipe: files left out, values changed) and edits/ (the files
+    # built from it). mod_entries applies it (stored file → files left out → matfix repair → value edit), so the
+    # mod's own files and folders are never written. The window and the command line ask for an EditPlan;
+    # edit_job (GUI thread) checks it, build_edit (any thread) builds the outputs into a temporary stage and
+    # finish_edit (GUI thread) moves them in and writes the record, all or nothing.
+    @staticmethod
+    def source_key(key: str) -> str:
+        """The stored file's source key of a mod_entries key: without ``matfix/`` (a repair in use) or
+        ``edits/`` (a value edit's output)."""
+        for prefix in (EDITS_PREFIX, MATFIX_DIR + "/"):
+            if key.startswith(prefix):
+                return key[len(prefix):]
+        return key
+
+    def edit_record(self, mod_id: str) -> edit_model.Record:
+        """The mod's 모드 수정 record (an empty one without edits.json; ``error`` when it cannot be read).
+        Cached: callers copy it before changing anything (GUI thread)."""
+        record = self._edit_records.get(mod_id)
+        if record is None:
+            record = self._edit_records[mod_id] = edit_model.load(self.mod_dir(mod_id))
+        return record
+
+    def _scopes(self, mod: Mod) -> list[tuple[str, Path, list[str]]]:
+        """(option id, "" without options; folder; its game paths) of every stored scope of a mod, in option order."""
+        if not mod.options:
+            base = self.files_dir(mod.id)
+            return [("", base, list_files(base))]
+        return [(o["id"], self.option_dir(mod.id, o["id"]), self.option_files(mod.id, o["id"])) for o in mod.options]
+
+    def _stored_path(self, mod: Mod, key: str) -> tuple[str, Path]:
+        """(game path, stored file) of a source key."""
+        if mod.options:
+            oid, _, rel = key.partition("/")
+            return rel, self.option_dir(mod.id, oid) / rel
+        return key, self.files_dir(mod.id) / key
+
+    def _edit_overlay(self, mod_id: str) -> EditOverlay:
+        """The record as mod_entries applies it, resolved to today's option ids (cached; an item whose option
+        or file is gone, an item conflict, is not used; an unreadable record not at all)."""
+        cached = self._edits_cache.get(mod_id)
+        if cached is not None:
+            return cached
+        record = self.edit_record(mod_id)
+        overlay = EditOverlay(error=record.error)
+        if not record.error and record.items:
+            mod = self.get(mod_id)
+            folder = self.mod_dir(mod_id)
+            for item in record.items:
+                key = None if item.conflict else edit_model.key_of(mod.options, item.source)
+                if key is None:
+                    continue
+                if item.exclude:
+                    overlay.excluded.add(key)  # (its values wait until it is put back)
+                elif item.out is not None and item.base is not None:
+                    overlay.outputs[key] = OutRef(folder / item.out.file, item.base.key, item.base.size,
+                                                  item.base.mtime_ns, item.out.size)
+        self._edits_cache[mod_id] = overlay
+        return overlay
+
+    def _exclusion_digest(self, mod_id: str) -> str:
+        """The files 모드 수정 leaves out of the mod, as the material record keeps it ("" for none)."""
+        return edit_model.exclusion_digest(self._edit_overlay(mod_id).excluded)
+
+    def _effective_base(self, mod: Mod, key: str, rel: str, stored: Path, repaired: dict | None = None
+                        ) -> edit_model.BaseRef:
+        """What a value edit of the stored file ``key`` is built on: the matfix repair in use, else the stored
+        file. ``repaired``: repaired_materials(mod.id) when the caller has it."""
+        repaired = self.repaired_materials(mod.id) if repaired is None else repaired
+        if key in repaired:
+            new_rel, path = repaired[key]
+            return edit_model.BaseRef(path, f"{MATFIX_DIR}/{key}", "repair", new_rel)
+        return edit_model.BaseRef(stored, key, "stored", rel)
+
+    def _effective_stored_files(self, mod_id: str) -> dict[str, Path]:
+        """Game path -> stored file for every file of a mod, all options included, without the files 모드 수정
+        leaves out (the Lua modules its scripts need, the files it provides for the material check)."""
+        mod = self.get(mod_id)
+        excluded = self._edit_overlay(mod_id).excluded
+        out: dict[str, Path] = {}
+        for oid, base, rels in self._scopes(mod):
+            out.update((rel, base / rel) for rel in rels if (f"{oid}/{rel}" if oid else rel) not in excluded)
+        return out
+
+    @staticmethod
+    def _effective_stage_files(stage: Path, options: list[dict], record: edit_model.Record | None) -> dict[str, Path]:
+        """_effective_stored_files of a mod being installed into ``stage`` with ``options``, without the files
+        the carried-over record (``record``, None: no edits) leaves out."""
+        excluded = set()
+        for item in (record.items if record is not None and not record.error else ()):
+            key = None if item.conflict or not item.exclude else edit_model.key_of(options, item.source)
+            if key is not None:
+                excluded.add(key)
+        scopes = [("", stage / "files")] if not options else [(o["id"], stage / "options" / o["id"]) for o in options]
+        out: dict[str, Path] = {}
+        for oid, base in scopes:
+            if base.is_dir():
+                out.update((rel, base / rel) for rel in list_files(base)
+                           if (f"{oid}/{rel}" if oid else rel) not in excluded)
+        return out
+
+    def _excluded_keys(self, mod: Mod, record: edit_model.Record) -> set[str]:
+        """The source keys ``record`` leaves out of the mod, with today's option ids."""
+        if record.error:
+            return set()
+        keys = (None if i.conflict or not i.exclude else edit_model.key_of(mod.options, i.source) for i in record.items)
+        return {k for k in keys if k is not None}
+
+    def _item_conflict(self, mod: Mod, item: edit_model.Item) -> str:
+        """Why an item is not used at all ("" when it is): its option or file went with an update, or its
+        option does not resolve (the mod gained or lost its options)."""
+        if item.conflict:
+            return item.conflict
+        if edit_model.key_of(mod.options, item.source) is not None:
+            return ""
+        if bool(mod.options) != bool(item.source.option):
+            return EDIT_OPTIONS_CHANGED
+        return f"옵션 '{item.source.option}'이(가) 없습니다"
+
+    def _needs_build(self, mod: Mod, key: str, item: edit_model.Item, repaired: dict | None = None) -> bool:
+        """An item with values whose output is not what the game should get (§2.13): never built, its base is
+        not the effective base any more (an update, a repair accepted or declined, a hand edit), or its output
+        is gone. One whose members all wait (pending) on an unchanged base does not."""
+        if item.conflict or not any(m.changes or m.conflicts for m in item.members):
+            return False
+        rel, stored = self._stored_path(mod, key)
+        if item.base is None:
+            return fsutil.is_file(stored)
+        eff = self._effective_base(mod, key, rel, stored, repaired)
+        st = fsutil.stat_or_none(eff.path)
+        if st is None:
+            return False  # nothing to build on (edit_issues says so)
+        if item.base.key != eff.key or (st.st_size, st.st_mtime_ns) != (item.base.size, item.base.mtime_ns):
+            return True
+        if item.out is not None:
+            out = fsutil.stat_or_none(self.mod_dir(mod.id) / item.out.file)
+            return out is None or out.st_size != item.out.size
+        return False
+
+    def _pending_keys(self, mod: Mod) -> list[str]:
+        """Source keys of the mod's items that need building again."""
+        record = self.edit_record(mod.id)
+        if record.error or not any(i.members for i in record.items):
+            return []
+        repaired = self.repaired_materials(mod.id)
+        out = []
+        for item in record.items:
+            key = None if item.conflict or not item.members else edit_model.key_of(mod.options, item.source)
+            if key is not None and self._needs_build(mod, key, item, repaired):
+                out.append(key)
+        return out
+
+    def edits_waiting(self, mod_id: str) -> list[str]:
+        """Source keys of the mod's files whose edits wait to be built again (the files tab says so; mod_entries
+        gives them without the edits meanwhile). GUI thread."""
+        return self._pending_keys(self.get(mod_id))
+
+    def edits_pending(self) -> list[str]:
+        """Ids of the mods with edits to build again (re-apply: §2.13). Cheap (a stat or two per edited file),
+        cached per revision (GUI thread)."""
+        if self._pending_cache is not None and self._pending_cache[0] == self.revision:
+            return list(self._pending_cache[1])
+        found = [m.id for m in self.mods if self._pending_keys(m)]
+        self._pending_cache = (self.revision, found)
+        return list(found)
+
+    def edit_issues(self, mod_id: str) -> list[str]:
+        """What of the mod's edits does not reach the game now, one line each (§2.14): an unreadable or newer
+        record, an item whose option or file is gone, values to check, files that could not be built (pending),
+        files waiting to be built again. The game gets the effective base for those (GUI thread)."""
+        mod = self.get(mod_id)
+        record = self.edit_record(mod_id)
+        if record.error:
+            if record.newer:
+                return ["모드 수정 기록이 더 새로운 버전의 매니저에서 만든 것이라 쓰지 않습니다"]
+            return [f"모드 수정 기록을 읽지 못해 쓰지 않고 있습니다: {record.error}"]
+        out, reasons = [], []
+        conflicts = waiting = 0
+        repaired = self.repaired_materials(mod_id) if any(i.members for i in record.items) else {}
+        for item in record.items:
+            why = self._item_conflict(mod, item)
+            if why:
+                out.append(f"{item.source.label()}: {why}")
+                continue
+            if not item.members:
+                continue
+            key = edit_model.key_of(mod.options, item.source)
+            if not fsutil.is_file(self._stored_path(mod, key)[1]):
+                out.append(f"{item.source.label()}: 모드 폴더에 파일이 없어 수정을 쓰지 않습니다")
+                continue
+            conflicts += item.conflicts()
+            reasons += [m.pending for m in item.members if m.pending]
+            waiting += self._needs_build(mod, key, item, repaired)
+        if conflicts:
+            out.append(f"확인할 값 {conflicts}개")
+        if reasons:
+            out.append(f"다시 적용하지 못한 파일 {len(reasons)}개: {reasons[0]}")
+        if waiting:
+            out.append(f"다시 적용 대기 {waiting}개")
+        return out
+
+    def _summary(self, mod: Mod, record: edit_model.Record, waiting: bool = True) -> edit_model.EditSummary:
+        if record.error:
+            return edit_model.EditSummary(0, 0, 0, 0, 0, 0, record.error)
+        excluded = values = files = conflicts = pending = wait = 0
+        repaired = self.repaired_materials(mod.id) if waiting and any(i.members for i in record.items) else {}
+        for item in record.items:
+            if self._item_conflict(mod, item):
+                conflicts += 1  # (to check in 수정 내용, which offers 지우기)
+                continue
+            excluded += item.exclude
+            n = item.changes()
+            values += n
+            files += bool(n)
+            conflicts += item.conflicts()
+            pending += sum(1 for m in item.members if m.pending)
+            if waiting and item.members:
+                wait += self._needs_build(mod, edit_model.key_of(mod.options, item.source), item, repaired)
+        return edit_model.EditSummary(excluded, values, files, conflicts, pending, wait, "")
+
+    def edit_summary(self, mod_id: str) -> edit_model.EditSummary:
+        """How many files the mod's edits leave out and values they change, and what needs the user (GUI thread)."""
+        return self._summary(self.get(mod_id), self.edit_record(mod_id))
+
+    def edit_items(self, mod_id: str) -> list[edit_model.EditItemView]:
+        """The lines of 수정 내용 (and of the command line's ``edit status``): one per file left out and one per
+        file (or PAK entry) with values, with its state (GUI thread)."""
+        mod = self.get(mod_id)
+        record = self.edit_record(mod_id)
+        if record.error:
+            return []
+        repaired = self.repaired_materials(mod_id) if any(i.members for i in record.items) else {}
+        out = []
+        for item in record.items:
+            why = self._item_conflict(mod, item)
+            key = None if why else edit_model.key_of(mod.options, item.source)
+            selected = not mod.options or (key is not None and key.partition("/")[0] in mod.selected)
+            if item.exclude:
+                state = "item_conflict" if why else "active" if selected else "inactive_option"
+                out.append(edit_model.EditItemView("exclude", item.source, "", item.source.rel, (), (), state, why))
+            waiting = key is not None and self._needs_build(mod, key, item, repaired)
+            name = item.source.rel.rsplit("/", 1)[-1]
+            for m in item.members:
+                state, reason = "active", ""
+                if why:
+                    state, reason = "item_conflict", why
+                elif item.exclude:
+                    state = "inactive_excluded"
+                elif m.pending:
+                    state, reason = "pending", m.pending
+                elif waiting:
+                    state = "waiting"
+                elif m.conflicts:
+                    state = "conflict"
+                elif not selected:
+                    state = "inactive_option"
+                label = m.label or (f"{name} {m.member}" if m.member else name)
+                out.append(edit_model.EditItemView(edit_model.engine_tool(m.engine) or "data", item.source, m.member,
+                                                   label, tuple(m.changes), tuple(m.conflicts), state, reason))
+        return out
+
+    def excluded_files(self, mod_id: str) -> list[str]:
+        """The game paths 모드 수정 leaves out of what the mod puts into the game now (the files tab lists them
+        muted; a path another chosen option still puts in is not one)."""
+        mod = self.get(mod_id)
+        excluded = self._edit_overlay(mod_id).excluded
+        if not excluded:
+            return []
+        shown = {path_key(rel) for rel in self.mod_entries(mod_id)}
+        out: dict[str, str] = {}
+        for oid, _base, rels in self._scopes(mod):
+            if oid and oid not in mod.selected:
+                continue
+            for rel in rels:
+                if (f"{oid}/{rel}" if oid else rel) in excluded and path_key(rel) not in shown:
+                    out.setdefault(path_key(rel), rel)
+        return sorted(out.values(), key=str.casefold)
+
+    def drop_edit_notice(self, mod_id: str) -> None:
+        """Forget the last update's report on the edits (Record.notice: shown once); the rev stays."""
+        record = self.edit_record(mod_id)
+        if record.error or not record.notice:
+            return
+        new = record.copy()
+        new.notice = {}
+        edit_model.save(self.mod_dir(mod_id), new)
+        self._edit_records.pop(mod_id, None)
+
+    def game_files(self, progress: ProgressFn | None = None) -> GameIndex | None:
+        """The game's pak index shared with the equipment window (None without a readable game). Any thread."""
+        return self._equip_game(progress)
+
+    # ---- what the window shows (GUI thread: the snapshot; worker threads read only the snapshot)
+    def _placed_states(self, mod: Mod, keys: Mapping[str, str]) -> dict[str, str]:
+        """Source key -> Deployer.placed state of the game copy that key's file is placed as now (``keys``:
+        source key -> its game path). A key that is not what the chosen options put at its path has no copy
+        there ("none"), unless a kept copy of the mod is in edited\\ for it ("stash"): it comes back only for
+        the same file."""
+        if not self.game_dir or not keys:
+            return {}
+        at = {self.source_key(k): rel for rel, (_path, k) in self.mod_entries(mod.id).items()}
+        ask = {at.get(key, rel) for key, rel in keys.items()} | set(keys.values())
+        try:
+            states = self.deployer().placed(mod.id, sorted(ask))
+        except (OSError, DeployError) as exc:
+            log.warning("게임 폴더에 넣은 파일을 확인하지 못했습니다: %s", exc)
+            return {}
+        out = {}
+        for key, rel in keys.items():
+            if key in at:
+                out[key] = states.get(at[key], "none")
+            else:
+                out[key] = "stash" if states.get(rel) == "stash" else "none"
+        return out
+
+    def edit_snapshot(self, mod_id: str, conflicts: Conflicts | None = None) -> edit_model.EditSnapshot:
+        """Everything the 모드 수정 pages and their workers read of a mod (GUI thread): its options, every stored
+        file with its state, the record (a copy), the effective bases, the game copies' states (Deployer.placed,
+        read once), matfix's stuck files, the paths another enabled mod wins (``conflicts``: conflicts() when
+        the caller has it) and what waits to be built again."""
+        mod = self.get(mod_id)
+        record = self.edit_record(mod_id)
+        overlay = self._edit_overlay(mod_id)
+        repaired = self.repaired_materials(mod_id)
+        options, seen = [], {}
+        for o in mod.options:
+            n = seen.get(o["name"], 0)
+            seen[o["name"]] = n + 1
+            options.append(edit_model.OptionRef(o["id"], o["name"], n, o["id"] in mod.selected))
+        refs = {o.id: o for o in options}
+        scopes = self._scopes(mod)
+        winner, having = {}, {}  # path -> the key the chosen options put there; path -> the chosen options having it
+        for oid, _base, rels in scopes:
+            if oid and oid not in mod.selected:
+                continue
+            for rel in rels:
+                key = f"{oid}/{rel}" if oid else rel
+                if oid:
+                    having.setdefault(path_key(rel), []).append(refs[oid].name)
+                if key not in overlay.excluded:
+                    winner[path_key(rel)] = key
+        keys = {f"{oid}/{rel}" if oid else rel: rel for oid, _base, rels in scopes for rel in rels}
+        placed = self._placed_states(mod, keys)
+        stuck: dict[str, str] = {}
+        if self.material_state(mod_id) not in ("none", "unchecked"):
+            for r in self.material_results(mod_id):
+                for s in r.stuck:  # (a PAK's entry is labelled "<pak>#<16 hex digits>.<user|pfb|scn>")
+                    found = _MEMBER_LABEL.search(str(s.get("label", "")))
+                    stuck.setdefault(f"{r.key}#{found.group(1).upper()}" if found else r.key, str(s.get("reason", "")))
+        conflicts = conflicts if conflicts is not None else self.conflicts()
+        names = {m.id: m.name for m in self.mods}
+        overlaps = {k: names.get(ids[-1], ids[-1]) for k, ids in conflicts.owners.items()
+                    if mod_id in ids and ids[-1] != mod_id}
+        files, bases = [], {}
+        for oid, base, rels in scopes:
+            by_path = {path_key(rel): rel for rel in rels}
+            for rel in rels:
+                key = f"{oid}/{rel}" if oid else rel
+                ref = refs.get(oid)
+                source = edit_model.Source(ref.name, ref.n, rel) if ref else edit_model.Source("", 0, rel)
+                item = None if record.error else record.item(source)
+                pk = path_key(rel)
+                over = ""
+                if item is not None and item.conflict:
+                    state = "conflict"
+                elif key in overlay.excluded:
+                    state = "excluded"
+                elif mod.options and not mod.selected:
+                    state = "needs_option"
+                elif oid and oid not in mod.selected:
+                    state = "option_off"
+                elif winner.get(pk, key) != key:
+                    state = "overridden"
+                    over = refs[winner[pk].partition("/")[0]].name
+                else:
+                    state = "in"
+                twin = equip_pathlist.streaming_twin(rel)
+                twin = by_path.get(path_key(twin)) if twin else None
+                if twin is None and pk.startswith(equip_pathlist.PREFIX + equip_pathlist.STREAMING):
+                    plain = pk[:len(equip_pathlist.PREFIX)] + pk[len(equip_pathlist.PREFIX + equip_pathlist.STREAMING):]
+                    twin = by_path.get(plain) if equip_pathlist.streaming_twin(plain) == pk else None
+                st = fsutil.stat_or_none(base / rel)
+                files.append(edit_model.EditFile(
+                    source, oid or None, key, rel, base / rel, st.st_size if st else 0, _edit_file_kind(rel), state,
+                    over, tuple(having.get(pk, ())) if oid else (), item.changes() if item else 0, key in repaired,
+                    placed.get(key, "none"), twin or ""))
+                bases[key] = self._effective_base(mod, key, rel, base / rel, repaired)
+        return edit_model.EditSnapshot(
+            mod.id, mod.name, mod.enabled, mod.stamp, record.rev, options, files, record.copy(), bases, placed,
+            stuck, overlaps, frozenset(self._pending_keys(mod)), self.edit_issues(mod_id), self.game_dir,
+            copy.deepcopy(mod.retarget), self.data_dir)
+
+    @staticmethod
+    def _copy_readonly(state: str, tool: str) -> str:
+        """Why a loose file's values cannot be changed because of its game copy (I11), "" when they can."""
+        if state not in ("changed", "stash"):
+            return ""
+        if tool == "config":
+            from .modedit import textconfig
+
+            return textconfig.GAME_COPY_CHANGED
+        return GAME_COPY_DATA
+
+    def edit_targets(self, snap: edit_model.EditSnapshot, tool: str,
+                     progress: ProgressFn | None = None) -> list[edit_model.EditTarget]:
+        """The files (and PAK entries) the 게임 수치 (``tool`` "data": .user files under natives/, the .user
+        entries of the mod's root PAKs) or 스크립트 설정 page ("config": textconfig.listed) can open, of every
+        option. Worker thread: reads the snapshot, the PAKs (on their effective base) and the path list."""
+        progress = progress or (lambda done, total, msg: None)
+        record = snap.record
+
+        def edited(source, member: str) -> bool:
+            item = None if record.error else record.item(source)
+            m = item.member(member) if item is not None else None
+            return m is not None and bool(m.changes or m.conflicts)
+
+        def readonly(f: edit_model.EditFile, kind: str) -> str:
+            if f.state == "conflict":
+                item = record.item(f.source)
+                return f"수정 기록에 확인할 문제가 있어 바꿀 수 없습니다: {item.conflict if item else ''}"
+            return self._copy_readonly(f.placed, kind)
+
+        def note(f: edit_model.EditFile) -> str:
+            if f.state == "option_off":
+                return f"옵션 '{f.source.option}'이(가) 꺼져 있어 바꾼 값은 그 옵션을 켜야 게임에 들어갑니다."
+            if f.state == "overridden":
+                return f"아래쪽 옵션 '{f.overridden_by}'의 파일이 이 파일을 덮어써 바꾼 값이 게임에 들어가지 않습니다."
+            if f.state == "excluded":
+                return "게임에 넣지 않는 파일이라 바꾼 값은 이 파일을 다시 넣어야 게임에 들어갑니다."
+            return ""
+
+        def label(f: edit_model.EditFile) -> str:
+            folder, _, name = f.rel.rpartition("/")
+            text = f"{name} · {folder}" if folder else name
+            return text + (f" (옵션 {f.source.option})" if f.source.option else "")
+
+        out: list[edit_model.EditTarget] = []
+        if tool == "config":
+            from .modedit import textconfig
+
+            for f in snap.files:
+                name = textconfig.listed(f.rel, f.size)
+                if name:
+                    out.append(edit_model.EditTarget(f.source, f.key, "", name, "config", label(f), f.size,
+                                                     edited(f.source, ""), readonly(f, "config"), note(f)))
+            return out
+        if tool != "data":
+            raise ValueError(tool)
+        paks = [f for f in snap.files if is_root_pak(f.rel)]
+        index = reg = None
+        if paks:
+            from .modedit import rszdata
+
+            with self._equip_lock:
+                if self._equip_paths is None:
+                    self._equip_paths = equip_pathlist.PathIndex(self.data_dir / "cache")
+                index = self._equip_paths
+            reg = rszdata.registry()
+        try:
+            done = 0
+            for f in snap.files:
+                if edit_model.is_data_rel(f.rel):
+                    out.append(edit_model.EditTarget(f.source, f.key, "", "rsz", "data", label(f), f.size,
+                                                     edited(f.source, ""), readonly(f, "data"), note(f)))
+                    continue
+                if not is_root_pak(f.rel):
+                    continue
+                progress(done, len(paks), f"PAK 안을 읽는 중... {f.rel}")
+                done += 1
+                base = snap.bases.get(f.key)
+                path = base.path if base is not None else f.path
+                why = pakedit.check_rebuildable(path)
+                locked = f"이 PAK은 다시 만들 수 없는 형식이라 값을 바꿀 수 없습니다 ({why})" if why else ""
+                size = fsutil.stat_or_none(path)
+                extra = note(f)
+                if size is not None and size.st_size > pakedit.BIG_PAK:
+                    extra = " ".join(x for x in (extra, f"이 PAK({pakedit.size_text(size.st_size)})은 고치면 같은 크기의 "
+                                                        "복사본을 하나 더 저장합니다.") if x)
+                try:
+                    members = pakedit.members(path, names=index.lookup if index is not None else None,
+                                              type_of=lambda data: rszdata.root_type(data, reg))
+                except Exception as exc:  # (EditError; OSError or a table that does not read: the PAK is listed so)
+                    if not isinstance(exc, EditError):
+                        log.warning("모드 수정: %s 안을 읽지 못했습니다: %s", f.rel, exc, exc_info=not isinstance(exc, OSError))
+                    why = str(exc) if isinstance(exc, EditError) else f"PAK을 읽지 못했습니다: {exc}"
+                    out.append(edit_model.EditTarget(f.source, f.key, "", "rsz", "data", label(f), f.size, False,
+                                                     why, extra))
+                    continue
+                for pm in members:
+                    root = pm.type_name.rsplit(".", 1)[-1] if pm.type_name else "데이터"
+                    tail = pm.name.rsplit("/", 1)[-1] if pm.name else pm.key[:9]
+                    text = f"{f.rel} · {root} ({tail})" + (f" (옵션 {f.source.option})" if f.source.option else "")
+                    out.append(edit_model.EditTarget(f.source, f.key, pm.key, "rsz", "data", text, pm.size,
+                                                     edited(f.source, pm.key), locked or readonly(f, "data"), extra))
+        finally:
+            if reg is not None:
+                rszdata.release()
+        return out
+
+    def _game_copy(self, snap: edit_model.EditSnapshot, target: edit_model.EditTarget,
+                   base: edit_model.BaseRef) -> bytes | None:
+        """The game's own copy of a data file (a moved mod's at the original equipment's path), None without one."""
+        try:
+            game = self.game_files()
+            if game is None:
+                return None
+            aliases = None
+            if snap.aliases:
+                try:
+                    aliases = retarget_aliases(snap.aliases)
+                except ValueError:
+                    aliases = None
+            if target.member:
+                h = pakedit.member_hash(target.member)
+                return game.read_hash(aliases.hashes.get(h, h) if aliases is not None else h)
+            path = (aliases.old_path(target.source.rel) if aliases is not None else None) or base.rel
+            m = RSZ_RE.search(path)
+            if m is None:
+                return None
+            for candidate in candidate_paths(path[:m.start()]):
+                found = game.read_versioned(candidate, m.group(1).lower(), prefer=(int(m.group(2)),))
+                if found is not None:
+                    return found[1]
+        except Exception as exc:  # display only: the page shows every value then
+            log.info("모드 수정: 게임 파일을 읽지 못했습니다 (%s): %s", target.label, exc)
+        return None
+
+    def open_values(self, snap: edit_model.EditSnapshot, target: edit_model.EditTarget,
+                    progress: ProgressFn | None = None) -> edit_model.ValueView:
+        """The values of one file (or PAK entry) on its effective base, with the mod's own value, the game's
+        (data files: rszdata.compare with the game's copy, and which of them came from rows paired by a key:
+        ``keyed``), the hint and the record's change, conflict and rule of each. A file that cannot be changed
+        or read (anything that goes wrong while reading it) comes back with ``readonly`` and no rows. Worker
+        thread: reads the snapshot, the file, the game's pak index (shared, locked) and the type registry
+        (held)."""
+        progress = progress or (lambda done, total, msg: None)
+        from .modedit import StaleError
+
+        base = snap.bases[target.key]
+
+        def view(rows=(), readonly="", notes=(), total=0, compared=False, truncated=False, data_files=(),
+                 added=frozenset(), keyed=frozenset()):
+            return edit_model.ValueView(target, list(rows), total, compared, truncated, list(notes), readonly, base,
+                                        list(data_files), frozenset(added), frozenset(keyed))
+
+        if target.readonly:
+            return view(readonly=target.readonly)
+        progress(0, 0, f"읽는 중... {target.label}")
+        data_tool = target.tool == "data"
+        rszdata = reg = None
+        try:
+            if data_tool:
+                from .modedit import rszdata
+
+                reg = rszdata.registry()
+            try:
+                if target.member:
+                    h = pakedit.member_hash(target.member)
+                    data, name = pakedit.read_member(base.path, h), f"{base.rel}#{h:016X}"
+                else:
+                    with open(fsutil.longpath(base.path), "rb") as f:
+                        data, name = f.read(), base.rel
+                engine = edit_engines.get(target.engine)
+                doc = engine.open(data, name)
+                locked = getattr(doc, "readonly", "")
+                values = [] if locked else list(doc.values())
+            except KeyError:
+                return view(readonly="PAK 안에서 이 파일을 찾지 못했습니다.")
+            except StaleError as exc:
+                why = str(exc)
+                if f"{target.key}{target.member}" in snap.stuck and rszdata is not None:
+                    why += rszdata.STUCK_SUFFIX  # (matfix found no way to repair it: a repair PAK holds it as it was)
+                return view(readonly=why)
+            except EditError as exc:
+                return view(readonly=str(exc))
+            except Exception as exc:  # (OSError, or a file that does not read as its engine expects)
+                log.warning("모드 수정: %s을(를) 읽지 못했습니다: %s", target.label, exc,
+                            exc_info=not isinstance(exc, OSError))
+                return view(readonly=f"파일을 읽지 못했습니다: {exc}")
+            if locked:
+                return view(readonly=locked)
+            notes = [rszdata.REPAIR_NOTE] if data_tool and base.via == "repair" else []
+            notes += list(doc.notes)
+            game = None
+            if data_tool:
+                progress(0, 0, f"게임 파일과 비교하는 중... {target.label}")
+                try:
+                    game = rszdata.compare(data, self._game_copy(snap, target, base), reg, doc=doc)
+                except Exception as exc:  # display only: the values without the game's then
+                    log.warning("모드 수정: %s을(를) 게임 파일과 비교하지 못했습니다: %s", target.label, exc, exc_info=True)
+                else:
+                    notes += game.notes()
+            rows = self._value_rows(snap, target, engine, values, game, doc)
+            compared = bool(game and game.compared)
+            return view(rows, "", notes, len(values), compared, bool(getattr(doc, "truncated", False)),
+                        getattr(doc, "data_files", ()), game.added if compared else (), game.keyed if compared else ())
+        finally:
+            if reg is not None:
+                rszdata.release()
+
+    @staticmethod
+    def _value_rows(snap: edit_model.EditSnapshot, target: edit_model.EditTarget, engine, values, game, doc=None
+                    ) -> list[edit_model.ValueRow]:
+        """The page's rows: each value with the record's change, conflict and rule of it. A change keeps the
+        address it was made at until its file is built again (a re-apply that waits, an update not applied
+        yet), so the record's addresses are matched as this file spells them (``doc``: Doc.get / expand)."""
+        record = snap.record
+        item = None if record.error else record.item(target.source)
+        member = item.member(target.member) if item is not None else None
+
+        def spelled(c: edit_model.Change) -> str:
+            return c.at if doc is None else ModManager._spelled_at(doc, c)
+
+        singles, rules, conflicts = {}, [], {}
+        for c in member.changes if member else ():  # (of two changes to one value the later one counts)
+            if c.rule:
+                rules.append((spelled(c), c))
+            else:
+                singles[spelled(c)] = c
+        for x in member.conflicts if member else ():
+            if not x.change.rule:
+                conflicts[spelled(x.change)] = x
+        rows = []
+        for v in values:
+            rule = None
+            if rules and v.rule_at:
+                rule = next((c for at, c in rules if at == v.rule_at and engine.same(v, v.text, c.before)), None)
+            rows.append(edit_model.ValueRow(v, v.text, game.values.get(v.at) if game is not None else None,
+                                            game.hint(v.rule_at) if game is not None else "", singles.get(v.at),
+                                            conflicts.get(v.at), rule))
+        return rows
+
+    @staticmethod
+    def _spelled_at(doc, c: edit_model.Change) -> str:
+        """The address of ``c`` as ``doc`` names its value now (a row is named by values of its table, which an
+        update can change: #8): Doc.get's, for a rule the rule address of the rows Doc.expand finds; its own
+        when the file cannot name it."""
+        try:
+            if c.rule:
+                return next((v.rule_at for v in doc.expand(c.at, c.before) if v.rule_at), c.at)
+            found = doc.get(c.at)
+        except Exception as exc:  # (an address this file cannot name: matched as it is)
+            log.debug("모드 수정: 주소를 찾지 못했습니다 (%s): %s", c.at, exc)
+            return c.at
+        return found.at if found is not None and found.at else c.at
+
+    @classmethod
+    def _respell(cls, doc, member: edit_model.Member) -> None:
+        """``member``'s changes and conflicts spelled as ``doc`` names their values, one per value as a build
+        keeps them (engines.apply): of two changes the later one, and a change rather than a conflict."""
+        changes: dict = {}
+        for c in member.changes:
+            at = cls._spelled_at(doc, c)
+            c = c if at == c.at else replace(c, at=at)
+            changes.pop(c.ident, None)
+            changes[c.ident] = c
+        conflicts: dict = {}
+        for x in member.conflicts:
+            at = cls._spelled_at(doc, x.change)
+            x = x if at == x.change.at else replace(x, change=replace(x.change, at=at))
+            if x.ident not in changes:
+                conflicts.pop(x.ident, None)
+                conflicts[x.ident] = x
+        member.changes, member.conflicts = list(changes.values()), list(conflicts.values())
+
+    @classmethod
+    def _respell_waiting(cls, inp, item: edit_model.Item) -> None:
+        """The members of a built item that wait (pending) keep their changes as they were given, named the way
+        the file they were made on named its rows. The 게임 수치 page and the command line find the record's
+        changes by address, so these are named the way the file names them now when it opens (#8; a member
+        that is built comes back so from engines.apply). One that does not open stays as it is. Worker thread
+        (the type registry held for data files)."""
+        waiting = [m for m in item.members if m.pending and (m.changes or m.conflicts)]
+        if not waiting:
+            return
+        rel = inp.base.rel or inp.rel
+        loose = None
+        for m in waiting:
+            try:
+                if is_root_pak(inp.rel):
+                    h = pakedit.member_hash(m.member)
+                    data, name = pakedit.read_member(inp.base.path, h), f"{rel}#{h:016X}"
+                else:
+                    if loose is None:
+                        with open(fsutil.longpath(inp.base.path), "rb") as f:
+                            loose = f.read()
+                    data, name = loose, rel
+                doc = edit_engines.get(m.engine).open(data, name)
+            except Exception as exc:  # (what made it wait, most likely)
+                log.debug("모드 수정: 기다리는 %s%s의 주소를 다시 읽지 못했습니다: %s", inp.rel, m.member, exc)
+                continue
+            if not getattr(doc, "readonly", ""):
+                cls._respell(doc, m)
+
+    # ---- saving (edit_job on the GUI thread → build_edit on a worker → finish_edit on the GUI thread)
+    def _guard_list(self, mod: Mod, prev: edit_model.Record, desired: edit_model.Record,
+                    reapply=frozenset()) -> list[tuple[str, str, str]]:
+        """The loose files whose output a save changes: (source key, game path, "values" when a value is set
+        or changed, "revert" when values only go). A changed copy of one in the game folder would be lost or
+        hidden (I11). Files left out or put back need no question, also when they make another selected
+        option's copy the one the mod puts there (쓸 옵션, 모두 원래대로): deploy keeps a changed copy aside
+        when another file of the mod takes its place and puts it back with its own file, as when the options
+        are changed (#0)."""
+        def values(record: edit_model.Record, source) -> dict:
+            item = None if record.error else record.item(source)
+            if item is None or item.conflict:
+                return {}
+            return {m.member: list(m.changes) for m in item.members if m.changes}
+
+        sources = {i.source for r in (prev, desired) if not r.error for i in r.items if i.members} | set(reapply)
+        out = []
+        for source in sorted(sources, key=lambda s: (s.option, s.n, s.rel)):
+            key = None if is_root_pak(source.rel) else edit_model.key_of(mod.options, source)
+            if key is None:
+                continue
+            a, b = values(prev, source), values(desired, source)
+            if a == b and source not in reapply:
+                continue
+            added = any(c not in a.get(m, ()) for m, cs in b.items() for c in cs)
+            out.append((key, source.rel, "values" if added else "revert"))
+        return out
+
+    def _check_guard(self, mod: Mod, guarded: list, force: bool) -> None:
+        """I11: refuse values on a loose file whose game copy changed (or is kept in edited\\), and ask before
+        putting it back to the mod's own file (GameCopyChanged unless ``force``)."""
+        if not guarded:
+            return
+        states = self._placed_states(mod, {key: rel for key, rel, _kind in guarded})
+        hit = [(rel, kind) for key, rel, kind in guarded if states.get(key) in ("changed", "stash")]
+        values = [rel for rel, kind in hit if kind == "values"]
+        if values:
+            tool = "config" if edit_model.config_engine(values[0]) else "data"
+            raise EditError(f"{values[0]}: {self._copy_readonly('changed', tool)}")
+        if hit and not force:
+            rels = list(dict.fromkeys(rel for rel, _kind in hit))
+            raise GameCopyChanged("게임 폴더의 다음 파일은 매니저가 넣은 뒤에 바뀌었습니다: " + ", ".join(rels), rels)
+
+    def edit_job(self, plan: edit_model.EditPlan, force: bool = False) -> EditJob:
+        """Check an EditPlan against the mod as it is now and take what building it needs (GUI thread, or the
+        command line's caller): the record ``plan`` was made on (stamp, rev), its files, the rules of the record
+        (model.merge), the game copies of the loose files whose values change (I11: ``force`` to put back one
+        that changed) and the effective bases of the items to build. EditError (Korean) when it cannot be
+        saved; GameCopyChanged when that needs ``force``."""
+        try:
+            mod = self.get(plan.mod_id)
+        except KeyError:
+            raise EditError("모드를 찾지 못했습니다. 창을 다시 열어 주세요.") from None
+        record = self.edit_record(mod.id)
+        if (mod.stamp, record.rev) != (plan.stamp, plan.rev):
+            raise EditError(EDIT_WAS_CHANGED)
+        if record.error and not (plan.clear_bad or plan.reset):
+            raise EditError(f"모드 수정 기록을 읽지 못해 고칠 수 없습니다 ({record.error}). 수정 내용에서 기록을 "
+                            "지우거나 모두 되돌리세요.")
+        for source in [*(s for s, flag in plan.exclude.items() if flag), *(s for s, _m in plan.members), *plan.reapply]:
+            key = edit_model.key_of(mod.options, source)
+            if key is None:
+                raise EditError(f"옵션을 찾지 못했습니다: {source.label()}")
+            if not fsutil.is_file(self._stored_path(mod, key)[1]):
+                raise EditError(f"모드에 없는 파일입니다: {source.label()}")
+        desired = edit_model.merge(record, plan)
+        prev = record.copy()
+        old = {} if prev.error else {i.source: i for i in prev.items}
+        repaired = self.repaired_materials(mod.id)
+        inputs = []
+        for index, item in enumerate(desired.items):
+            key = None if item.conflict or not item.members else edit_model.key_of(mod.options, item.source)
+            if key is None:
+                continue
+            was = old.get(item.source)
+            before = {m.member: list(m.changes) for m in was.members if m.changes} if was is not None else {}
+            now = {m.member: list(m.changes) for m in item.members if m.changes}
+            if before != now:
+                mode = "commit"  # (only conflicts taken away: the output stays as it is)
+            elif item.source in plan.reapply or self._needs_build(mod, key, item, repaired):
+                mode = "reapply"  # (a file that does not open waits instead of stopping the save)
+            else:
+                continue
+            rel, stored = self._stored_path(mod, key)
+            if not fsutil.is_file(stored):
+                if mode == "commit":
+                    raise EditError(f"모드에 없는 파일입니다: {item.source.label()}")
+                continue
+            new = frozenset((m.member, c.at) for m in item.members for c in m.changes
+                            if c not in before.get(m.member, ()))
+            inputs.append(edit_build.BuildInput(index, copy.deepcopy(item), key, rel,
+                                                self._effective_base(mod, key, rel, stored, repaired), stored, mode, new))
+        guarded = self._guard_list(mod, prev, desired, plan.reapply)
+        self._check_guard(mod, guarded, force)
+        flipped = self._excluded_keys(mod, prev) ^ self._excluded_keys(mod, desired)
+        return EditJob(mod.id, mod.name, mod.stamp, record.rev, "commit", desired, inputs, prev, force=force,
+                       exclusion_changed=bool(flipped), lua_changed=any(k.lower().endswith(".lua") for k in flipped),
+                       guarded=guarded)
+
+    def reapply_job(self, mod_id: str, sources=None) -> EditJob | None:
+        """A re-apply of the mod's items that need building again (or of ``sources``, the Sources asked for,
+        even when nothing changed): None when there is none or the record is unreadable (GUI thread)."""
+        mod = self.get(mod_id)
+        record = self.edit_record(mod_id)
+        if record.error:
+            return None
+        wanted = None if sources is None else set(sources)
+        repaired = self.repaired_materials(mod_id)
+        inputs = []
+        for index, item in enumerate(record.items):
+            key = None if item.conflict or not item.members else edit_model.key_of(mod.options, item.source)
+            if key is None or (wanted is not None and item.source not in wanted):
+                continue
+            if wanted is None and not self._needs_build(mod, key, item, repaired):
+                continue
+            rel, stored = self._stored_path(mod, key)
+            if fsutil.is_file(stored):
+                inputs.append(edit_build.BuildInput(index, copy.deepcopy(item), key, rel,
+                                                    self._effective_base(mod, key, rel, stored, repaired), stored,
+                                                    "reapply"))
+        if not inputs:
+            return None
+        return EditJob(mod.id, mod.name, mod.stamp, record.rev, "reapply", record.copy(), inputs, record.copy())
+
+    @classmethod
+    def _failed_build(cls, inp, why: str) -> edit_build.Built:
+        """An item of a re-apply that could not be built: every member waits with ``why``, on the base as it
+        is now (so it is not tried again until that changes or the user asks), named as that names its values
+        (_respell_waiting)."""
+        item = copy.deepcopy(inp.item)
+        for m in item.members:
+            m.pending = why
+        cls._respell_waiting(inp, item)
+        item.out = None
+        st = fsutil.stat_or_none(inp.base.path)
+        if st is not None:
+            item.base = edit_model.Base(inp.base.key, st.st_size, st.st_mtime_ns, "", "")
+        return edit_build.Built(inp.index, item, None, [f"{inp.rel}: {why}"])
+
+    def build_edit(self, job: EditJob, progress: ProgressFn | None = None) -> EditJob:
+        """Build the job's outputs into a new folder under temp (any thread: reads only the job, the stored
+        files and the type registry, which it holds while it works; writes nothing else). A commit raises on
+        the first item that cannot be built (the stage is deleted); a re-apply lets that item wait (pending)."""
+        progress = progress or (lambda done, total, msg: None)
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        stage = self.temp_root / f"modedit-{job.mod_id}-{uuid.uuid4().hex[:8]}"
+        stage.mkdir()
+        job.stage, job.built, job.notes = stage, [], list(job.notes)
+        rszdata = None
+        verb = "저장" if job.mode == "commit" else "다시 적용"
+        try:
+            if any(edit_model.engine_tool(m.engine) == "data" for inp in job.inputs for m in inp.item.members):
+                from .modedit import rszdata as module
+
+                module.registry()
+                rszdata = module
+            folder = self.mod_dir(job.mod_id)
+            number = max(edit_model.number_from(folder, job.prev), edit_model.number_from(folder, job.record))
+            for n, inp in enumerate(job.inputs):
+                progress(n, len(job.inputs), f"모드 수정 {verb} 중... {inp.rel.rsplit('/', 1)[-1]}")
+                try:
+                    built = edit_build.build_item(inp, stage, number, progress)
+                except Exception as exc:
+                    if inp.mode == "commit":
+                        raise
+                    log.warning("%s: %s을(를) 다시 적용하지 못했습니다: %s", job.name, inp.rel, exc,
+                                exc_info=not isinstance(exc, (EditError, OSError)))
+                    built = self._failed_build(inp, f"다시 적용하지 못했습니다: {exc}")
+                else:
+                    self._respell_waiting(inp, built.item)
+                if built.out_path is not None:
+                    number += 1
+                job.built.append(built)
+                job.notes += built.notes
+            job.next = number
+        except BaseException:
+            fsutil.rmtree(stage)
+            job.stage = None
+            raise
+        finally:
+            if rszdata is not None:
+                rszdata.release()
+        progress(len(job.inputs), len(job.inputs), f"모드 수정 {verb}을 마쳤습니다")
+        return job
+
+    def _base_still(self, mod: Mod, inp, base: edit_model.Base | None, repaired: dict) -> bool:
+        """The effective base of a built item is still the one it was built on."""
+        if base is None:
+            return False
+        eff = self._effective_base(mod, inp.key, inp.rel, inp.stored_path, repaired)
+        st = fsutil.stat_or_none(eff.path)
+        return eff.key == base.key and st is not None and (st.st_size, st.st_mtime_ns) == (base.size, base.mtime_ns)
+
+    def _post_check(self, mod: Mod, record: edit_model.Record, written=frozenset()) -> None:
+        """F1: mod_entries as the saved record says - no file left out in it, every output with a fitting base
+        used under its game path, every output written now (``written``: edits/ names) there with its size (an
+        older one that went missing only makes its item wait). EditError when not."""
+        entries = self.mod_entries(mod.id)
+        live = {self.source_key(k): (path, k) for path, k in entries.values()}
+        put_in = self._excluded_keys(mod, record) & live.keys()
+        if put_in:
+            raise EditError(f"뺀 파일이 아직 들어갑니다 ({sorted(put_in)[0]})")
+        folder = self.mod_dir(mod.id)
+        repaired = self.repaired_materials(mod.id)
+        for item in record.items:
+            key = None if item.conflict or item.out is None else edit_model.key_of(mod.options, item.source)
+            if key is None:
+                continue
+            path = folder / item.out.file
+            st = fsutil.stat_or_none(path)
+            if item.out.file in written and (st is None or st.st_size != item.out.size):
+                raise EditError(f"수정 파일이 없거나 크기가 다릅니다 ({item.out.file})")
+            if item.exclude or key not in live or item.base is None:
+                continue
+            rel, stored = self._stored_path(mod, key)
+            eff = self._effective_base(mod, key, rel, stored, repaired)
+            ref = OutRef(path, item.base.key, item.base.size, item.base.mtime_ns, item.out.size)
+            used, used_key = live[key]
+            if ref.fits((eff.path, eff.key)) and (used_key != EDITS_PREFIX + key or not fsutil.same_path(used, path)):
+                raise EditError(f"수정한 파일이 쓰이지 않습니다 ({item.source.label()})")
+
+    @staticmethod
+    def _edit_time(old: str) -> str:
+        """Mod.edited_at for a save now: later than ``old`` even within the same second (the stamps must change)."""
+        now = _now()
+        if old and now <= old:
+            try:
+                now = (datetime.fromisoformat(old) + timedelta(seconds=1)).isoformat(timespec="seconds")
+            except ValueError:
+                pass
+        return now
+
+    def _edit_result(self, job: EditJob, mod: Mod | None, record: edit_model.Record, changed: bool = False,
+                     deploy: bool = False, flipped=(), skipped: bool = False) -> EditResult:
+        rels = {inp.rel for inp in job.inputs} | {k.partition("/")[2] if mod and mod.options else k for k in flipped}
+        summary = self._summary(mod, record, waiting=changed) if mod is not None else None
+        materials = bool(flipped) and mod is not None and (
+            bool(self.material_files(mod.id)) or any(is_material_file(r) for r in rels))
+        return EditResult(
+            job.mod_id, changed, deploy, materials,
+            any(r.lower().startswith("natives/") or is_root_pak(r) for r in rels), job.lua_changed and changed,
+            summary.text() if summary is not None else "", 0 if record.error else sum(i.conflicts() for i in record.items),
+            0 if record.error else sum(1 for i in record.items for m in i.members if m.pending), list(job.notes),
+            skipped)
+
+    def finish_edit(self, job: EditJob) -> EditResult:
+        """Write what build_edit built (GUI thread, while nothing else changes the mods): the mod and its record
+        must still be those the job was made of (a commit raises EditError, a re-apply is dropped: ``skipped``),
+        and each built item's base the effective base; the game copies are checked again (I11). The outputs
+        are moved into edits/, the record written (rev + 1), mod_entries checked against it (F1) and all of
+        it undone when that fails (F2). Then the outputs no record refers to go (one generation kept),
+        Mod.edited_at changes (and with it Mod.stamp), and the state is saved. ``dry_run``: nothing is written."""
+        commit = job.mode == "commit"
+        try:
+            try:
+                mod = self.get(job.mod_id)
+            except KeyError:
+                mod = None
+            record = self.edit_record(job.mod_id) if mod is not None else None
+            if mod is None or (mod.stamp, record.rev) != (job.stamp, job.rev):
+                if commit:
+                    raise EditError(EDIT_MOD_CHANGED)
+                log.info("모드 수정 다시 적용: '%s'이(가) 그사이 바뀌어 다음에 다시 합니다", job.name)
+                return self._edit_result(job, mod, job.record, skipped=True)
+            final = job.record.copy()
+            inputs = {inp.index: inp for inp in job.inputs}
+            repaired = self.repaired_materials(mod.id)
+            used = []
+            for built in job.built:
+                inp = inputs[built.index]
+                if not self._base_still(mod, inp, built.item.base, repaired):
+                    if inp.mode == "commit":
+                        raise EditError(EDIT_MOD_CHANGED)
+                    log.info("모드 수정 다시 적용: %s의 바탕 파일이 그사이 바뀌어 다음에 다시 합니다", inp.rel)
+                    continue
+                final.items[built.index] = built.item
+                if built.out_path is not None:
+                    used.append(built)
+            if commit:
+                self._check_guard(mod, job.guarded, job.force)
+            final = edit_model.normalize(final)
+            flipped = self._excluded_keys(mod, job.prev) ^ self._excluded_keys(mod, final)
+            if job.dry_run:
+                return self._edit_result(job, mod, final, flipped=flipped)
+            if not used and not job.prev.error and final.to_dict() == job.prev.to_dict():
+                return self._edit_result(job, mod, final)  # nothing changes
+            folder = self.mod_dir(mod.id)
+            old_entries = dict(self.mod_entries(mod.id))
+            path = folder / EDITS_RECORD
+            try:
+                old_bytes = path.read_bytes()
+            except FileNotFoundError:
+                old_bytes = None
+            moved = []
+            try:
+                for built in used:
+                    target = folder / built.item.out.file
+                    if fsutil.exists(target):
+                        raise EditError(f"같은 이름의 수정 파일이 이미 있습니다 ({built.item.out.file})")
+                    fsutil.move_file(built.out_path, target)
+                    moved.append(target)
+                final.rev = job.prev.rev + 1
+                final.next = max(final.next, job.next)
+                if job.prev.error:  # (기록 지우기 / 모두 원래대로 of an unreadable record: kept aside, never overwritten)
+                    edit_model.set_aside(folder)
+                edit_model.save(folder, final)
+                self._invalidate(mod.id)
+                self._post_check(mod, final, {b.item.out.file for b in used})
+            except Exception as exc:
+                try:  # F2
+                    if old_bytes is None:
+                        fsutil.remove_file(path)
+                    elif not fsutil.exists(path) or path.read_bytes() != old_bytes:
+                        back = path.with_name(path.name + ".restore")
+                        back.write_bytes(old_bytes)
+                        os.replace(back, path)
+                    for target in moved:
+                        fsutil.remove_file(target)
+                except OSError as undo:
+                    log.error("%s: 모드 수정을 되돌리지 못했습니다: %s", mod.name, undo)
+                self._invalidate(mod.id)
+                log.warning("%s: 모드 수정을 저장하지 못해 되돌렸습니다: %s", mod.name, exc,
+                            exc_info=not isinstance(exc, (EditError, OSError)))
+                raise EditError(f"수정을 저장한 뒤 확인하지 못해 되돌렸습니다: {exc}") from exc
+            self._gc_edits(mod.id, keep=job.prev.outputs())
+            mod.edited_at = self._edit_time(mod.edited_at)
+            if job.lua_changed:
+                mod.lua_requires = requirements.required_modules(self._effective_stored_files(mod.id))
+            self._write_mod_meta(mod)
+            deploy = mod.enabled and dict(self.mod_entries(mod.id)) != old_entries
+            self.revision += 1
+            self.dirty = self.dirty or deploy
+            self.save()
+            summary = self._summary(mod, final)
+            log.info("모드 수정%s: %s (뺀 파일 %d개 · 바꾼 값 %d개)", "" if commit else " 다시 적용", mod.name,
+                     summary.excluded, summary.values)
+            return self._edit_result(job, mod, final, changed=True, deploy=deploy, flipped=flipped)
+        finally:
+            if job.stage is not None:
+                fsutil.rmtree(job.stage)
+                job.stage = None
+
+    def apply_edit_plan(self, plan: edit_model.EditPlan, force: bool = False, dry_run: bool = False,
+                        progress: ProgressFn | None = None) -> EditResult:
+        """edit_job → build_edit → finish_edit on the caller's thread (the command line). ``dry_run``: built and
+        checked, nothing written."""
+        job = self.edit_job(plan, force)
+        job.dry_run = dry_run
+        self.build_edit(job, progress)
+        return self.finish_edit(job)
+
+    def reapply_edits(self, mod_ids=None, progress: ProgressFn | None = None) -> list[EditResult]:
+        """Build the edits that need it again (of ``mod_ids``, None: edits_pending()) on the caller's thread (the
+        command line after a material check, repair or restore). A mod that fails is logged and left waiting."""
+        results = []
+        for mod_id in list(mod_ids) if mod_ids is not None else self.edits_pending():
+            try:
+                job = self.reapply_job(mod_id)
+            except KeyError:
+                continue
+            if job is None:
+                continue
+            try:
+                self.build_edit(job, progress)
+                results.append(self.finish_edit(job))
+            except Exception as exc:
+                log.warning("%s: 모드 수정을 다시 적용하지 못했습니다: %s", job.name, exc,
+                            exc_info=not isinstance(exc, (EditError, OSError)))
+        return results
+
+    def _gc_edits(self, mod_id: str, keep=frozenset()) -> None:
+        """Delete the outputs in edits/ that neither the record nor ``keep`` (``edits/...`` names: the previous
+        record's, for workers that still hold its snapshot) refers to; nothing for an unreadable record."""
+        folder = self.mod_dir(mod_id)
+        try:
+            edit_build.collect(folder, edit_model.load(folder), keep)
+            fsutil.prune_empty_dirs(folder / EDITS_DIR, folder)
+        except OSError as exc:
+            log.warning("지난 모드 수정 파일을 지우지 못했습니다 (%s): %s", mod_id, exc)
+
+    # ---- updates (install_package with replace_id): the edits carried over to the new files
+    def _carry_edits(self, mod_id: str, old_dir: Path, stage: Path, old_options: list[dict], new_options: list[dict],
+                     progress: ProgressFn | None = None) -> tuple[edit_model.CarryReport, edit_model.Record | None]:
+        """Carry the mod's record over to an update's files in ``stage`` (the install worker, before the folder
+        swap; writes only into the stage): each item resolved by option name and n against ``new_options``, an
+        exclusion kept (dropped with its file), values copied with their output when the stored file did not
+        change, else built again on the new file (build_item "carry": conflicts left to check, a file that does
+        not open waits). stage/edits.json gets rev + 1 and the report as its ``notice``. Never raises: when that
+        fails, the old record is put in with every value waiting (nothing unchecked is applied)."""
+        old_dir, stage = Path(old_dir), Path(stage)
+        try:
+            return self._carry(old_dir, stage, old_options, new_options, progress or (lambda done, total, msg: None))
+        except Exception as exc:
+            log.warning("모드 수정을 업데이트한 파일에 다시 적용하지 못했습니다 (%s): %s", mod_id, exc, exc_info=True)
+        try:
+            fsutil.rmtree(stage / EDITS_DIR)
+            record = edit_model.load(old_dir)
+            if record.error:
+                return self._carry_unreadable(old_dir, stage, record)
+            for item in record.items:
+                for m in item.members:
+                    m.pending = CARRY_FAILED
+                item.out = None
+            record.rev += 1
+            report = edit_model.CarryReport(pending=sum(len(i.members) for i in record.items))
+            record.notice = report.notice(_now())
+            edit_model.save(stage, record)
+            return report, record
+        except Exception as exc:
+            log.error("모드 수정 기록을 업데이트한 모드에 옮기지 못했습니다 (%s): %s", mod_id, exc, exc_info=True)
+            return edit_model.CarryReport(), None
+
+    @staticmethod
+    def _carry_unreadable(old_dir: Path, stage: Path, record: edit_model.Record):
+        """An unreadable record is kept aside in the new folder (never applied), with a notice that says so."""
+        from .modedit import BAD_SUFFIX
+
+        bad = stage / f"{EDITS_RECORD}{BAD_SUFFIX}{time.strftime('%Y%m%d-%H%M%S')}"
+        fsutil.copy_file(old_dir / EDITS_RECORD, bad)
+        log.warning("%s: %s (%s)", CARRY_UNREADABLE, record.error, bad.name)
+        report = edit_model.CarryReport(error=f"{CARRY_UNREADABLE}: {record.error}")
+        note = edit_model.Record(notice=report.notice(_now()))
+        edit_model.save(stage, note)
+        return report, note
+
+    def _carry(self, old_dir: Path, stage: Path, old_options: list[dict], new_options: list[dict], progress):
+        record = edit_model.load(old_dir)
+        if record.error:
+            return self._carry_unreadable(old_dir, stage, record)
+        new = edit_model.Record(rev=record.rev + 1, next=record.next)
+        report = edit_model.CarryReport()
+        number = edit_model.number_from(old_dir, record)
+        listed: dict[Path, tuple[set, dict]] = {}  # scope -> (its files, path_key -> file) as the update lists them
+        rszdata = None
+        try:
+            if any(edit_model.engine_tool(m.engine) == "data" for i in record.items for m in i.members):
+                from .modedit import rszdata as module
+
+                module.registry()
+                rszdata = module
+            for n, old in enumerate(record.items):
+                progress(n, len(record.items), f"모드 수정 다시 적용 중... {old.source.rel.rsplit('/', 1)[-1]}")
+                item = copy.deepcopy(old)
+                src = item.source
+                values = item.changes() + int(item.exclude)
+                was, item.conflict = item.conflict, ""  # (inactive since an earlier update: its option or file may be back)
+                oid = edit_model.resolve_option(new_options, src.option, src.n)
+                if oid is None:
+                    item.conflict = (f"업데이트에서 옵션 '{src.option}'이(가) 없어졌습니다" if src.option and new_options
+                                     else EDIT_OPTIONS_CHANGED)
+                    item.out = None
+                    report.conflicts += 0 if was else values
+                    new.items.append(item)
+                    continue
+                scope = stage / "options" / oid if oid else stage / "files"
+                if scope not in listed:
+                    names = set(list_files(scope)) if scope.is_dir() else set()
+                    listed[scope] = (names, {path_key(rel): rel for rel in sorted(names)})
+                names, by_key = listed[scope]
+                # the update's own spelling: one that changed only the letter case of a folder or file is the same
+                # file (Windows finds it under the old spelling too, but every key of the mod has the new one)
+                rel = src.rel if src.rel in names else by_key.get(path_key(src.rel))
+                respelled = edit_model.Source(src.option, src.n, rel or "")
+                if rel is not None and rel != src.rel and record.item(respelled) is None and new.item(respelled) is None:
+                    item.source = src = respelled  # (not when the record has an item of that spelling too)
+                key = f"{oid}/{src.rel}" if oid else src.rel
+                path = scope / src.rel
+                if rel != src.rel:
+                    if not item.members:
+                        report.dropped.append(src.label())  # (an exclusion of a file the update removed)
+                        continue
+                    item.conflict, item.out = "업데이트에서 파일이 없어졌습니다", None
+                    report.conflicts += 0 if was else values
+                    new.items.append(item)
+                    continue
+                if not item.members:  # an exclusion: kept as it is
+                    report.kept += 1
+                    new.items.append(item)
+                    continue
+                if not was and not any(m.pending for m in item.members) and \
+                        self._carry_copy(old_dir, stage, item, key, path):  # (one that waits is tried again)
+                    report.kept += values
+                    new.items.append(item)
+                    continue
+                inp = edit_build.BuildInput(len(new.items), item, key, src.rel,
+                                            edit_model.BaseRef(path, key, "stored", src.rel), path, "carry")
+                try:
+                    built = edit_build.build_item(inp, stage, number, progress)
+                except Exception as exc:  # one item must not stop the update
+                    log.warning("업데이트한 파일에 모드 수정을 다시 적용하지 못했습니다 (%s): %s", src.label(), exc,
+                                exc_info=True)
+                    built = self._failed_build(inp, f"{CARRY_FAILED}: {exc}")
+                else:
+                    self._respell_waiting(inp, built.item)
+                if built.out_path is not None:
+                    number += 1
+                given, item = item, built.item
+                for m in item.members:
+                    if m.pending and rszdata is not None and m.pending.startswith(rszdata.STALE):
+                        m.pending = CARRY_STALE
+                report.reapplied += item.changes()
+                report.conflicts += self._made_conflicts(given, item)
+                report.pending += sum(1 for m in item.members if m.pending)
+                new.items.append(item)
+        finally:
+            if rszdata is not None:
+                rszdata.release()
+        new.next = max(new.next, number)
+        new.notice = report.notice(_now())
+        edit_model.save(stage, new)
+        log.info("모드 수정을 업데이트한 파일에 옮겼습니다: %s", report.text())
+        return report, new
+
+    @staticmethod
+    def _made_conflicts(given: edit_model.Item, built: edit_model.Item) -> int:
+        """The values to check that a build of ``given`` made (``built``): the changes that became conflicts,
+        and earlier conflicts that hold another value now (or whose value went). Not the difference of the
+        counts: an earlier conflict that heals (its value back to what the change was made on) must not hide a
+        new one (#1). An earlier conflict the file only names another way now (its row key changed) is not
+        new."""
+        made = 0
+        for m in built.members:
+            old = given.member(m.member)
+            left = list(old.conflicts) if old is not None else []
+            mine = {c.at for c in old.changes} if old is not None else set()
+            for x in m.conflicts:
+                if x in left:
+                    left.remove(x)
+                    continue
+                same = None if x.change.at in mine else next(
+                    (o for o in left if (o.now, o.why, o.note) == (x.now, x.why, x.note)
+                     and replace(o.change, at=x.change.at) == x.change), None)
+                if same is not None:
+                    left.remove(same)
+                else:
+                    made += 1
+        return made
+
+    @staticmethod
+    def _carry_copy(old_dir: Path, stage: Path, item: edit_model.Item, key: str, path: Path) -> bool:
+        """The cheap path of a carry-over: the item was built on the stored file and the update did not change
+        it, so its output is copied as it is (same name and time) and its base points at the new file."""
+        base = item.base
+        if base is None or base.key.startswith(MATFIX_DIR + "/") or not base.stored_sha1:
+            return False
+        if _sha1_file(path) != base.stored_sha1:
+            return False
+        if item.out is not None:
+            old = old_dir / item.out.file
+            st = fsutil.stat_or_none(old)
+            if st is None or st.st_size != item.out.size:
+                return False
+            fsutil.copy_file(old, stage / item.out.file)
+        st = path.stat()
+        item.base = edit_model.Base(key, st.st_size, st.st_mtime_ns, base.sha1, base.stored_sha1)
+        return True
+
     # ------------------------------------------------------------- requirements
     @staticmethod
     def _stored_files(mod_dir: Path) -> dict[str, Path]:
@@ -2425,7 +3866,7 @@ class ModManager:
     def _ensure_lua_scan(self, mod: Mod) -> None:
         """Mods installed by older versions are read once for the Lua modules they need."""
         if not mod.lua_scanned:
-            mod.lua_requires = requirements.required_modules(self._stored_files(self.mod_dir(mod.id)))
+            mod.lua_requires = requirements.required_modules(self._effective_stored_files(mod.id))
             mod.lua_scanned = True
             self._write_mod_meta(mod)
             self.save()
@@ -2449,8 +3890,10 @@ class ModManager:
         if not mod.options:
             items = [(None, rel, path) for rel, (path, _key) in self.mod_entries(mod.id).items()]
         else:
+            excluded = self._edit_overlay(mod.id).excluded  # (모드 수정: left out of every option)
             items = [(o["id"], rel, self.option_dir(mod.id, o["id"]) / rel)
-                     for o in mod.options for rel in self.option_files(mod.id, o["id"])]
+                     for o in mod.options for rel in self.option_files(mod.id, o["id"])
+                     if f"{o['id']}/{rel}" not in excluded]
         return [(opt, rel, path) for opt, rel, path in items if SHADER_FILE_RE.match(rel) or is_root_pak(rel)]
 
     def _pak_hashes(self, path: Path) -> frozenset:
@@ -2471,8 +3914,8 @@ class ModManager:
     def _shader_index(self):
         """(shader key -> [(mod id, option id or None)] of the loose shader files, [(mod id, option id or None,
         file hashes)] of the PAKs, the version numbers to look for in PAKs) of every installed mod, all options
-        included (cached until a mod is installed, updated or removed)."""
-        key = tuple((m.id, m.installed_at, m.updated_at, len(m.options)) for m in self.mods)
+        included (cached until a mod is installed, updated, edited or removed)."""
+        key = tuple((m.id, m.stamp, len(m.options)) for m in self.mods)
         cached = self.__dict__.get("_shader_cache")
         if cached and cached[0] == key:
             return cached[1]
@@ -2530,8 +3973,7 @@ class ModManager:
         if record.get("format", 1) < SHADERS_FORMAT or record.get("game") != self.game_version():
             return {}
         mod = self.get(mod_id)
-        prefix = MATFIX_DIR + "/"
-        live = {key[len(prefix):] if key.startswith(prefix) else key for _path, key in self.mod_entries(mod_id).values()}
+        live = {self.source_key(key) for _path, key in self.mod_entries(mod_id).values()}
         need: dict[str, list[str]] = {}
         for r in self.material_results(mod_id):
             if r.key not in live:
@@ -2853,7 +4295,7 @@ class ModManager:
 
         deployed = self.deployed_files() if deployed is None else deployed
         return {"app": __version__, "game_version": self.game_version(), "profile": self.profile,
-                "mods": [{"id": m.id, "name": m.name, "enabled": m.enabled, "stamp": self._stamp(m),
+                "mods": [{"id": m.id, "name": m.name, "enabled": m.enabled, "stamp": m.stamp,
                           "options": [o["name"] for o in m.options if o["id"] in m.selected]}
                          for m in self.mods],
                 "owners": {e.get("path") or key: e["mod"] for key, e in deployed.items()

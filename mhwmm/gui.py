@@ -29,6 +29,8 @@ from .helptext import SECTIONS as HELP_SECTIONS
 from .manager import (InstallError, InstallSession, MaterialJob, MaterialRun, Mod, ModManager,
                       acquire_instance_lock, is_game_running, prepare_data_dir, resolve_data_dir, setup_logging)
 from .matfix import MatfixError
+from .modedit import EDITS_PREFIX, EditError, GameCopyChanged
+from .modedit import model as edit_model
 from .precheck import stuck_summary
 from .theme import THEME_NAMES, Theme, set_dark_titlebar
 from .updater import Release, UpdateError
@@ -83,10 +85,11 @@ EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, MatfixE
 
 RETARGET_TITLE = "다른 장비로 옮기기"
 RETARGET_ACTION = RETARGET_TITLE + "..."  # the 장비 외형 window's link (to 모드 수정 on that mod and equipment)
-# the window where a mod is made into a new one (retargetview.RetargetDialog: for now 다른 장비로 옮기기), opened from
-# the toolbar and the list's context menu
+# the window where a mod is changed in place (파일 고르기, 게임 수치, 스크립트 설정, 수정 내용) or made into a new one
+# (다른 장비로 옮기기): modtool.ModToolDialog, opened from the toolbar, the list's context menu and the info tab
 MOD_TOOL_TITLE = "모드 수정"
 MOD_TOOL_ACTION = MOD_TOOL_TITLE + "..."
+REAPPLY_TRIES = 2  # 모드 수정 edits built again for a mod at most this often after a change (_reapply_soon)
 
 KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
 
@@ -2700,7 +2703,7 @@ class PrecheckDialog(Dialog):
 class App:
     MUTATING_OK_DURING = (None, "deploy")
     # end with an apply: no launch meanwhile
-    FOLDER_TASKS = ("purge", "game", "remove", "refw", "install", "matfix", "retarget")
+    FOLDER_TASKS = ("purge", "game", "remove", "refw", "install", "matfix", "retarget", "modedit")
 
     def __init__(self, root: tk.Tk, manager: ModManager, events: queue.Queue):
         self.root = root
@@ -2712,7 +2715,13 @@ class App:
         self._installing = False
         self._close_after_task = False
         self._status_after_task = ""  # a line for the status bar once the running task is done (it says "준비")
-        self._retarget_waiting = 0  # 다른 장비로 옮기기 waiting for a running task to make its mod (no launch meanwhile)
+        # 모드 수정 waiting for a running task to save its changes or make its new mod (no launch meanwhile)
+        self._tool_waiting = 0
+        self._mod_tool_page: str | None = None  # the 모드 수정 tool picked last (the window opens on it again)
+        self._tool_file: dict[str, object] = {}  # 게임 수치 / 스크립트 설정: the file looked at last, by mod
+        self._reapply_after = None  # the next look for 모드 수정 edits to build again (_reapply_soon)
+        self._reapply_tried: dict[str, int] = {}  # mods built again since the last change: how many times
+        self._edit_notice_mods: list[str] = []  # updated mods whose edits could not all be applied again
         self._closed = False
         self._drag: dict | None = None
         self._preview = None
@@ -2817,6 +2826,7 @@ class App:
         if manager.settings.check_materials:
             root.after(4000, self.check_materials_background)
         root.after(9000, self.warm_equipment)
+        root.after(3000, self._reapply_soon)  # (모드 수정 edits whose files changed while the manager was closed)
 
     def _place_sash(self):
         width = self.paned.winfo_width()
@@ -2979,7 +2989,8 @@ class App:
         button("remove", "삭제", self.remove_selected, tip="Delete", padx=(0, px(14)))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(0, px(14)), pady=px(4))
         button("equipment", "장비 외형", lambda: self.show_equipment(), tip="모드가 어떤 장비의 모습을 바꾸는지 보기")
-        button("modtool", MOD_TOOL_TITLE, self.open_mod_tool, tip="고른 모드를 고쳐 새 모드 만들기 (다른 장비로 옮기기)")
+        button("modtool", MOD_TOOL_TITLE, lambda: self.open_mod_tool(),
+               tip="고른 모드 고치기: 파일 고르기 · 게임 수치 · 스크립트 설정 · 다른 장비로 옮기기")
 
         # the widgets on the right in one frame, as in the header (made after the ones on the left: Tab goes
         # through widgets in the order they were made)
@@ -3253,6 +3264,8 @@ class App:
         info.tag_bind("equip_show", "<Button-1>",
                       lambda e: self.show_equipment(self._selected_mod().id if self._selected_mod() else None))
         info.tag_bind("nexus_search", "<Button-1>", lambda e: self._search_nexus())
+        info.tag_bind("modedit_show", "<Button-1>",
+                      lambda e: self.open_mod_tool(self._selected_mod().id, "summary") if self._selected_mod() else None)
         for action in ("check", "repair", "restore", "report"):
             info.tag_bind(f"matfix_{action}", "<Button-1>", lambda e, action=action: self._material_action(action))
         info.tag_bind("link", "<Enter>", lambda e: info.configure(cursor="hand2"))
@@ -3940,32 +3953,38 @@ class App:
         self.equipment_window = EquipmentWindow(self, mod_id)
 
     def editable(self, mod: Mod) -> bool:
-        """Can 모드 수정 work on the mod: one with game files (in natives or a .pak), not REFramework itself (the
-        window says when nothing of them can be moved)."""
-        return mod.origin != refw.ORIGIN and bool(self.manager.mod_kinds(mod.id) & {"loose", "pak"})
+        """Can 모드 수정 work on the mod: any mod with files (also one whose options are not chosen yet or whose files
+        are all left out), not REFramework itself (the window says what each tool can do with it)."""
+        if mod.origin == refw.ORIGIN:
+            return False
+        m = self.manager
+        if mod.options or m.mod_files(mod.id):
+            return True
+        try:
+            return bool(m.excluded_files(mod.id))
+        except Exception as exc:  # (an edit record that cannot be read: the window says so)
+            log.debug("뺀 파일을 알지 못했습니다: %s", exc)
+            return False
 
-    def open_mod_tool(self):
-        """모드 수정 (the toolbar's button): the window on the first mod selected in the list that it can work on,
-        else on the first one selected (the window says what it cannot do with it), else on the first mod it can
-        work on that the list shows (then of all; another one can be picked in the window)."""
-        if self._search_blocks() or not self.can_mutate():
-            return
+    def _tool_mod(self) -> str | None:
+        """The mod 모드 수정 opens on from the toolbar: the first mod selected in the list that it can work on, else
+        the first one selected, else the first mod it can work on that the list shows (then of all)."""
         ids = [mod.id for mod in self.manager.mods if self.editable(mod)]
         if not ids:
-            messagebox.showinfo(MOD_TOOL_TITLE, "고칠 수 있는 모드가 없습니다. 게임 파일(natives 폴더나 .pak 파일)이 든 모드를 "
-                                                "추가하면 고칠 수 있습니다.", parent=self.root)
-            return
+            return None
         selected = [i for i in self._selected_ids() if self.manager.get(i).origin != refw.ORIGIN]
         shown = set(self.tree.get_children())
-        mod_id = next((i for i in ids if i in selected), None) or next(iter(selected), None) or \
+        return next((i for i in ids if i in selected), None) or next(iter(selected), None) or \
             next((i for i in ids if i in shown), ids[0])
-        self.open_retarget(mod_id)
 
-    def open_retarget(self, mod_id: str, source=None, parent=None):
-        """모드 수정 (for now 다른 장비로 옮기기): the window on mod ``mod_id`` (over ``parent``, by default the main
-        window; ``source``: the equipment picked first), then the new mod made from the files of the mod picked
-        in it (it may be another one) for the equipment chosen. Over another window (장비 외형) a refusal is told
-        there: the main window's status bar may be hidden."""
+    def open_mod_tool(self, mod_id: str | None = None, page: str | None = None, source=None, parent=None,
+                      pending=None):
+        """모드 수정: the window on mod ``mod_id`` (None: the toolbar's choice, _tool_mod) with the tool ``page``
+        (modtool.TOOLS; None: the one that fits, the last used first) over ``parent`` (by default the main window;
+        ``source``: the equipment 다른 장비로 옮기기 starts from; ``pending``: the changes of a save that failed,
+        shown again), then what was chosen in it for the mod picked last: a new mod made (_create_retarget) or the
+        changes saved (_commit_edits). Over another window (장비 외형) a refusal is told there: the main window's
+        status bar may be hidden."""
         window = parent if parent is not None and parent is not self.root else None
         if window is None:
             if self._search_blocks() or not self.can_mutate():
@@ -3974,30 +3993,58 @@ class App:
             messagebox.showinfo(bisect.TITLE, bisect.BLOCKED, parent=window)
             return
         elif not self.can_mutate():
-            messagebox.showinfo(RETARGET_TITLE, "다른 작업이 진행 중입니다. 작업이 끝난 뒤에 다시 시도하세요.", parent=window)
+            messagebox.showinfo(RETARGET_TITLE if page == "retarget" else MOD_TOOL_TITLE,
+                                "다른 작업이 진행 중입니다. 작업이 끝난 뒤에 다시 시도하세요.", parent=window)
             return
+        if mod_id is None:
+            mod_id = self._tool_mod()
+            if mod_id is None:
+                messagebox.showinfo(MOD_TOOL_TITLE, "고칠 수 있는 모드가 없습니다. 모드를 추가하면 고칠 수 있습니다.",
+                                    parent=window or self.root)
+                return
         if not any(m.id == mod_id for m in self.manager.mods):
             return
-        from .retargetview import RetargetDialog  # imports this module
+        from . import modtool  # imports this module
+        from .retargetview import Choice
 
-        dialog = RetargetDialog(parent or self.root, self, mod_id, source)
-        choice = dialog.show()
-        if choice is not None:
-            self._create_retarget(dialog.mod_id, choice)  # (the mod picked last)
+        dialog = modtool.ModToolDialog(parent or self.root, self, mod_id, page=page, source=source, pending=pending)
+        result = dialog.show()
+        # (only a tool the user picked in it: not one a link or the update asked for, nor 수정 내용)
+        self._mod_tool_page = getattr(dialog, "picked", "") or self._mod_tool_page
+        if isinstance(result, Choice):
+            self._create_retarget(dialog.mod_id, result)  # (the mod picked last)
+        elif isinstance(result, modtool.EditChoice):
+            self._commit_edits(result)
+
+    def open_retarget(self, mod_id: str, source=None, parent=None):
+        """모드 수정 on 다른 장비로 옮기기 for mod ``mod_id`` (``source``: the equipment picked first; the 장비 외형
+        window's link, over that window)."""
+        self.open_mod_tool(mod_id, page="retarget", source=source, parent=parent)
+
+    @property
+    def _retarget_waiting(self) -> int:
+        """(The older name of _tool_waiting.)"""
+        return self._tool_waiting
+
+    @_retarget_waiting.setter
+    def _retarget_waiting(self, value: int):
+        self._tool_waiting = value
 
     def _create_retarget(self, mod_id: str, choice, waited: bool = False):
-        """Make the mod the dialog chose once no other task runs (an apply may have started meanwhile). While
-        it waits the game does not start (_retarget_waiting, as during the task: FOLDER_TASKS)."""
-        if waited:
-            self._retarget_waiting -= 1
+        """Make the mod the dialog chose once no other task runs (an apply may have started meanwhile). Until its
+        task starts or it is given up it waits (_tool_waiting): the game does not start meanwhile (as during the
+        task: FOLDER_TASKS), and the app asked to close waits for it."""
+        if not waited:
+            self._tool_waiting += 1
         if self._closed or not any(m.id == mod_id for m in self.manager.mods):
+            self._tool_given_up()
             return
         if self.busy is not None or self._installing:
             self.status_var.set("진행 중인 작업이 끝나면 새 모드를 만듭니다...")
-            self._retarget_waiting += 1
             self.root.after(200, lambda: self._create_retarget(mod_id, choice, waited=True))
             return
         if self._search_blocks():
+            self._tool_given_up()
             return
         m = self.manager
         original = m.get(mod_id)
@@ -4030,10 +4077,210 @@ class App:
             self.warm_equipment()
 
         def failed(exc):
-            self.show_error(RETARGET_TITLE, f"새 모드를 만들지 못했습니다.\n\n{exc}")
+            self._tool_waiting += 1  # (under the message box the app's timers run: nothing goes on meanwhile)
+            try:
+                self.show_error(RETARGET_TITLE, f"새 모드를 만들지 못했습니다.\n\n{exc}")
+            finally:
+                self._tool_waiting -= 1
             self.refresh(select=mod_id)
 
+        self._tool_waiting -= 1  # (its task runs now: busy)
         self.run_task("retarget", f"새 모드 만드는 중: {name}", work, on_done=done, on_error=failed)
+
+    def _commit_edits(self, choice, waited: bool = False, agreed: frozenset = frozenset()):
+        """Save the changes the 모드 수정 window chose (modtool.EditChoice) once no other task runs: checked and
+        planned here (manager.edit_job), the files built on another thread (build_edit), then put in place and
+        recorded here (finish_edit). Until its task starts or it is given up it waits (_tool_waiting), its
+        questions too (the app's timers run under a message box: another task may start and end meanwhile): the
+        game does not start, the app asked to close once the work is done (on_close) waits for it, and so do the
+        next 수정 내용 after an update (_open_edit_notices). A save that fails opens the window again with the
+        changes in it (the app stays open), and waits until then. ``agreed``: the game folder's changed copies
+        the user said may be reverted (GameCopyChanged: not asked again when it waits once more)."""
+        if not waited:
+            self._tool_waiting += 1
+        plan = choice.plan
+        mod_id = plan.mod_id
+        if self._closed or not any(m.id == mod_id for m in self.manager.mods):
+            self._tool_given_up()
+            return
+        if self.busy is not None or self._installing:
+            self.status_var.set("진행 중인 작업이 끝나면 모드 수정을 저장합니다...")
+            self.root.after(200, lambda: self._commit_edits(choice, waited=True, agreed=agreed))
+            return
+        if self._search_blocks():
+            self._tool_given_up()
+            return
+        m = self.manager
+        mod = m.get(mod_id)
+        name = mod.name
+
+        def reopen():  # (waiting until the window is open again: _tool_waiting held by the caller)
+            if self._closed:
+                self._tool_waiting -= 1
+                return
+            if self.busy not in self.MUTATING_OK_DURING or self._installing or self._modal_open():
+                self.root.after(200, reopen)  # (it could not open now: another task or window)
+                return
+            self._tool_waiting -= 1
+            if self._close_after_task:  # (the changes would be lost with the app: it stays open, the window again)
+                self._close_after_task = False
+                log.info("모드 수정을 저장하지 못해 종료하지 않았습니다")
+            self.open_mod_tool(mod_id, choice.page, pending=plan)
+
+        def unresolved() -> bool:
+            """After a message box (the app's timers ran under it): the save waits again when a task started
+            meanwhile; True when it does not go on now."""
+            if self._closed:
+                self._tool_waiting -= 1
+                return True
+            if self.busy is not None or self._installing:
+                self.root.after(200, lambda: self._commit_edits(choice, waited=True, agreed=agreed))
+                return True
+            return False
+
+        try:
+            try:
+                job = m.edit_job(plan)
+            except GameCopyChanged as exc:
+                if not set(exc.rels) <= agreed:
+                    shown = "\n".join(f"• {rel}" for rel in exc.rels[:8])
+                    if len(exc.rels) > 8:
+                        shown += f"\n… 외 {len(exc.rels) - 8}개"
+                    if not messagebox.askyesno(
+                            MOD_TOOL_TITLE, f"게임 폴더의 다음 파일은 매니저가 넣은 뒤에 바뀌었습니다:\n{shown}\n\n되돌리면 "
+                                            "게임 폴더의 이 파일은 모드의 원래 파일로 바뀝니다. 게임에서 바꾼 파일은 데이터 폴더의 "
+                                            "edited 폴더에 따로 보관하지만 게임에는 들어가지 않습니다. 되돌릴까요?", parent=self.root):
+                        self.root.after(1, reopen)
+                        return
+                    agreed = agreed | frozenset(exc.rels)
+                    if unresolved():
+                        return
+                job = m.edit_job(plan, force=True)
+        except EditError as exc:
+            self.show_error(MOD_TOOL_TITLE, str(exc))
+            self.root.after(1, reopen)
+            return
+        except Exception as exc:  # (one the check did not expect: as a save that failed, never left waiting)
+            log.error("모드 수정을 저장하지 못했습니다:\n%s", traceback.format_exc())
+            self.show_error(MOD_TOOL_TITLE, f"모드 수정을 저장하지 못했습니다.\n\n{exc}")
+            self.root.after(1, reopen)
+            return
+
+        def failed(exc):  # (one the build did not expect is in the log with its traceback: _poll_events)
+            self._tool_waiting += 1  # (until the window is open again)
+            try:
+                self.show_error(MOD_TOOL_TITLE, f"모드 수정을 저장하지 못했습니다.\n\n{exc}")
+                self.refresh(select=mod_id)
+            finally:  # (never left waiting)
+                self.root.after(1, reopen)
+
+        def done(built):
+            try:
+                res = m.finish_edit(built)
+            except Exception as exc:  # (its own checks: the mod changed meanwhile, the post-check)
+                if not isinstance(exc, EXPECTED_ERRORS):
+                    log.error("모드 수정을 저장하지 못했습니다:\n%s", traceback.format_exc())
+                failed(exc)
+                return
+            for note in res.notes:
+                log.info("'%s': %s", name, note)
+            self.refresh(select=mod_id)
+            if not self.tree.exists(mod_id):  # (hidden by the search or a filter)
+                self.show_mod(mod_id)
+            self.status_var.set(f"모드 수정을 저장했습니다: {name}" + (f" ({res.summary})" if res.summary else ""))
+            if res.deploy:
+                if m.settings.auto_apply and m.game_dir:  # (the apply's end would say "준비" at once)
+                    self._status_after_task = self.status_var.get()
+                self.request_apply()
+            if res.materials:  # (files left out or put back: the material check sees what the game gets; values
+                self.check_materials_background()  # never change a material's verdict)
+            if res.equipment:
+                self.warm_equipment()
+            if res.lua:
+                self._check_requirements_of(m.get(mod_id))
+            self._reapply_soon()  # (다시 적용 asked for: what is still waiting)
+
+        gc.collect()  # (here: tk objects left for the collector must not be freed on the worker thread)
+        self._tool_waiting -= 1  # (its task runs now: busy)
+        self.run_task("modedit", f"모드 수정 저장 중: {name}", lambda p: m.build_edit(job, p), on_done=done,
+                      on_error=failed)
+
+    def _tool_given_up(self) -> None:
+        """A 모드 수정 save or new mod that waited (_tool_waiting) will not run: the app asked to close may now."""
+        self._tool_waiting -= 1
+        self._close_when_done()
+
+    def _reapply_soon(self, retry: bool = False):
+        """Build again the 모드 수정 edits that wait for it (their file changed: an update, a material repair accepted
+        or undone, a file of the mod's folder changed by hand), once nothing else runs, never during 원인 모드 찾기.
+        ``retry``: a look of its own after a run (not after a change: those start the count again): a mod is built
+        again at most REAPPLY_TRIES times (a run may be dropped because the mod changed meanwhile), else one that
+        keeps waiting would be built over and over."""
+        if not retry:
+            self._reapply_tried.clear()
+        if self._reapply_after is not None:
+            self.root.after_cancel(self._reapply_after)
+            self._reapply_after = None
+        if self._closed or self._bisect is not None or self._bisect_preparing:
+            return
+        m = self.manager
+        try:
+            ids = [i for i in m.edits_pending() if self._reapply_tried.get(i, 0) < REAPPLY_TRIES]
+        except Exception as exc:
+            log.warning("다시 적용할 모드 수정이 있는지 알지 못했습니다: %s", exc)
+            return
+        if not ids:
+            return
+        if self.busy is not None or self._installing or self._tool_waiting or self._modal_open():
+            self._reapply_after = self.root.after(1000, lambda: self._reapply_soon(retry=True))
+            return
+        jobs = []
+        for mod_id in ids:
+            self._reapply_tried[mod_id] = self._reapply_tried.get(mod_id, 0) + 1
+            try:
+                job = m.reapply_job(mod_id)
+            except Exception as exc:
+                log.warning("'%s': 모드 수정을 다시 적용할 준비를 하지 못했습니다: %s", m.get(mod_id).name, exc)
+                continue
+            if job is not None:
+                jobs.append(job)
+        if not jobs:
+            return
+
+        def done(built):
+            names, conflicts, deploy, equipment = [], 0, False, False
+            for job in built:
+                try:
+                    res = m.finish_edit(job)
+                except Exception as exc:
+                    log.warning("'%s': 모드 수정을 다시 적용하지 못했습니다: %s", job.name, exc)
+                    continue
+                if res.changed:
+                    names.append(job.name)
+                    conflicts += res.conflicts
+                deploy, equipment = deploy or res.deploy, equipment or res.equipment
+                if res.lua:
+                    self._check_requirements_of(m.get(job.mod_id))
+            self.refresh()
+            if names:
+                line = f"모드 수정을 다시 적용했습니다: {', '.join(names)}"
+                self.status_var.set(line + (f" · 확인할 값 {conflicts}개" if conflicts else ""))
+                log.info("%s", self.status_var.get())
+            if deploy:
+                if m.settings.auto_apply and m.game_dir and names:
+                    self._status_after_task = self.status_var.get()
+                self.request_apply()
+            if equipment:
+                self.warm_equipment()
+            self._reapply_after = self.root.after(1000, lambda: self._reapply_soon(retry=True))
+
+        def failed(exc):
+            log.warning("모드 수정을 다시 적용하지 못했습니다: %s", exc)
+
+        log.info("모드 수정을 다시 적용합니다: %s", ", ".join(job.name for job in jobs))
+        gc.collect()  # (here: tk objects left for the collector must not be freed on the worker thread)
+        self.run_task("modedit", "모드 수정 다시 적용 중...", lambda p: [m.build_edit(job, p) for job in jobs],
+                      on_done=done, on_error=failed)
 
     def show_mod(self, mod_id: str):
         """Select a mod in the list (clearing a search or filter that hides it) and show its info."""
@@ -4169,6 +4416,17 @@ class App:
             errors = sum(1 for r in results if r.state == "error")
             if errors:
                 chunks.append((f"\t읽지 못한 파일 {errors}개 (자세한 내용은 로그)\n", ("value", "muted")))
+        edits = self._edit_summary(mod.id)
+        if edits is not None and not edits.empty:
+            problem = edits.problem()
+            chunks.append(("수정\t", "key"))
+            if edits.error:
+                chunks += [("✕ ", ("value", "req_missing")), (f"{problem}   ", "value")]
+            else:
+                chunks.append((f"{edits.text()}   ", "value"))
+            chunks += [("모드 수정에서 보기", ("value", "link", "modedit_show")), ("\n", "value")]
+            if problem and not edits.error:
+                chunks += [("\t✕ ", ("value", "req_missing")), (f"{problem}\n", "value")]
         looks = m.equipment_summary(mod.id)
         for i, text in enumerate(looks[:4]):
             chunks += [("외형\t" if i == 0 else "\t", "key"), (f"{text}\n", "value")]
@@ -4498,10 +4756,40 @@ class App:
             self.preview_label.configure(image="")
             self.preview_label.pack_forget()
 
+    def _edit_summary(self, mod_id: str):
+        """What 모드 수정 changed in the mod (model.EditSummary), None when that could not be read."""
+        try:
+            return self.manager.edit_summary(mod_id)
+        except Exception as exc:
+            log.debug("모드 수정 내용을 읽지 못했습니다: %s", exc)
+            return None
+
+    def _edit_waiting(self, mod: Mod) -> dict[str, str]:
+        """Source keys of the mod whose 모드 수정 edits are not in the game now -> what the files tab says: waiting
+        to be built again, or that they could not be applied (the game gets the file without them)."""
+        edits = self._edit_summary(mod.id)
+        if edits is None or not (edits.waiting or edits.pending):
+            return {}
+        out = {}
+        try:
+            if edits.pending:
+                for item in self.manager.edit_items(mod.id):
+                    key = edit_model.key_of(mod.options, item.source) if item.state == "pending" else None
+                    if key is not None:
+                        out[key] = "다시 적용하지 못함"
+            if edits.waiting:
+                out.update(dict.fromkeys(self.manager.edits_waiting(mod.id), "다시 적용 대기"))
+        except Exception as exc:
+            log.debug("모드 수정 내용을 읽지 못했습니다: %s", exc)
+        return out
+
     def _fill_files(self, mod: Mod, files: list[str]):
         deployed = self.manager.deployed_files()
         by_source = {(e.get("mod"), e.get("src")): e["path"] for e in deployed.values()}
         entries = self.manager.mod_entries(mod.id)
+        waiting = self._edit_waiting(mod)
+        repaired = self.manager.repaired_materials(mod.id) if any(
+            key.startswith(EDITS_PREFIX) for _path, key in entries.values()) else {}
         if mod.needs_option:
             self.files_tree.insert("", "end", values=("선택된 옵션이 없습니다 — '옵션' 탭에서 옵션을 켜세요", ""),
                                    tags=("attention",))
@@ -4526,12 +4814,28 @@ class App:
                 if conflicts and key in conflicts.owners:
                     status += " (우선)"
                 tag = "" if applied else "pending"
-            if rel in entries and entries[rel][1].startswith("matfix/"):
+            key = entries[rel][1] if rel in entries else rel
+            if key.startswith("matfix/"):
                 status += " · 재질 복구본"
+            elif key.startswith(EDITS_PREFIX):  # (built on the repair when there is one)
+                status += " · 재질 복구본 · 수정본" if key[len(EDITS_PREFIX):] in repaired else " · 수정본"
+            source = key.split("/", 1)[1] if key.startswith(("matfix/", EDITS_PREFIX)) else key
+            if source in waiting:
+                status += f" · {waiting[source]}"
             tags = [t for t in (tag, "odd" if i % 2 else "") if t]
             self.files_tree.insert("", "end", values=(rel, status), tags=tags)
         if len(files) > MAX_FILE_ROWS:
             self.files_tree.insert("", "end", values=(f"... 외 {len(files) - MAX_FILE_ROWS}개", ""))
+        try:  # files left out with 모드 수정: last, muted
+            excluded = self.manager.excluded_files(mod.id)
+        except Exception as exc:
+            log.debug("뺀 파일을 알지 못했습니다: %s", exc)
+            excluded = []
+        for rel in excluded[:MAX_FILE_ROWS]:
+            self.files_tree.insert("", "end", values=(rel, "뺌 (모드 수정)"), tags=("disabled",))
+        if len(excluded) > MAX_FILE_ROWS:
+            self.files_tree.insert("", "end", values=(f"... 뺀 파일 외 {len(excluded) - MAX_FILE_ROWS}개", ""),
+                                   tags=("disabled",))
 
     def _fill_conflicts(self, mod: Mod):
         names = {x.id: x.name for x in self.manager.mods}
@@ -4670,8 +4974,7 @@ class App:
     def _after_task(self):
         if self._closed:
             return
-        if self.busy is None and self._close_after_task:
-            self._destroy()
+        if self._close_when_done():
             return
         if self.busy is None and self._apply_pending and not self._installing:
             self._apply_pending = False
@@ -4816,6 +5119,9 @@ class App:
             if self._apply_pending:
                 self._apply_pending = False
                 self.apply()
+            self._reapply_soon()  # (edits carried over that wait for their file: built once nothing else runs)
+            if self._edit_notice_mods:  # 수정 내용 of the updated mods, as the user asked (after every install)
+                self.root.after(1, self._open_edit_notices)
             return
         self._installing = True
         path = self._install_queue.pop(0)
@@ -4827,6 +5133,51 @@ class App:
 
         self.run_task("install", f"압축 푸는 중: {name}", lambda p: self.manager.prepare_install(path),
                       on_done=self._on_prepared, on_error=failed)
+
+    def _open_edit_notices(self):
+        """수정 내용 of each updated mod the user asked to check (_tell_carried_edits), one window after another:
+        the next once the one before is closed and what was saved in it has run, or is open again after the save
+        failed (_tool_waiting holds until then, its message boxes too: the app's timers run under them)."""
+        if self._closed or not self._edit_notice_mods:
+            return
+        if self._bisect is not None or self._bisect_preparing:  # (원인 모드 찾기 started meanwhile: the info tab links)
+            self._edit_notice_mods.clear()
+            return
+        if self.busy not in self.MUTATING_OK_DURING or self._installing or self._tool_waiting or self._modal_open():
+            self.root.after(200, self._open_edit_notices)
+            return
+        mod_id = self._edit_notice_mods.pop(0)
+        if any(m.id == mod_id for m in self.manager.mods):
+            self.open_mod_tool(mod_id, "summary")
+        if self._edit_notice_mods:
+            self.root.after(1, self._open_edit_notices)
+
+    def _tell_carried_edits(self, mod: Mod):
+        """After an update of a mod changed with 모드 수정: what could not be applied to the new files is offered in
+        수정 내용 (opened once the installs are done), else the status line says the edits were applied again."""
+        try:
+            notice = self.manager.edit_record(mod.id).notice
+        except Exception as exc:
+            log.debug("모드 수정 기록을 읽지 못했습니다: %s", exc)
+            return
+        if not notice or notice.get("kind") != "update":
+            return
+        report = edit_model.CarryReport.from_notice(notice)
+        total = report.kept + report.reapplied + report.problems
+        if report.problems:
+            what = (f"{report.error}." if report.error else
+                    f"수정 {total}개 가운데 {report.problems}개를 새 파일에 다시 적용하지 못했습니다.")
+            if messagebox.askyesno(MOD_TOOL_TITLE, f"'{mod.name}' 업데이트: {what} 지금 모드 수정 → 수정 내용에서 "
+                                                   "확인할까요?", parent=self.root):
+                self._edit_notice_mods.append(mod.id)
+            return
+        line = f"업데이트하며 모드 수정을 다시 적용했습니다 (수정 {total}개)"  # (files left out count too)
+        log.info("'%s': %s", mod.name, line)
+        self.status_var.set(line)
+        try:
+            self.manager.drop_edit_notice(mod.id)  # (told)
+        except Exception as exc:
+            log.debug("모드 수정 알림을 지우지 못했습니다: %s", exc)
 
     def _on_prepared(self, session: InstallSession):
         variants = session.variants
@@ -4848,10 +5199,12 @@ class App:
         if existing:
             why = (f"'{existing.name}' 모드가 이미 있습니다." if self.manager.find_by_name(package) is existing else
                    f"'{existing.name}' 모드와 같은 Nexus 모드 페이지에서 받은 같은 이름의 파일입니다.")
+            edits = self._edit_summary(existing.id)
+            carried = "\n(이 모드에서 수정한 내용은 새 파일에 다시 적용합니다.)" if edits is not None and not edits.empty else ""
             answer = messagebox.askyesnocancel(
                 "이미 설치된 모드",
-                f"{why}\n\n예: 기존 모드를 새 파일로 교체 (업데이트)\n아니요: 별도의 모드로 추가\n취소: 설치하지 않음",
-                parent=self.root)
+                f"{why}\n\n예: 기존 모드를 새 파일로 교체 (업데이트){carried}\n아니요: 별도의 모드로 추가\n"
+                "취소: 설치하지 않음", parent=self.root)
             if answer is None:
                 session.cleanup()
                 self.root.after(1, self._next_install)
@@ -4876,6 +5229,8 @@ class App:
                 self.request_apply()
             self._check_requirements_of(mod)
             self._first_check.add(mod.id)
+            if replace_id:
+                self._tell_carried_edits(mod)
             self.root.after(1, self._next_install)
 
         def failed(exc):
@@ -5304,7 +5659,7 @@ class App:
                 menu.add_command(label="저장된 모드 폴더 열기", command=self.open_mod_folder)
                 menu.add_command(label="장비 외형 보기", command=lambda: self.show_equipment(ids[0]))
                 if self.editable(mods[0]):
-                    menu.add_command(label=MOD_TOOL_ACTION, command=lambda: self.open_retarget(ids[0]))
+                    menu.add_command(label=MOD_TOOL_ACTION, command=lambda: self.open_mod_tool(ids[0]))
                 if mods[0].origin != refw.ORIGIN:
                     menu.add_separator()
                     if mods[0].update:
@@ -5426,6 +5781,8 @@ class App:
             self.refresh()
             if any(mod.enabled for mod in changed):
                 self.request_apply()
+            if changed:  # (repairs no longer needed dropped: edits built on them are built again)
+                self._reapply_soon()
             if run.registry_updated:
                 self._matfix_again = True  # check what could not be repaired again with the new data
             fresh = [j.mod_id for j in jobs if j.mod_id in self._first_check and self._checked_now(run, j)
@@ -5514,7 +5871,7 @@ class App:
             mod = self.manager.get(job.mod_id)
         except KeyError:
             return True
-        return job.mod_id in run.results and f"{mod.installed_at}|{mod.updated_at}" == job.stamp
+        return job.mod_id in run.results and mod.files_stamp == job.stamp
 
     def _log_shader_requirements(self, run: MaterialRun, jobs: list[MaterialJob]):
         """Where the shaders come from that the checked mods' materials use and the game does not have
@@ -5625,6 +5982,7 @@ class App:
                 self.root.after(500, self.check_materials_background)
             if any(mod.enabled for mod in changed):
                 self.request_apply()
+            self._reapply_soon()  # (모드 수정 edits on the repaired files: built again on them)
             fixed = sum(1 for j in jobs if m.material_state(j.mod_id) == "repaired")
             failed = len(run.errors) + sum(1 for rs in run.results.values() for r in rs if r.state == "error")
             if fixed:
@@ -5670,6 +6028,7 @@ class App:
         if self.manager.restore_materials(mod_id):
             log.info("'%s': 원래 재질 파일로 되돌렸습니다", mod.name)
             self._changed(select=mod_id)
+            self._reapply_soon()  # (모드 수정 edits: built again on the mod's own files)
         else:
             self.refresh(select=mod_id)
 
@@ -5902,7 +6261,7 @@ class App:
         if self.busy == "deploy":  # its done handler starts the game (after looking again)
             self._launch_after_apply = True
             return
-        if self.busy in self.FOLDER_TASKS or self._installing or self._retarget_waiting:
+        if self.busy in self.FOLDER_TASKS or self._installing or self._tool_waiting:
             log.info("다른 작업 중이라 게임을 실행하지 않았습니다. 작업이 끝난 뒤 다시 실행하세요.")
             self.status_var.set("작업이 끝난 뒤에 다시 시도하세요.")
             self._precheck_answered = None
@@ -6674,6 +7033,7 @@ class App:
         self.warm_equipment()
         if self.manager.game_dir:
             self.apply()
+        self._reapply_soon()  # (모드 수정 edits that waited during the search)
         if restored:
             self.status_var.set(restored)
             if self.busy is not None or self._apply_pending:  # (the deploy's end would replace it with "준비" at once)
@@ -6682,7 +7042,7 @@ class App:
 
     # ------------------------------------------------------------------ closing
     def on_close(self):
-        if self.busy:
+        if self.busy or self._tool_waiting:  # (a task, or a 모드 수정 save or a new mod waiting for one)
             if messagebox.askyesno("종료", "작업이 끝나면 종료할까요?", parent=self.root):
                 self._close_after_task = True
             return
@@ -6695,6 +7055,14 @@ class App:
                 self.apply()
                 return
         self._destroy()
+
+    def _close_when_done(self) -> bool:
+        """The app asked to close once its work is done (on_close) closes when no task runs and nothing waits to
+        run one (a 모드 수정 save or a new mod chosen while a task ran: _tool_waiting): True when it closed."""
+        if self._closed or not self._close_after_task or self.busy is not None or self._tool_waiting:
+            return False
+        self._destroy()
+        return True
 
     def _destroy(self):
         self.watcher.stop()
