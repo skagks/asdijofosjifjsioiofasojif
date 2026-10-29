@@ -552,13 +552,18 @@ def test_files_page_keeps_its_width_when_its_table_scrolls(root):
 
 
 @pytest.mark.parametrize("key_", ["files", "data", "summary"])
-def test_a_table_bar_while_the_window_was_bigger_leaves_the_panel_its_width(root, key_):
+def test_a_table_bar_while_the_window_was_bigger_leaves_the_panel_its_width(root, key_, monkeypatch):
     """The window made bigger (ttk stretches the table's columns to fill it), the table's scroll bar hidden or shown
     (a search; on 수정 내용 fewer lines), the window made smaller again, in either order: the page still asks for the
     width it was made with, so the panel beside the table is there at its width and in its place (were the table to
     ask for its stretched width, the panel would be squeezed or gone once the window is smaller)."""
+    from mhwmm import modtool
+
     scaling = root.tk.call("tk", "scaling")
-    root.tk.call("tk", "scaling", 4 / 3)  # (100%: the window as made fits the tests' screen, 1280 pixels wide)
+    root.tk.call("tk", "scaling", 4 / 3)  # (100%: the window as made fits a 1366x768 screen)
+    # (the room of a 1366x768 screen whatever the test machine's: the Windows CI's screen is narrower)
+    monkeypatch.setattr(modtool.ModToolDialog, "_room", lambda self: self.theme.px(688))
+    monkeypatch.setattr(modtool.ModToolDialog, "_room_width", lambda self: self.theme.px(1350))
     m = FakeManager()
     mod = FakeMod("many", "Many")
     rels = [f"natives/STM/Art/x/file{i:03}.tex.241106027" for i in range(60)]

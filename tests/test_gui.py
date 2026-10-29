@@ -1155,9 +1155,12 @@ def test_gui_a_pause_in_the_drag_lays_the_window_out_once(root, manager, monkeyp
     monkeypatch.setattr(gui, "_pointer", lambda: pointer)  # (without it, on Windows the mouse would say "up")
     manager.settings.auto_apply = False
     manager.settings.remember_window = False
+    scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    # (before the window gets its size: Windows keeps a window within the screen unless told otherwise, and the
+    # CI's screen is narrower than the window's minimum width, so every step of the drag would be refused)
+    root.maxsize(int(round(4000 * scale)), int(round(3000 * scale)))
     app = gui.App(root, manager, queue.Queue())
     px = app.theme.px
-    root.maxsize(px(4000), px(3000))  # (Windows keeps a window within the screen unless told otherwise)
     pump(root, lambda: root.winfo_width() > 1 and app.content.winfo_width() == root.winfo_width())
     _quiet(root, 1.2)
     width, height = root.winfo_width(), root.winfo_height()
