@@ -145,6 +145,8 @@ class ModState:
     needs_option: bool = False
     missing: Sequence[str] = ()  # names of requirements missing or off (enabled mods only)
     material_state: str = ""  # manager.material_state (enabled mods only)
+    # "stale" after a game update: repairs made for the older version are in use (manager.material_repairs_outdated)
+    repairs_outdated: bool = False
     after_update: bool = False  # "unchecked" because the game was updated since its last check (not never checked)
     stuck: Sequence[dict] = ()  # manager.material_stuck: [{"label", "kind", "reason"}]
     hidden: bool = False  # every file loses to other mods
@@ -189,6 +191,11 @@ def _digest(text: str) -> str:
 
 
 # ---- the mods' own problems ------------------------------------------------------------------------
+# a stale mod's line when its repairs are from before a game update (ModState.repairs_outdated)
+REPAIRS_OUTDATED = ("게임이 업데이트되어 전에 복구한 재질·.user·.pfb 파일을 다시 복구해야 합니다 (오른쪽 클릭 → 재질 복구). "
+                    "다시 복구할 때까지는 전에 복구한 파일을 그대로 씁니다")
+
+
 def mod_problems(mods: Sequence[ModState]) -> dict[str, list[str]]:
     """Why each enabled mod cannot fully work: {mod id: [reason]} (the main list's ⚠ marks and tooltips)."""
     problems: dict[str, list[str]] = {}
@@ -200,7 +207,9 @@ def mod_problems(mods: Sequence[ModState]) -> dict[str, list[str]]:
             reasons.append("옵션을 하나도 켜지 않아 아무 파일도 적용되지 않습니다")
         if mod.missing:
             reasons.append("필요한 모드가 없거나 꺼져 있습니다: " + ", ".join(mod.missing))
-        if mod.material_state == "stale":
+        if mod.material_state == "stale" and mod.repairs_outdated:
+            reasons.append(REPAIRS_OUTDATED)
+        elif mod.material_state == "stale":
             reasons.append("재질이나 .user·.pfb 파일이 현재 게임과 맞지 않습니다 (오른쪽 클릭 → 재질 복구)")
         if mod.stuck:
             reasons.append(f"현재 게임과 맞지 않지만 고칠 수 없는 {stuck_summary(mod.stuck)}이 있어 게임이 멈출 수 "
@@ -230,11 +239,24 @@ def mod_issues(mods: Sequence[ModState], unchecked: bool = True, checking: bool 
         out.append(Issue(kind, level, text, detail(found) if detail else [], [m.id for m in found], action,
                          items=[item(m) if item else f"{m.id}|{m.stamp}" for m in found]))
 
-    group("material", "high", [m for m in on if m.material_state == "stale"],
-          lambda m: f"'{m.name}'의 재질·.user·.pfb 파일이 현재 게임과 맞지 않습니다 → 재질 복구를 해 보세요. 그대로 두면 "
-                    "텍스처가 깨지거나 게임이 검은 화면에서 멈출 수 있습니다.",
-          lambda n, names: f"재질·.user·.pfb 파일이 현재 게임과 맞지 않는 모드 {n}개: {names} → 재질 복구를 해 보세요. "
-                           "그대로 두면 텍스처가 깨지거나 게임이 검은 화면에서 멈출 수 있습니다.", "matfix")
+    stale = [m for m in on if m.material_state == "stale"]
+    redo = [m for m in stale if m.repairs_outdated]
+    if redo and len(redo) == len(stale):
+        group("material", "high", stale,
+              lambda m: f"게임이 업데이트되어 '{m.name}'의 전에 복구한 재질·.user·.pfb 파일이 현재 게임과 맞지 않습니다 → "
+                        "재질 복구를 다시 해 보세요. 다시 복구할 때까지는 전에 복구한 파일을 그대로 써서 텍스처가 깨지거나 "
+                        "게임이 검은 화면에서 멈출 수 있습니다.",
+              lambda n, names: f"게임이 업데이트되어 전에 복구한 재질·.user·.pfb 파일이 현재 게임과 맞지 않는 모드 {n}개: "
+                               f"{names} → 재질 복구를 다시 해 보세요. 다시 복구할 때까지는 전에 복구한 파일을 그대로 써서 "
+                               "텍스처가 깨지거나 게임이 검은 화면에서 멈출 수 있습니다.", "matfix")
+    else:
+        group("material", "high", stale,
+              lambda m: f"'{m.name}'의 재질·.user·.pfb 파일이 현재 게임과 맞지 않습니다 → 재질 복구를 해 보세요. 그대로 "
+                        "두면 텍스처가 깨지거나 게임이 검은 화면에서 멈출 수 있습니다.",
+              lambda n, names: f"재질·.user·.pfb 파일이 현재 게임과 맞지 않는 모드 {n}개: {names} → 재질 복구를 해 보세요. "
+                               "그대로 두면 텍스처가 깨지거나 게임이 검은 화면에서 멈출 수 있습니다.", "matfix",
+              detail=lambda found: [f"게임이 업데이트되어 전에 복구한 파일을 다시 복구해야 하는 모드: "
+                                    f"{_names([m.name for m in redo], DETAIL)}"] if redo else [])
     group("stuck", "high", [m for m in on if m.stuck],
           lambda m: f"'{m.name}'에 현재 게임과 맞지 않지만 고칠 수 없는 {stuck_summary(m.stuck)}이 있어 게임이 멈출 수 "
                     "있습니다 → 모드 업데이트를 확인하거나 이 모드를 꺼 보세요.",
@@ -1259,10 +1281,11 @@ def mod_states(manager, conflicts=None, missing: dict | None = None) -> list[Mod
     version = manager.game_version()
     out = []
     for m in manager.mods:
-        reqs, state, stuck, updated, edits = [], "", [], False, []
+        reqs, state, redo, stuck, updated, edits = [], "", False, [], False, []
         if m.enabled:
             reqs = missing.get(m.id, []) if missing is not None else manager.missing_requirements(m.id)
             state = manager.material_state(m.id)
+            redo = state == "stale" and manager.material_repairs_outdated(m.id)
             stuck = manager.material_stuck(m.id)
             checked = manager.material_checked_for(m.id) if state == "unchecked" else ""
             updated = bool(checked) and checked != version
@@ -1270,7 +1293,7 @@ def mod_states(manager, conflicts=None, missing: dict | None = None) -> list[Mod
         files = manager.mod_files(m.id)
         out.append(ModState(m.id, m.name, m.enabled, m.stamp,
                             frozenset(manager.mod_kinds(m.id)), list(files), m.needs_option,
-                            [requirement_label(r) for r in reqs], state, updated, list(stuck), m.id in hidden,
+                            [requirement_label(r) for r in reqs], state, redo, updated, list(stuck), m.id in hidden,
                             refw is not None and refw.id == m.id, list(edits)))
     return out
 

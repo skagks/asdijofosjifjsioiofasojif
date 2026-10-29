@@ -1698,6 +1698,19 @@ def test_gui_help_window(root, manager):
     dialog.destroy()
 
 
+def test_help_tells_that_repairs_that_still_fit_carry_over_a_game_update():
+    """After a game update a repair in use that still fits the game is kept as it is, one that does not is told
+    about (⚠) and stays in use until repaired again (finish_materials): the help does not say that every update
+    repairs again from the mod's files."""
+    from mhwmm import helptext
+
+    (section,) = [s for s in helptext.SECTIONS if s.key == "materials"]
+    text = " ".join(t for _kind, body in section.blocks for t in ((body,) if isinstance(body, str) else body))
+    assert "게임이 다시 업데이트되면 원래 파일에서 다시 복구합니다" not in text
+    assert "게임이 다시 업데이트되면 전에 복구한 파일이 새 게임과도 맞는지 점검합니다. 맞으면 그대로 쓰고" in text
+    assert "다시 복구할 때까지는 전에 복구한 파일을 그대로 쓰고" in text
+
+
 def test_gui_checks_mod_updates_at_startup(root, manager, tmp_path, monkeypatch):
     from mhwmm import gui, nexus
 
@@ -3367,3 +3380,102 @@ def test_gui_precheck_while_the_material_check_runs(root, manager, tmp_path, gam
     pump(root, lambda: len(started) == 3)
     assert len(seen) == 2
     assert [i.kind for i in manager.prelaunch_check().issues if i.kind.startswith("unchecked")] == ["unchecked_new"]
+
+
+def _matfix_library(tmp_path, monkeypatch, **types):
+    """test_matfix's small game (its current body, legs and weapon materials and .user file) with a manager on it,
+    and test_rsz's type data (with ``types`` more)."""
+    from mhwmm import matfix
+
+    if not matfix.available():
+        pytest.skip("zstd 모듈이 없습니다")
+    import test_matfix as M
+    import test_rsz as R
+    from mhwmm.manager import ModManager
+    from mhwmm.matfix import rsz
+
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry(**types))
+    monkeypatch.setattr(rsz.TypeRegistry, "_from_file", False)
+    game = tmp_path / "MonsterHunterWilds"
+    game.mkdir()
+    legs = [M.material("legs", [("BaseDielectricMap", "Art/ch03/legs.tex")], [("Color", (1.0,) * 4)])]
+    M.write_game_pak(game / "re_chunk_000.pak", {
+        M.BODY + ".mdf2.45": b"stale base copy", M.LEGS + ".mdf2.45": M.assemble_mdf2(legs, 45),
+        M.WEAPON + ".mdf2.45": M.assemble_mdf2(M.current_body()[:1], 45), M.AVP: R.game_file()})
+    M.write_game_pak(game / "re_chunk_000.pak.patch_001.pak",
+                     {M.BODY + ".mdf2.45": M.assemble_mdf2(M.current_body(), 45)}, chunked=True)
+    library = ModManager(tmp_path / "data")
+    library.settings.check_game_running = False
+    library.set_game_dir(game)
+    s = library.settings
+    s.check_updates = s.check_refw_updates = s.check_mod_updates = s.check_materials = False
+    return library, game
+
+
+def test_gui_log_of_a_check_of_repairs_that_fit(root, tmp_path, monkeypatch, caplog):
+    """A check of mods whose repairs in use fit the game - carried over a game update, or checked again for the
+    same version - does not warn that the mods' own files do not fit (nothing else says there is a problem): one
+    line says the repaired files are in use (after a carry-over finish_materials' line says so), each file only at
+    debug level. What could not be repaired stays a warning, and so do the files of a mod that needs a repair."""
+    import logging
+
+    import test_matfix as M
+    import test_rsz as R
+    from mhwmm import gui
+    from mhwmm.matfix import pak as pakmod
+
+    extra = {format(R.EXTRA, "x"): ["4444", "app.CustomChain", R.json.dumps(R.CHILD_FIELDS)]}
+    library, game = _matfix_library(tmp_path, monkeypatch, **extra)
+    chen = M.install_tree(library, tmp_path / "Chen", {M.BODY + ".mdf2.45": M.assemble_mdf2(M.old_body_mod(), 45)})
+    lepus = M.install_tree(library, tmp_path / "Lepus", {M.AVP: M.old_avp()})
+    short = R.PARAM_FIELDS[:-1]  # a .pak with a stale material and a .user that cannot be repaired
+    user = R.user_file([(R.EXTRA, 0x4444, R.CHILD_FIELDS, [R.s32(1)]), (R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(42)]),
+                        (R.PARAM, R.NO_CHILD_CRC, short, R.param(short))])
+    weapon = M.assemble_mdf2([M.material("body", [("BaseDielectricMap", "Art/w.tex")], [("Color", (0.5,) * 4)])], 45)
+    source = tmp_path / "Mixed" / "Mixed.pak"
+    source.parent.mkdir()
+    pakmod.write_pak([(pakmod.path_hash(M.WEAPON + ".mdf2.45"), weapon, len(weapon), 0),
+                      (pakmod.path_hash(M.AVP), user, len(user), 0)], source)
+    with library.prepare_install(source) as session:
+        mixed = library.install_package(session, session.variants)
+    M.run(library, repair=True)
+    never = M.install_tree(library, tmp_path / "Never", {M.WEAPON + ".mdf2.45": weapon})  # (not repaired)
+    M.update_game(game)  # nothing about the materials changes
+    offered = []
+    monkeypatch.setattr(gui.MaterialsDialog, "show", lambda self: offered.append(sorted(self.checked)) or self.destroy())
+    app = gui.App(root, library, queue.Queue())
+    pump(root, lambda: app.busy is None)
+
+    def lines(level, name, *words):
+        return [r.getMessage() for r in caplog.records if r.levelno == level and f"'{name}'" in r.getMessage()
+                and all(w in r.getMessage() for w in words)]
+
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    app._matfix_running = True
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        app._on_materials_checked(found, jobs, None)  # what the background check does when it ends
+    assert [library.material_state(m.id) for m in (chen, lepus, mixed, never)] == ["repaired"] * 3 + ["stale"]
+    problems = library.problems()
+    assert set(problems) == {mixed.id, never.id} and offered == [[never.id]]
+    (stuck,) = problems[mixed.id]  # (only what cannot be repaired)
+    assert stuck.startswith("현재 게임과 맞지 않지만 고칠 수 없는")
+    for mod in (chen, lepus, mixed):
+        assert not lines(logging.WARNING, mod.name, "맞지 않습니다")
+        assert lines(logging.INFO, mod.name, "전에 복구한 파일이 그대로 맞아 계속 씁니다")  # (finish_materials)
+        assert not lines(logging.INFO, mod.name, "복구한 파일을 쓰고 있습니다")  # (said once)
+        assert lines(logging.DEBUG, mod.name, "현재 게임과 맞지 않아 복구한 파일을 씁니다")
+    assert lines(logging.WARNING, "Mixed", "user 복구 불가")
+    assert lines(logging.WARNING, "Never", "재질이 현재 게임과 맞지 않습니다 (body)")
+
+    # checked again for this game version (☰ → 모든 모드 재질 점검)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        app.check_materials([chen.id, lepus.id, mixed.id])
+        pump(root, lambda: app.busy is None)
+    assert [library.material_state(m.id) for m in (chen, lepus, mixed)] == ["repaired"] * 3
+    for mod in (chen, lepus, mixed):
+        assert not lines(logging.WARNING, mod.name, "맞지 않습니다")
+        assert lines(logging.INFO, mod.name, "모드의 원래 파일 1개가 현재 게임과 맞지 않아 복구한 파일을 쓰고 있습니다")
+    assert lines(logging.WARNING, "Mixed", "user 복구 불가")

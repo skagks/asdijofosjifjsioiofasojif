@@ -431,6 +431,54 @@ def test_a_moved_mod_repaired_and_moved_again(library, tmp_path, game):
         assert result.state == "fixable" and any("AnotherNewMap" in n for n in result.notes), who.name
 
 
+def own_helm_update(game):
+    """A game update that gives the target's own helm material a slot (the original equipment's is as it was)."""
+    newer = mdf2("helm", ("BaseDielectricMap", ALBD_B), ("BOnlyMap", "Art/Common/b_only.tex"))
+    M.write_game_pak(game / "re_chunk_000.pak.patch_001.pak", {N + HELM_B + ".mdf2.45": newer})
+
+
+def test_the_repairs_of_a_moved_mod_carry_over_a_game_update(library, types, game):
+    """Checked again after a game update, a moved mod's repairs (the material and the hair list that points at the
+    moved files) are compared with the original equipment's files, as its own files are: they still fit."""
+    m, mod, _first, _last = library
+    new = m.create_retarget(mod.id, A, B)
+    jobs = m.material_jobs([new.id])
+    m.finish_materials(m.run_materials(jobs, repair=True), jobs)
+    assert m.material_state(new.id) == "repaired"
+    entries = m.mod_entries(new.id)
+    assert {key for _path, key in entries.values() if key.startswith("matfix/")} == \
+        {"matfix/" + N + HELM_B + ".mdf2.45", "matfix/" + N + HAIR_B}
+
+    own_helm_update(game)
+    jobs = m.material_jobs(unchecked_only=True)
+    assert new.id in [j.mod_id for j in jobs]
+    found = m.run_materials(jobs)
+    assert found.carried[new.id] == {N + HELM_B + ".mdf2.45": True, N + HAIR_B: True}
+    assert m.finish_materials(found, jobs) == []
+    assert m.material_state(new.id) == "repaired" and m.mod_entries(new.id) == entries
+    assert m._material_record(new.id)["applied_game"] == m.game_version()
+
+
+def test_a_moved_repair_with_another_version_number_is_compared_with_the_original(library, tmp_path, game):
+    """The repair gave the moved material the version number the game uses (.40 -> .45): its check after a game
+    update still compares it with the original equipment's material, not with the target's own one."""
+    m, _mod, _first, _last = library
+    old = assemble_mdf2([M.material("helm", [("BaseDielectricMap", ALBD_A)], [("Color", (1.0, 1.0, 1.0, 1.0))])], 40)
+    mod = M.install_tree(m, tmp_path / "src" / "Old", {N + HELM_A + ".mesh.241111606": MESH,
+                                                       N + HELM_A + ".mdf2.40": old, N + ALBD_A + ".241106027": TEX})
+    new = m.create_retarget(mod.id, A, B)
+    jobs = m.material_jobs([new.id])
+    m.finish_materials(m.run_materials(jobs, repair=True), jobs)
+    assert m.repaired_materials(new.id)[N + HELM_B + ".mdf2.40"][0] == N + HELM_B + ".mdf2.45"
+
+    own_helm_update(game)
+    jobs = m.material_jobs([new.id])
+    found = m.run_materials(jobs)
+    assert found.carried == {new.id: {N + HELM_B + ".mdf2.40": True}}
+    m.finish_materials(found, jobs)
+    assert m.material_state(new.id) == "repaired"
+
+
 def test_a_chain_only_where_the_first_move_ended():
     first = {"kind": "armor", "from": "f/004/001", "to": "f/004/000", "parts": ["helm"],
              "moves": [[N + HELM_B + ".mdf2.40", N + HELM_A + ".mdf2.40"],

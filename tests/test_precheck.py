@@ -130,6 +130,34 @@ def test_mod_issues_are_grouped_by_problem():
     assert "점검하는 중입니다 → 점검이 끝난 뒤 실행하면" in checking[0].text and checking[0].items == ["j|2026-10-01|j"]
 
 
+def test_repairs_from_before_a_game_update_are_told_apart():
+    """A stale mod whose repairs were made for the version before a game update needs the repair again (and uses
+    the old repairs until then); one never repaired is told as before."""
+    redo = mod("a", "갑옷 A", material_state="stale", repairs_outdated=True)
+    plain = mod("b", "갑옷 B", material_state="stale")
+    off = mod("c", "갑옷 C", enabled=False, material_state="stale", repairs_outdated=True)
+    assert precheck.mod_problems([redo, plain, off]) == {
+        "a": [precheck.REPAIRS_OUTDATED],
+        "b": ["재질이나 .user·.pfb 파일이 현재 게임과 맞지 않습니다 (오른쪽 클릭 → 재질 복구)"]}
+    assert precheck.REPAIRS_OUTDATED.startswith("게임이 업데이트되어 전에 복구한 재질·.user·.pfb 파일을 다시 복구해야 합니다")
+    assert precheck.mod_problems([mod("d", material_state="repaired", repairs_outdated=True)]) == {}
+
+    (one,) = precheck.mod_issues([redo, off])
+    assert one.kind == "material" and one.level == "high" and one.action == "matfix" and one.mods == ["a"]
+    assert one.text.startswith("게임이 업데이트되어 '갑옷 A'의 전에 복구한 재질·.user·.pfb 파일이 현재 게임과 맞지 않습니다 → "
+                               "재질 복구를 다시 해 보세요. 다시 복구할 때까지는 전에 복구한 파일을 그대로 써서")
+    assert one.items == ["a|2026-10-01|a"] and one.detail == []
+    (many,) = precheck.mod_issues([redo, mod("e", "갑옷 E", material_state="stale", repairs_outdated=True)])
+    assert many.text.startswith("게임이 업데이트되어 전에 복구한 재질·.user·.pfb 파일이 현재 게임과 맞지 않는 모드 2개: "
+                                "'갑옷 A', '갑옷 E' → 재질 복구를 다시 해 보세요")
+    (mixed,) = precheck.mod_issues([redo, plain])
+    assert mixed.text.startswith("재질·.user·.pfb 파일이 현재 게임과 맞지 않는 모드 2개: '갑옷 A', '갑옷 B' → 재질 복구를 해 보세요")
+    assert mixed.detail == ["게임이 업데이트되어 전에 복구한 파일을 다시 복구해야 하는 모드: '갑옷 A'"]
+    assert mixed.mods == ["a", "b"] and mixed.items == ["a|2026-10-01|a", "b|2026-10-01|b"]
+    (alone,) = precheck.mod_issues([plain])
+    assert alone.text.startswith("'갑옷 B'의 재질·.user·.pfb 파일이 현재 게임과 맞지 않습니다") and alone.detail == []
+
+
 def test_stuck_files_are_listed_by_name():
     stuck = [{"label": f"natives/STM/x/{n}.user.3", "kind": "user"} for n in "abcd"]
     (found,) = precheck.mod_issues([mod("a", "Lepus", material_state="current", stuck=stuck)])

@@ -37,6 +37,12 @@
     (타입 정보 `rsz_types.json.xz`는 `tools/make_rsz_types.py`로 REasy 덤프 기록에서 만듦). 테스트에 zstandard 필요
     - 점검·복구 결과가 달라질 수 있는 변경을 하면 `manager.MATFIX_FORMAT`을 올린다. 그래야 업데이트 후 기존 기록이 '점검 전'이
       되어 다시 점검하고 복구를 다시 묻는다 (올리지 않으면 예전 결과가 그대로 남음).
+    - 게임 업데이트 뒤 복구 이어 쓰기(v2.7.1, `MATFIX_FORMAT` 6): 점검 실행에서 다른 게임 버전용 복구본이 쓰이는 모드는 아직
+      맞지 않는 키의 복구본도 같은 규칙으로 점검(`_repairs_fit`, 읽기만). 모두 맞으면 `applied_game`을 지금 게임으로 하고
+      기록에 `"carried"`({"from": 예전 버전, "registry"})를 남김('복구됨'). 형식 정보가 게임보다 오래되어 확인하지 못한 것
+      (`_types_lag`), 깨진 복구 PAK(`_pak_reads_alike`), 점검 중 뺀 파일이 바뀐 것은 맞지 않음으로 침. 이어 쓴 기록은 더 새
+      형식 정보가 오면 '점검 전'이 되어 다시 보고, 그때 맞지 않으면 `applied_game`을 `"from"`으로 되돌림. 맞지 않으면 '복구 필요'
+      그대로이고 문구는 `material_repairs_outdated`로 "다시 복구"(precheck `REPAIRS_OUTDATED`, 정보 탭, 복구 창, 명령줄)
     - 맞지 않는 재질(`repair.plan_entries`): 모드가 베낀 재질(모드 파일의 현재 버전에서 이름이 같은 것 `SAME_FILE_NAME`, 또는
       후보 중 이름이 같은 것이 하나뿐일 때 그것)은 그것과 바로 비교한다(업데이트로 그 재질에 생긴 칸이 없으면 맞지 않음).
       여러 후보에서 고른 donor는 그것만으로 정하지 않고, 매칭에 쓴 셰이더(`_NoMultiBlend` 형제로 맞췄으면 그 셰이더)를 쓰는

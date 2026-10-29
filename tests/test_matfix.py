@@ -1,6 +1,7 @@
 """Material repair against a small fake game: encrypted (and chunked) paks, an
 outdated costume mod as loose files and as a mod pak."""
 
+import copy
 import os
 import struct
 from pathlib import Path
@@ -584,21 +585,328 @@ def test_the_managers_old_chain_paks_are_left_out(library, game, tmp_path):
     assert index.key != index.fingerprint
 
 
-def test_game_update_and_reinstall_need_a_new_check(library, game, tmp_path):
+def update_game(game, files=None):
+    """A game update: the latest patch (written again with ``files``) is newer, so the game version changes."""
+    patch = game / "re_chunk_000.pak.patch_001.pak"
+    if files is not None:
+        write_game_pak(patch, files, chunked=True)
+    os.utime(patch, (patch.stat().st_atime, patch.stat().st_mtime + 100))
+
+
+def newer_body():
+    """The game's material after another update: the body got one more shader parameter."""
+    mats = current_body()
+    mats[0]["props"].append({"name": "NewerParam", "values": [0.5], "count_flags": 0})
+    return mats
+
+
+def test_game_update_and_reinstall_need_a_new_check(library, game, tmp_path, caplog):
+    """After a game update every mod is checked again. The mod's own file is still stale, but the repair in use
+    fits the new version too (the update did not change its material): it carries over - no ⚠, no offer."""
+    import logging
+
     mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
     run(library, [mod.id], repair=True)
     assert library.material_state(mod.id) == "repaired"
+    before = library.game_version()
+    entry = library.mod_entries(mod.id)[BODY + ".mdf2.45"]
+    repaired = entry[0].read_bytes()
 
-    patch = game / "re_chunk_000.pak.patch_001.pak"
-    os.utime(patch, (patch.stat().st_atime, patch.stat().st_mtime + 100))  # a game update
+    update_game(game)
     assert [j.mod_id for j in library.material_jobs(unchecked_only=True)] == [mod.id]
     assert library.material_state(mod.id) == "unchecked"
     assert library.mod_entries(mod.id)[BODY + ".mdf2.45"][1].startswith("matfix/")  # kept until checked again
-    run(library, unchecked_only=True)
-    assert library.material_state(mod.id) == "stale"  # repaired for the previous game version
+    with caplog.at_level(logging.INFO, logger="mhwmm.manager"):
+        assert run(library, unchecked_only=True) == []  # nothing the game gets changes
+    assert library.material_state(mod.id) == "repaired" and not library.material_repairs_outdated(mod.id)
+    (result,) = library.material_results(mod.id)
+    assert result.state == "fixable"  # (the mod's own file: still the old layout)
+    assert library._material_record(mod.id)["applied_game"] == library.game_version() != before
+    assert library.problems() == {} and library.materials_to_offer() == [] and library.stale_material_mods() == []
+    assert library.mod_entries(mod.id)[BODY + ".mdf2.45"] == entry and entry[0].read_bytes() == repaired
+    library.deploy()
+    assert (game / (BODY + ".mdf2.45")).read_bytes() == repaired
+    assert caplog.text.count("게임 업데이트 뒤에도 전에 복구한 파일이 그대로 맞아 계속 씁니다") == 1
+    assert run(library) == [] and library.material_state(mod.id) == "repaired"  # (checked again: the same)
 
     mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(current_body(), 45)})
     assert library.material_state(mod.id) == "unchecked" and not library.repaired_materials(mod.id)
+
+
+def test_a_game_update_that_changes_the_material_needs_the_repair_again(library, game, tmp_path):
+    from mhwmm import precheck
+
+    mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, [mod.id], repair=True)
+    entry = library.mod_entries(mod.id)[BODY + ".mdf2.45"]
+    repaired = entry[0].read_bytes()
+
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(newer_body(), 45)})  # the repair lacks the new parameter
+    assert run(library, unchecked_only=True) == []
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert library.problems() == {mod.id: [precheck.REPAIRS_OUTDATED]} and library.materials_to_offer() == [mod]
+    (issue,) = [i for i in precheck.mod_issues(precheck.mod_states(library)) if i.kind == "material"]
+    assert issue.text.startswith("게임이 업데이트되어 'Chen'의 전에 복구한 재질·.user·.pfb 파일이 현재 게임과 맞지 않습니다")
+    assert issue.action == "matfix" and issue.mods == [mod.id]
+    assert library.mod_entries(mod.id)[BODY + ".mdf2.45"] == entry and entry[0].read_bytes() == repaired  # still used
+
+    assert run(library, [mod.id], repair=True) == [mod]
+    assert library.material_state(mod.id) == "repaired" and not library.material_repairs_outdated(mod.id)
+    assert library.problems() == {}
+    library.deploy()
+    mat = extract_material(Mdf2File((game / (BODY + ".mdf2.45")).read_bytes(), 45), 0)
+    assert "NewerParam" in {p["name"] for p in mat["props"]}
+    assert {t["type"]: t["path"] for t in mat["textures"]}["BaseDielectricMap"] == "Art/Dimcirui/chen/body_ALBD.tex"
+
+
+def test_one_repair_that_no_longer_fits_leaves_the_mod_stale(library, game, tmp_path):
+    weapon = [material("body", [("BaseDielectricMap", "Art/myweapon/w_ALBD.tex")], [("Color", (0.3, 0.3, 0.3, 1.0))])]
+    mod = install_tree(library, tmp_path / "Both", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45),
+                                                    WEAPON + ".mdf2.45": assemble_mdf2(weapon, 45)})
+    run(library, [mod.id], repair=True)
+    repaired = library.repaired_materials(mod.id)
+    assert set(repaired) == {BODY + ".mdf2.45", WEAPON + ".mdf2.45"}
+
+    # the body's material changed, not the weapon's
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(newer_body(), 45)})
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {BODY + ".mdf2.45": False, WEAPON + ".mdf2.45": True}}
+    assert library.finish_materials(found, jobs) == []
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert library.repaired_materials(mod.id) == repaired  # both stay in use until it is repaired again
+
+
+def test_a_file_the_update_made_stale_needs_its_first_repair(library, game, tmp_path):
+    """The repair in use still fits, but the update made another of the mod's files stale: the repair carries over
+    and the mod is stale for that file alone (told as one never repaired, not as one to repair again)."""
+    legs = [material("legs", [("BaseDielectricMap", "Art/mine/legs.tex")], [("Color", (0.1,) * 4)])]
+    mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45),
+                                                    LEGS + ".mdf2.45": assemble_mdf2(legs, 45)})
+    run(library, [mod.id], repair=True)
+    assert set(library.repaired_materials(mod.id)) == {BODY + ".mdf2.45"}  # (the legs fit then)
+
+    newer_legs = [material("legs", [("BaseDielectricMap", "Art/ch03/legs.tex"), ("NormalRoughnessMap", "n.tex")],
+                           [("Color", (1.0,) * 4)])]
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(current_body(), 45),
+                       LEGS + ".mdf2.45": assemble_mdf2(newer_legs, 45)})
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {BODY + ".mdf2.45": True}}
+    library.finish_materials(found, jobs)
+    assert library.material_state(mod.id) == "stale" and not library.material_repairs_outdated(mod.id)
+    assert library._material_record(mod.id)["applied_game"] == library.game_version()
+    assert library.problems()[mod.id] == ["재질이나 .user·.pfb 파일이 현재 게임과 맞지 않습니다 (오른쪽 클릭 → 재질 복구)"]
+    # a repair from before in use for a file that fits now, the legs stale: not one to repair again either
+    record = copy.deepcopy(library._material_record(mod.id))
+    record["applied_game"] = "the version before"
+    for r in record["results"]:
+        r["state"] = "current" if r["key"] == BODY + ".mdf2.45" else r["state"]
+    library._save_material_record(mod.id, record)
+    assert library.material_state(mod.id) == "stale" and not library.material_repairs_outdated(mod.id)
+    run(library, [mod.id], repair=True)
+    assert library.material_state(mod.id) == "repaired"
+    assert set(library.repaired_materials(mod.id)) == {BODY + ".mdf2.45", LEGS + ".mdf2.45"}
+
+
+@pytest.mark.parametrize("change", ["made_for", "file"])
+def test_repairs_changed_while_they_were_checked_do_not_carry_over(library, game, tmp_path, change):
+    """finish_materials keeps the repairs only when they are still the ones the run looked at."""
+    mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, [mod.id], repair=True)
+    update_game(game)
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {BODY + ".mdf2.45": True}}
+    record = copy.deepcopy(library._material_record(mod.id))
+    if change == "made_for":
+        record["applied_game"] = "another version"
+    else:
+        entry = record["applied"][BODY + ".mdf2.45"]
+        other = library.mod_dir(mod.id) / "matfix" / "002_other.mdf2.45"
+        other.write_bytes((library.mod_dir(mod.id) / entry["file"]).read_bytes())
+        entry["file"] = "matfix/002_other.mdf2.45"
+    library._save_material_record(mod.id, record)
+    library.finish_materials(found, jobs)
+    assert library.material_state(mod.id) == "stale"
+
+
+@pytest.mark.parametrize("kind", ["mdf2", "user"])
+def test_a_repaired_copy_that_cannot_be_read_does_not_carry_over(library, game, tmp_path, types, kind):
+    rel, shipped = (BODY + ".mdf2.45", assemble_mdf2(old_body_mod(), 45)) if kind == "mdf2" else (AVP, old_avp())
+    mod = install_tree(library, tmp_path / "Mod", {rel: shipped})
+    run(library, [mod.id], repair=True)
+    assert library.material_state(mod.id) == "repaired"
+    library.repaired_materials(mod.id)[rel][1].write_bytes(b"broken")
+    update_game(game)
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+
+
+@pytest.mark.parametrize("compression", [pakmod.COMPRESSION_NONE, pakmod.COMPRESSION_ZSTD], ids=["stored", "zstd"])
+@pytest.mark.parametrize("damage", ["cut", "half", "garbled"])
+def test_a_repaired_pak_whose_entries_cannot_be_read_does_not_carry_over(library, game, tmp_path, damage,
+                                                                          compression):
+    """check_mod passes over a PAK's entry it cannot read (no result, or a PAK that looks current): the repaired
+    copy must still read every entry the check of the mod's own PAK reads. Damaged, the mod is offered a repair,
+    which makes the PAK again from the mod's own one."""
+    material_rel = WEAPON + ".mdf2.45"
+    data = assemble_mdf2([material("body", [("BaseDielectricMap", "Art/mine/w.tex")], [("Color", (0.1,) * 4)])], 45)
+    tex = os.urandom(3000)
+    pack = (lambda b: matfix.zstd_compress(b)) if compression == pakmod.COMPRESSION_ZSTD else (lambda b: b)
+    source = tmp_path / "Weapon" / "Weapon.pak"
+    source.parent.mkdir()
+    pakmod.write_pak([(pakmod.path_hash(material_rel), pack(data), len(data), compression),
+                      (pakmod.path_hash("natives/STM/Art/mine/w.tex.241106027"), pack(tex), len(tex), compression)],
+                     source)
+    with library.prepare_install(source) as session:
+        mod = library.install_package(session, session.variants)
+    run(library, [mod.id], repair=True)
+    assert library.material_state(mod.id) == "repaired"
+    ((_rel, path),) = library.repaired_materials(mod.id).values()
+    pak = pakmod.PakFile(path)
+    off, csize, _dsize, _attrs = pak.entry(pak.find(pakmod.path_hash(material_rel)))
+    raw = bytearray(path.read_bytes())
+    if damage == "cut":  # nothing after the entry table
+        raw = raw[:min(pak.offsets)]
+    elif damage == "half":  # cut short in the middle of the material
+        raw = raw[:off + csize // 2]
+    else:  # the material's bytes after its first four overwritten
+        raw[off + 4:off + csize] = b"\xff" * (csize - 4)
+    path.write_bytes(bytes(raw))
+
+    update_game(game)  # nothing about the materials changes
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {"Weapon.pak": False}}
+    library.finish_materials(found, jobs)
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert library.materials_to_offer() == [mod]
+    assert run(library, [mod.id], repair=True) == [mod]
+    assert library.material_state(mod.id) == "repaired"
+    ((_rel, path),) = library.repaired_materials(mod.id).values()
+    assert pakmod.PakFile(path).read_hash(pakmod.path_hash(material_rel))[:4] == b"MDF\x00"
+
+
+NEWER_CRC = 0x5555  # the .user type's layout after another game update: one more field
+NEWER_FIELDS = R.PARAM_FIELDS + [["_Extra", "S32", 4, 4, 0]]
+
+
+def newer_game_avp():
+    values = R.param(R.PARAM_FIELDS, scale=1.0, hide=0, new=1) + [R.s32(9)]
+    return R.user_file([(R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(7)]), (R.PARAM, NEWER_CRC, NEWER_FIELDS, values)])
+
+
+def newer_types(history=True, **extra):
+    """Type data that came out after that update: it knows the new layout and the ones before (without
+    ``history``: not the one just before it)."""
+    from mhwmm.matfix import rsz
+
+    types = {format(R.PARAM, "x"): [format(NEWER_CRC, "x"), R.PARAM_NAME, R.json.dumps(NEWER_FIELDS)],
+             format(R.CHILD, "x"): [format(R.CHILD_CRC, "x"), "app.TestChild", R.json.dumps(R.CHILD_FIELDS)], **extra}
+    old = {format(R.OLD_CRC, "x"): R.json.dumps(R.OLD_PARAM)}
+    if history:
+        old[format(R.NEW_CRC, "x")] = R.json.dumps(R.PARAM_FIELDS)
+    return rsz.TypeRegistry({"types": types, "empty": {}, "alt": {}, "old": {format(R.PARAM, "x"): old}})
+
+
+@pytest.mark.parametrize("in_pak", [False, True], ids=["loose", "pak"])
+def test_a_repair_the_updated_game_cannot_check_yet_does_not_carry_over(library, game, tmp_path, types, monkeypatch,
+                                                                        in_pak):
+    """A game update gave the .user type a layout the type data does not know yet: the mod's own .user and its
+    repaired copy are both stuck. The copy is one the old repair rewrote, so it is not known to fit: the mod stays
+    stale (to repair again). Carried over, nothing would check it again once newer type data comes - while a
+    repair would then change it."""
+    from mhwmm.matfix import rsz
+    from mhwmm.matfix.repair import RszContext
+
+    body, user = assemble_mdf2(old_body_mod(), 45), old_avp()
+    if in_pak:
+        source = tmp_path / "Both" / "Both.pak"
+        source.parent.mkdir()
+        pakmod.write_pak([(pakmod.path_hash(BODY + ".mdf2.45"), body, len(body), 0),
+                          (pakmod.path_hash(AVP), user, len(user), 0)], source)
+        with library.prepare_install(source) as session:
+            mod = library.install_package(session, session.variants)
+    else:
+        mod = install_tree(library, tmp_path / "Both", {BODY + ".mdf2.45": body, AVP: user})
+    run(library, [mod.id], repair=True)
+    assert library.material_state(mod.id) == "repaired"
+    repaired, made_for = library.repaired_materials(mod.id), library.game_version()
+    fits = {"Both.pak": False} if in_pak else {BODY + ".mdf2.45": True, AVP: False}
+
+    monkeypatch.setattr(rsz, "download_registry", lambda folder: None)  # nothing newer published yet
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(current_body(), 45), AVP: newer_game_avp()})
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: fits}
+    assert library.finish_materials(found, jobs) == []
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert library.material_stuck(mod.id) and library.materials_to_offer() == [mod]
+    assert library._material_record(mod.id)["applied_game"] == made_for != library.game_version()
+    assert library.repaired_materials(mod.id) == repaired  # (in use until the mod is repaired again)
+
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", newer_types())  # newer type data comes
+    monkeypatch.setattr(library, "registry_date", lambda refresh=False: "2099-01-01")
+    assert library.material_state(mod.id) == "unchecked"
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: fits}  # (the repaired copies are checked again: still made for the old one)
+    library.finish_materials(found, jobs)
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert not library.material_stuck(mod.id) and library.materials_to_offer() == [mod]
+
+    assert run(library, [mod.id], repair=True) == [mod]
+    assert library.material_state(mod.id) == "repaired"
+    rel = "Both.pak" if in_pak else AVP
+    index = GameIndex(game, tmp_path / "cache2")
+    (verdict,) = check_mod([(rel, rel, library.mod_entries(mod.id)[rel][0])], index, None, rszs=RszContext(index))
+    assert verdict.state == "current"  # what is deployed now fits the updated game
+
+
+def test_pak_and_user_file_repairs_carry_over(library, game, tmp_path, types):
+    weapon = tmp_path / "Weapon" / "Weapon.pak"
+    weapon.parent.mkdir()
+    data = assemble_mdf2([material("body", [("BaseDielectricMap", "Art/w.tex")], [("Color", (0.5,) * 4)])], 45)
+    pakmod.write_pak([(pakmod.path_hash(WEAPON + ".mdf2.45"), data, len(data), 0)], weapon)
+    lepus = tmp_path / "Lepus" / "Lepus.pak"
+    lepus.parent.mkdir()
+    user = old_avp(scale=4.0)
+    pakmod.write_pak([(pakmod.path_hash(AVP), user, len(user), 0),
+                      (pakmod.path_hash("natives/STM/Art/x.tex.241106027"), b"TEX", 3, 0)], lepus)
+    mods = []
+    for source in (weapon, lepus):
+        with library.prepare_install(source) as session:
+            mods.append(library.install_package(session, session.variants))
+    mods.append(install_tree(library, tmp_path / "Loose", {AVP: old_avp()}))
+    run(library, repair=True)
+    assert [library.material_state(m.id) for m in mods] == ["repaired"] * 3
+    entries = {m.id: library.mod_entries(m.id) for m in mods}
+    assert [sorted(k for _, k in entries[m.id].values() if k.startswith("matfix/")) for m in mods] == \
+        [["matfix/Weapon.pak"], ["matfix/Lepus.pak"], ["matfix/" + AVP]]
+
+    update_game(game)
+    assert run(library, unchecked_only=True) == []
+    assert [library.material_state(m.id) for m in mods] == ["repaired"] * 3
+    assert {m.id: library.mod_entries(m.id) for m in mods} == entries and library.problems() == {}
+    assert all(library._material_record(m.id)["applied_game"] == library.game_version() for m in mods)
+
+
+def test_records_of_v270_after_a_game_update_are_checked_again(library, game, tmp_path):
+    """v2.7.0 checked every repaired mod after a game update and called it stale (format 5): the new rules check
+    those records again, so the repairs that still fit carry over right after the manager is updated."""
+    mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, [mod.id], repair=True)
+    update_game(game)
+    run(library, unchecked_only=True)
+    record = dict(library._material_record(mod.id))
+    record.update(format=5, applied_game="the version before the update")  # what v2.7.0 left
+    library._save_material_record(mod.id, record)
+    assert library.material_state(mod.id) == "unchecked"
+    assert [j.mod_id for j in library.material_jobs(unchecked_only=True)] == [mod.id]
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "repaired" and library.materials_to_offer() == []
+    assert library._material_record(mod.id)["applied_game"] == library.game_version()
 
 
 def test_versions_and_paks_of_installed_mods(library, game, tmp_path):
@@ -700,6 +1008,77 @@ def test_cli_checks_repairs_and_restores(library, tmp_path, capsys):
 
 
 
+def test_cli_says_which_repairs_carried_over_and_which_to_redo(library, game, tmp_path, types, capsys):
+    """The labels, and the mods' own stale files under a "복구됨" one: handled by the repairs in use (not "복구 필요")."""
+    from mhwmm import cli
+    from mhwmm.cli import main
+
+    install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    install_tree(library, tmp_path / "Lepus", {AVP: old_avp()})
+    data = str(library.data_dir)
+    assert main(["--data-dir", data, "matfix", "repair"]) == 0
+    capsys.readouterr()
+    body, user = f"{BODY}.mdf2.45: 재질 body", f"{AVP}: user"
+    update_game(game)
+    assert main(["--data-dir", data, "materials", "check"]) == 0
+    out = capsys.readouterr().out
+    assert f"Chen: {cli.MATERIAL_CARRIED}" in out and f"Lepus: {cli.MATERIAL_CARRIED}" in out
+    assert f"{body}{cli.MATERIAL_IN_USE}\n" in out and f"{user}{cli.MATERIAL_IN_USE}\n" in out
+    assert "복구 필요" not in out and "복구하려면" not in out
+    assert main(["--data-dir", data, "materials", "check"]) == 0  # (checked for this version already)
+    out = capsys.readouterr().out
+    assert "Chen: 복구됨\n" in out and "Lepus: 복구됨\n" in out
+    assert f"{body}{cli.MATERIAL_IN_USE}\n" in out and f"{user}{cli.MATERIAL_IN_USE}\n" in out
+    assert "복구 필요" not in out
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(newer_body(), 45)})
+    assert main(["--data-dir", data, "materials", "check"]) == 0
+    out = capsys.readouterr().out
+    assert f"Chen: {cli.MATERIAL_REDO}" in out and "복구하려면: materials repair" in out
+    assert f"{body}\n" in out and f"Lepus: {cli.MATERIAL_CARRIED}" in out and f"{user}{cli.MATERIAL_IN_USE}\n" in out
+
+
+def test_gui_tells_repairs_from_before_a_game_update(library, game, tmp_path):
+    tk = pytest.importorskip("tkinter")
+    import queue
+
+    from mhwmm import gui, precheck
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("화면(display)이 없어 GUI 테스트를 건너뜁니다")
+    s = library.settings
+    s.check_updates = s.check_refw_updates = s.check_mod_updates = s.check_materials = False
+    weapon = [material("body", [("BaseDielectricMap", "Art/myweapon/w_ALBD.tex")], [("Color", (0.3, 0.3, 0.3, 1.0))])]
+    chen = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, [chen.id], repair=True)
+    never = install_tree(library, tmp_path / "Never", {WEAPON + ".mdf2.45": assemble_mdf2(weapon, 45)})
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(newer_body(), 45)})
+    run(library, unchecked_only=True)
+    assert [library.material_state(m.id) for m in (chen, never)] == ["stale", "stale"]
+    try:
+        app = gui.App(root, library, queue.Queue())
+        app.refresh()
+        assert app._row_tooltip(chen.id) == "⚠ " + precheck.REPAIRS_OUTDATED
+        assert app._row_tooltip(never.id) == "⚠ 재질이나 .user·.pfb 파일이 현재 게임과 맞지 않습니다 (오른쪽 클릭 → 재질 복구)"
+        texts = {}
+        for mod in (chen, never):
+            app.tree.selection_set(mod.id)
+            app._update_details()
+            texts[mod.id] = app.info_text.get("1.0", "end")
+        assert "재질 다시 복구 필요" in texts[chen.id] and "전에 복구한 파일이 현재 게임과 맞지 않음" in texts[chen.id]
+        assert "게임이 업데이트되어 다시 복구해야 합니다" in texts[chen.id] and "원래대로 되돌리기" in texts[chen.id]
+        assert "현재 게임과 맞지 않는 파일이 있습니다" not in texts[chen.id]
+        assert "재질 복구 필요" in texts[never.id] and "다시 복구" not in texts[never.id]
+        assert "현재 게임과 맞지 않는 파일이 있습니다" in texts[never.id]
+        offer = gui.MaterialsDialog(root, app.theme, library, [chen, never])
+        assert offer.tree.item(chen.id, "values")[0].startswith("다시 복구 · 파일 1개 · 재질 body")
+        assert offer.tree.item(never.id, "values")[0].startswith("파일 1개 · 재질 body")
+        offer.destroy()
+    finally:
+        root.destroy()
+
+
 # ---- .user / .pfb files ----------------------------------------------------------
 @pytest.fixture
 def types(monkeypatch):
@@ -777,11 +1156,17 @@ def test_rsz_lines_in_the_log(library, game, tmp_path, types, caplog):
 
     from mhwmm import gui
 
+    class App:  # just enough of gui.App for its log of a run (no window): its methods, on this manager
+        manager = library
+
+        def __getattr__(self, name):
+            return getattr(gui.App, name).__get__(self)
+
     mod = install_tree(library, tmp_path / "Lepus", {AVP: old_avp()})
     jobs = library.material_jobs([mod.id])
     found = library.run_materials(jobs, repair=True)
     with caplog.at_level(logging.INFO):
-        gui.App._log_materials(None, found, jobs)
+        App()._log_materials(found, jobs)
     library.finish_materials(found, jobs)
     assert f"'Lepus' {AVP}: user 복구 (재구성)" in caplog.text
 
@@ -822,6 +1207,268 @@ def test_diagnostics_report_holds_both_files(library, game, tmp_path, types, cap
     assert report["mod"] == "Lepus" and report["record"]["format"] == manager.MATFIX_FORMAT
     assert main(["--data-dir", str(library.data_dir), "materials", "report", "Lepus", "--out", str(tmp_path / "cli.zip")]) == 0
     assert (tmp_path / "cli.zip").is_file() and "1개" in capsys.readouterr().out
+
+
+def test_a_pak_with_an_entry_that_cannot_be_repaired_carries_over(library, game, tmp_path, types, monkeypatch):
+    """A PAK's entry that could not be repaired stays as shipped in its repair: checked again after a game update
+    the repaired PAK still has it, as a new repair would - that alone does not make it stale."""
+    from mhwmm.matfix import rsz
+
+    extra = {format(R.EXTRA, "x"): ["4444", "app.CustomChain", R.json.dumps(R.CHILD_FIELDS)]}
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry(**extra))
+    short = R.PARAM_FIELDS[:-1]
+    user = R.user_file([(R.EXTRA, 0x4444, R.CHILD_FIELDS, [R.s32(1)]),
+                        (R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(42)]),
+                        (R.PARAM, R.NO_CHILD_CRC, short, R.param(short))])
+    weapon = assemble_mdf2([material("body", [("BaseDielectricMap", "Art/w.tex")], [("Color", (0.5,) * 4)])], 45)
+    source = tmp_path / "Mixed" / "Mixed.pak"
+    source.parent.mkdir()
+    pakmod.write_pak([(pakmod.path_hash(WEAPON + ".mdf2.45"), weapon, len(weapon), 0),
+                      (pakmod.path_hash(AVP), user, len(user), 0)], source)
+    with library.prepare_install(source) as session:
+        mod = library.install_package(session, session.variants)
+    run(library, repair=True)
+    (result,) = library.material_results(mod.id)
+    assert result.state == "fixable" and len(result.stuck) == 1 and library.material_state(mod.id) == "repaired"
+
+    made_for = library.game_version()
+    update_game(game)
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {"Mixed.pak": True}}  # (the type data is this game version's)
+    library.finish_materials(found, jobs)
+    assert library.material_state(mod.id) == "repaired" and len(library.material_stuck(mod.id)) == 1
+    assert library._material_record(mod.id)["carried"] == {"from": made_for, "registry": library.registry_date()}
+
+
+EXTRA_PART = {format(R.EXTRA, "x"): ["4444", "app.TestExtraPart", R.json.dumps(R.CHILD_FIELDS)]}
+
+
+def avp_with_a_part():
+    """A mod's .user made for the fixture's game, with a part of its own the game's file does not have."""
+    return R.user_file([(R.EXTRA, 0x4444, R.CHILD_FIELDS, [R.s32(1)]), (R.CHILD, R.CHILD_CRC, R.CHILD_FIELDS, [R.s32(42)]),
+                        (R.PARAM, R.NEW_CRC, R.PARAM_FIELDS, R.param(R.PARAM_FIELDS, scale=3.0, hide=1))])
+
+
+@pytest.mark.parametrize("data", ["behind", "no history"])
+def test_a_pak_entry_stuck_in_the_updated_game_is_checked_again_with_newer_type_data(library, game, tmp_path, monkeypatch,
+                                                                                    data):
+    """The repaired PAK has the .user entry as shipped (it fit the game then). A game update changes the .user type,
+    and the entry is stuck in the mod's PAK and in the repaired one alike:
+    - "behind": the type data does not know the new layout yet (it cannot read the game's file). Stuck only for
+      that, the entry is not known to fit: no carry-over, the mod is to repair again.
+    - "no history": the type data is this version's, only without the entry's old layout. The repairs carry over,
+      and the record says so.
+    Newer type data then finds the entry stale in both PAKs: the mod is to repair again (carried over, the check
+    looks at the repaired PAK again), and a repair makes it fit."""
+    from mhwmm import precheck
+    from mhwmm.matfix import rsz
+    from mhwmm.matfix.repair import RszContext
+
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", R.registry(**EXTRA_PART))
+    monkeypatch.setattr(rsz.TypeRegistry, "_from_file", False)
+    weapon = assemble_mdf2([material("body", [("BaseDielectricMap", "Art/w.tex")], [("Color", (0.5,) * 4)])], 45)
+    user = avp_with_a_part()
+    source = tmp_path / "Mixed" / "Mixed.pak"
+    source.parent.mkdir()
+    pakmod.write_pak([(pakmod.path_hash(WEAPON + ".mdf2.45"), weapon, len(weapon), 0),
+                      (pakmod.path_hash(AVP), user, len(user), 0)], source)
+    with library.prepare_install(source) as session:
+        mod = library.install_package(session, session.variants)
+    run(library, [mod.id], repair=True)
+    assert library.material_state(mod.id) == "repaired"
+    repaired, made_for = library.repaired_materials(mod.id), library.game_version()
+    assert pakmod.PakFile(repaired["Mixed.pak"][1]).read_hash(pakmod.path_hash(AVP)) == user  # (left as shipped)
+
+    monkeypatch.setattr(rsz, "download_registry", lambda folder: None)  # nothing newer published yet
+    if data == "no history":
+        monkeypatch.setattr(rsz.TypeRegistry, "_loaded", newer_types(history=False, **EXTRA_PART))
+    update_game(game, {BODY + ".mdf2.45": assemble_mdf2(current_body(), 45), AVP: newer_game_avp()})
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    (own,) = found.results[mod.id]
+    assert own.state == "fixable" and [i["label"] for i in own.stuck] == [f"Mixed.pak#{pakmod.path_hash(AVP):016X}.user"]
+    assert found.carried == {mod.id: {"Mixed.pak": data == "no history"}}
+    assert library.finish_materials(found, jobs) == []
+    record = library._material_record(mod.id)
+    if data == "behind":
+        assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+        assert record["applied_game"] == made_for and "carried" not in record
+        assert library.materials_to_offer() == [mod]
+    else:
+        assert library.material_state(mod.id) == "repaired" and library.materials_to_offer() == []
+        assert record["applied_game"] == library.game_version()
+        assert record["carried"] == {"from": made_for, "registry": library.registry_date()}
+    assert library.material_stuck(mod.id)
+
+    monkeypatch.setattr(rsz.TypeRegistry, "_loaded", newer_types(**EXTRA_PART))  # newer type data comes
+    monkeypatch.setattr(library, "registry_date", lambda refresh=False: "2099-01-01")
+    assert library.material_state(mod.id) == "unchecked"
+    jobs = library.material_jobs(unchecked_only=True)
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {"Mixed.pak": False}}  # the entry in the repaired PAK is stale now
+    assert library.finish_materials(found, jobs) == []
+    record = library._material_record(mod.id)
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert record["applied_game"] == made_for != library.game_version() and "carried" not in record
+    assert not library.material_stuck(mod.id) and library.materials_to_offer() == [mod]
+    assert library.problems() == {mod.id: [precheck.REPAIRS_OUTDATED]}
+    assert library.repaired_materials(mod.id) == repaired  # (in use until the mod is repaired again)
+
+    assert run(library, [mod.id], repair=True) == [mod]
+    assert library.material_state(mod.id) == "repaired" and "carried" not in library._material_record(mod.id)
+    index = GameIndex(game, tmp_path / "cache2")
+    path = library.mod_entries(mod.id)["Mixed.pak"][0]
+    (verdict,) = check_mod([("Mixed.pak", "Mixed.pak", path)], index, None, rszs=RszContext(index))
+    assert verdict.state == "current"  # what is deployed now fits the updated game
+
+
+def test_carried_over_repairs_are_checked_again_with_newer_type_data(library, game, tmp_path, types, monkeypatch):
+    """Newer .user/.pfb type data checks a mod whose repairs carried over a game update again, the repaired copies
+    too: still fitting, they stay (the record says with which type data they were looked at)."""
+    from mhwmm.matfix import rsz
+
+    mod = install_tree(library, tmp_path / "Lepus", {AVP: old_avp(), BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, [mod.id], repair=True)
+    made_for = library.game_version()
+    update_game(game)
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "repaired"
+    assert library._material_record(mod.id)["carried"] == {"from": made_for, "registry": library.registry_date()}
+
+    monkeypatch.setattr(rsz.TypeRegistry, "date_in_use", classmethod(lambda cls: "2099-01-01"))  # (the same types)
+    monkeypatch.setattr(library, "registry_date", lambda refresh=False: "2099-01-01")
+    assert library.material_state(mod.id) == "unchecked"
+    jobs = library.material_jobs(unchecked_only=True)
+    assert [(j.mod_id, j.carried, j.repaired_for == library.game_version()) for j in jobs] == [(mod.id, True, True)]
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {AVP: True, BODY + ".mdf2.45": True}}
+    assert library.finish_materials(found, jobs) == []
+    record = library._material_record(mod.id)
+    assert library.material_state(mod.id) == "repaired" and library.problems() == {}
+    assert record["applied_game"] == library.game_version()
+    assert record["carried"] == {"from": made_for, "registry": "2099-01-01"}
+    assert library.material_jobs(unchecked_only=True) == []
+
+    library.restore_materials(mod.id)
+    assert "carried" not in library._material_record(mod.id)
+
+
+def test_carried_over_repairs_are_looked_at_by_every_check(library, game, tmp_path):
+    """A check of a mod whose repairs carried over looks at the repaired copies again: one that no longer fits
+    (here: no longer reads) makes the mod one to repair again, as before the carry-over."""
+    from mhwmm import precheck
+
+    mod = install_tree(library, tmp_path / "Chen", {BODY + ".mdf2.45": assemble_mdf2(old_body_mod(), 45)})
+    run(library, [mod.id], repair=True)
+    made_for = library.game_version()
+    update_game(game)
+    run(library, unchecked_only=True)
+    assert library.material_state(mod.id) == "repaired" and "carried" in library._material_record(mod.id)
+    library.mark_materials_offered([mod])
+    ((_rel, path),) = library.repaired_materials(mod.id).values()
+    path.write_bytes(b"broken")
+
+    jobs = library.material_jobs([mod.id])
+    found = library.run_materials(jobs)
+    assert found.carried == {mod.id: {BODY + ".mdf2.45": False}}
+    library.finish_materials(found, jobs)
+    record = library._material_record(mod.id)
+    assert library.material_state(mod.id) == "stale" and library.material_repairs_outdated(mod.id)
+    assert record["applied_game"] == made_for and "carried" not in record
+    assert library.problems() == {mod.id: [precheck.REPAIRS_OUTDATED]} and library.materials_to_offer() == [mod]
+    assert run(library, [mod.id], repair=True) == [mod]
+    assert library.material_state(mod.id) == "repaired" and "carried" not in library._material_record(mod.id)
+
+
+def test_what_counts_as_a_repair_that_still_fits(tmp_path, monkeypatch):
+    """The rules of _repairs_fit on made-up results of the repaired copies' check (``seen``) next to the mod's own
+    files' (``own``). The PAKs are real files: an entry stuck in a repaired copy fits only when the old repair left
+    it as shipped, and every entry the own PAK's check reads must read in the copy too."""
+    from mhwmm import manager
+
+    user = tmp_path / "ok.user.3"
+    user.write_bytes(R.game_file())
+    broken = tmp_path / "broken.user.3"
+    broken.write_bytes(b"not an RSZ file")
+    stuck_user = tmp_path / "stuck.user.3"
+    stuck_user.write_bytes(R.game_file())
+    weapon = assemble_mdf2([material("body", [("BaseDielectricMap", "Art/w.tex")], [("Color", (0.5,) * 4)])], 45)
+    tex = ("natives/STM/Art/x.tex.241106027", b"TEX" * 10)
+
+    def pak(path, entries):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pakmod.write_pak([(pakmod.path_hash(name), data, len(data), 0) for name, data in entries], path)
+        return path
+
+    def label(name, rel=AVP):
+        return f"{name}#{pakmod.path_hash(rel):016X}.user"
+
+    paks = {  # name: (the mod's own PAK, its repaired copy)
+        "Stuck.pak": ([(AVP, old_avp())], [(AVP, old_avp())]),  # the stuck entry left as shipped
+        "Other.pak": ([(AVP, old_avp())], [(AVP, old_avp())]),
+        "Rewritten.pak": ([(AVP, old_avp())], [(AVP, R.game_file())]),  # the stuck entry is one the repair rewrote
+        "Empty.pak": ([tex], [tex]),
+        "Damaged.pak": ([(WEAPON + ".mdf2.45", weapon), tex], [(WEAPON + ".mdf2.45", b"MDF\x00" + b"\xff" * 64), tex]),
+        "Gone.pak": ([(WEAPON + ".mdf2.45", weapon), tex], [tex]),
+    }
+    names = ["cur.mdf2.45", "fix.mdf2.45", "err.mdf2.45", "same.mdf2.45", "new.mdf2.45", *paks, "none.mdf2.45",
+             "ok.user.3", "broken.user.3", "stuck.user.3"]
+    paths = {"ok.user.3": user, "broken.user.3": broken, "stuck.user.3": stuck_user}
+    own_paths = {}
+    for name, (mine, repaired) in paks.items():
+        own_paths[name] = pak(tmp_path / "own" / name, mine)
+        paths[name] = pak(tmp_path / "repaired" / name, repaired)
+    files = [(n, n, own_paths.get(n, tmp_path / "own" / n)) for n in names]
+    job = manager.MaterialJob("m", "M", "s", files, repaired={n: (n, paths.get(n, tmp_path / n)) for n in names}
+                              | {"elsewhere.mdf2.45": ("elsewhere.mdf2.45", tmp_path / "x")}, repaired_for="old")
+
+    def result(key, state, unresolved=(), stuck=()):
+        kind = "pak" if key.endswith(".pak") else key.split(".")[1]
+        return FileResult(key, key, kind, state, unresolved=list(unresolved),
+                          rsz=[{"label": label, "kind": "user", "method": "", "reason": "r"} for label in stuck])
+
+    special = ("same.mdf2.45", "Stuck.pak", "Other.pak", "Rewritten.pak", "stuck.user.3")
+    own = [result(n, "fixable") for n in names if n not in special]
+    own += [result("same.mdf2.45", "fixable", ["m1"]), result("Stuck.pak", "fixable", stuck=[label("Stuck.pak")]),
+            result("Other.pak", "fixable", stuck=[label("Other.pak")]),
+            result("Rewritten.pak", "fixable", stuck=[label("Rewritten.pak")]),
+            result("stuck.user.3", "stuck", stuck=["stuck.user.3"])]
+    seen = [result("cur.mdf2.45", "current"), result("fix.mdf2.45", "fixable"), result("err.mdf2.45", "error"),
+            result("same.mdf2.45", "unresolved", ["m1"]), result("new.mdf2.45", "unresolved", ["m2"]),
+            result("Stuck.pak", "stuck", stuck=[label("Stuck.pak")]),
+            result("Other.pak", "stuck", stuck=[label("Other.pak", WEAPON + ".mdf2.45")]),
+            result("Rewritten.pak", "stuck", stuck=[label("Rewritten.pak")]),
+            result("Damaged.pak", "current"),
+            result("ok.user.3", "current"), result("broken.user.3", "current"),
+            result("stuck.user.3", "stuck", stuck=["stuck.user.3"])]
+    checked = []
+    monkeypatch.setattr(manager, "check_mod", lambda files, *a, **k: checked.append(files) or seen)
+    assert manager.ModManager._repairs_fit(job, own, None, None, None, None) == {
+        "cur.mdf2.45": True, "fix.mdf2.45": False, "err.mdf2.45": False,
+        "same.mdf2.45": True, "new.mdf2.45": False,  # (a material left as shipped only by the repaired copy)
+        "Stuck.pak": True, "Other.pak": False,  # (an entry stuck only in the repaired copy)
+        "Rewritten.pak": False,  # stuck in this game, and not as shipped: not known to fit (newer type data)
+        "Empty.pak": True, "none.mdf2.45": False,  # nothing to look at in a PAK; a loose file always has a result
+        "Damaged.pak": False, "Gone.pak": False,  # an entry the own PAK's check reads does not read in the copy
+        "ok.user.3": True, "broken.user.3": False,  # (check_mod takes one that does not read for no RSZ file)
+        "stuck.user.3": False,  # a repaired loose .user is one the old repair rewrote: stuck, it is not known to fit
+        "elsewhere.mdf2.45": False}  # not one of the files looked at
+    assert checked == [[(n, n, paths.get(n, tmp_path / n)) for n in names]]  # the repaired copies in their place
+
+    # the entry left as shipped is stuck while the type data is behind the game (a game file it could not read or
+    # whose CRCs it does not have, during the checks since ``marks``, or the game's sample .pfb): not known to fit
+    from types import SimpleNamespace
+
+    for context, marks, fits in [(SimpleNamespace(game_unreadable=2, registry_outdated=1, matches_game=lambda: None),
+                                  (2, 1), True),
+                                 (SimpleNamespace(game_unreadable=2, registry_outdated=1, matches_game=lambda: None),
+                                  (2, 0), False),
+                                 (SimpleNamespace(game_unreadable=1, registry_outdated=0, matches_game=lambda: None),
+                                  None, False),
+                                 (SimpleNamespace(game_unreadable=0, registry_outdated=0, matches_game=lambda: False),
+                                  (0, 0), False)]:
+        assert manager.ModManager._repairs_fit(job, own, None, None, context, None, marks)["Stuck.pak"] is fits
 
 
 def test_stuck_files_are_checked_again_with_newer_type_data(library, game, tmp_path, types, monkeypatch):

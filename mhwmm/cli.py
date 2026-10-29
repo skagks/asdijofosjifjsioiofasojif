@@ -339,6 +339,11 @@ def cmd_verify(manager: ModManager, args) -> int:
 
 MATERIAL_STATES = {"unchecked": "점검 전", "current": "현재 게임과 맞음", "stale": "복구 필요",
                    "repaired": "복구됨", "declined": "복구하지 않음 (원래 파일 사용)"}
+# a stale mod whose repairs are from before a game update (manager.material_repairs_outdated)
+MATERIAL_REDO = "다시 복구 필요 (게임이 업데이트되어 전에 복구한 파일이 맞지 않음. 다시 복구할 때까지는 전에 복구한 파일을 씀)"
+MATERIAL_CARRIED = "복구됨 (게임이 업데이트된 뒤에도 전에 복구한 파일이 맞아 그대로 씀)"
+# a file of a "복구됨" mod that is stale itself: its repair in use fits (no repair needed)
+MATERIAL_IN_USE = " - 원래 파일은 맞지 않아 복구한 파일 사용 중"
 
 
 def cmd_materials(manager: ModManager, args) -> int:
@@ -388,20 +393,30 @@ def cmd_materials(manager: ModManager, args) -> int:
             failed += 1
             continue
         state = manager.material_state(job.mod_id)
-        print(f"{position.get(job.mod_id, '?')}. {job.name}: {MATERIAL_STATES.get(state, state)}")
+        label = MATERIAL_STATES.get(state, state)
+        if state == "stale" and manager.material_repairs_outdated(job.mod_id):
+            label = MATERIAL_REDO
+        elif state == "repaired" and not repair and job.repaired and job.repaired_for != run.game:
+            label = MATERIAL_CARRIED  # (finish_materials kept them for this game version)
+        print(f"{position.get(job.mod_id, '?')}. {job.name}: {label}")
+        # a check of a mod whose repairs in use fit this game: its own stale files are handled by them
+        in_use = set(manager.repaired_materials(job.mod_id)) if not repair and state == "repaired" else set()
         for r in run.results.get(job.mod_id, []):
+            own = r.state == "fixable" and r.key in in_use
             if r.state == "error":
                 failed += 1
                 print(f"     {r.rel}: 오류 - {r.error}")
             elif r.state == "fixable" and (r.fixed or r.kind == "mdf2"):
                 moved = f"  ->  {r.new_rel}" if r.new_rel != r.rel and not r.rsz else ""
-                print(f"     {r.rel}: 재질 {', '.join(r.fixed) or '버전 번호'}{moved}")
+                print(f"     {r.rel}: 재질 {', '.join(r.fixed) or '버전 번호'}{moved}{MATERIAL_IN_USE if own else ''}")
             for item in r.rsz:
                 if item.get("reason"):
                     failed += 1
                     print(f"     {item['label']}: {item['kind']} 복구 불가 - {item['reason']}")
                     if item.get("detail"):
                         print(f"       ({item['detail']})")
+                elif r.state != "error" and own:
+                    print(f"     {item['label']}: {item['kind']}{MATERIAL_IN_USE}")
                 elif r.state != "error":
                     moved = f"  ->  {r.new_rel}" if r.kind != "pak" and r.new_rel != r.rel else ""
                     print(f"     {item['label']}: {item['kind']} {'복구' if repair else '복구 필요'} ({item['method']}){moved}")

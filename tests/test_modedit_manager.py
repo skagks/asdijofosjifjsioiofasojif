@@ -620,6 +620,92 @@ def test_a_repair_of_a_file_left_out_stays(mlib, tmp_path, mgame):
     assert mlib.repaired_materials(mod.id) == {}
 
 
+def game_update(mgame: Path) -> None:
+    """A game update that changes none of the game's files the mods' repairs were made for."""
+    pak = mgame / "re_chunk_000.pak"
+    touch_later(pak, pak.read_bytes())
+
+
+def test_values_set_on_a_repair_that_carries_over_stay(mlib, tmp_path, mgame):
+    """A repair that still fits after a game update stays the base: the values set on it need nothing again."""
+    mod = install(mlib, tmp_path, "Old", {ITEM: mf.stale_item_data(3)})
+    M.run(mlib, [mod.id], repair=True)
+    set_values(mlib, mod.id, ITEM, {SELL.format(102): "4242"})
+    assert keys(mlib, mod.id)[ITEM] == "edits/" + ITEM
+    game_update(mgame)
+    assert M.run(mlib, unchecked_only=True) == []
+    assert mlib.material_state(mod.id) == "repaired"
+    assert keys(mlib, mod.id)[ITEM] == "edits/" + ITEM and mlib.edits_pending() == [] and mlib.edit_issues(mod.id) == []
+    assert mlib.edit_record(mod.id).items[0].base.key == "matfix/" + ITEM
+    mlib.deploy()
+    assert value((mgame / ITEM).read_bytes(), SELL.format(102)) == "4242"
+
+
+def test_a_repair_of_a_file_left_out_goes_when_the_others_carry_over(mlib, tmp_path, mgame):
+    """The check does not look at the files 모드 수정 left out: when the other repairs carry over to a new game version,
+    theirs (made for the older one) go - put back, the file is stale and offered, not taken as repaired for it."""
+    other = ITEM.replace("ItemData", "ItemData2")
+    M.write_game_pak(mgame / "re_chunk_000.pak.patch_001.pak",
+                     {other: mf.item_data(rows=[mf.item_row(i) for i in range(3)])})
+    mod = install(mlib, tmp_path, "Old", {ITEM: mf.stale_item_data(3), other: mf.stale_item_data(3)})
+    M.run(mlib, [mod.id], repair=True)
+    gone = mlib.repaired_materials(mod.id)[other][1]
+    exclude(mlib, mod.id, other)
+    M.run(mlib, unchecked_only=True)
+    assert mlib.material_state(mod.id) == "repaired" and set(mlib.repaired_materials(mod.id)) == {ITEM, other}
+
+    game_update(mgame)
+    assert M.run(mlib, unchecked_only=True) == []  # (the file left out is not in the game either way)
+    assert mlib.material_state(mod.id) == "repaired" and set(mlib.repaired_materials(mod.id)) == {ITEM}
+    assert not gone.exists()
+    exclude(mlib, mod.id, other, flag=False)
+    M.run(mlib, unchecked_only=True)
+    assert mlib.material_state(mod.id) == "stale" and not mlib.material_repairs_outdated(mod.id)
+    assert mlib.materials_to_offer() == [mlib.get(mod.id)]
+
+
+@pytest.mark.parametrize("change", ["put back", "left out"])
+def test_files_left_out_or_put_back_during_a_check_stop_the_carry_over(mlib, tmp_path, mgame, change):
+    """모드 수정 saved while the background check after a game update ran (the check sets no busy flag): the run
+    looked at other files than the mod has now, so nothing carries over - a repair of a file put back is in use
+    again and must not go. The record is unchecked, and the check that follows carries over what fits."""
+    other = ITEM.replace("ItemData", "ItemData2")
+    M.write_game_pak(mgame / "re_chunk_000.pak.patch_001.pak",
+                     {other: mf.item_data(rows=[mf.item_row(i) for i in range(3)])})
+    mod = install(mlib, tmp_path, "Old", {ITEM: mf.stale_item_data(3), other: mf.stale_item_data(3)})
+    M.run(mlib, [mod.id], repair=True)
+    repaired = mlib.repaired_materials(mod.id)
+    assert set(repaired) == {ITEM, other}
+    if change == "put back":
+        exclude(mlib, mod.id, other)
+        M.run(mlib, unchecked_only=True)
+        assert mlib.material_state(mod.id) == "repaired" and mlib.repaired_materials(mod.id) == repaired
+
+    game_update(mgame)
+    jobs = mlib.material_jobs(unchecked_only=True)  # the GUI thread takes the jobs
+    assert jobs[0].left_out == (frozenset({other}) if change == "put back" else frozenset())
+    found = mlib.run_materials(jobs)  # (a worker thread)
+    assert all(found.carried[mod.id].values())
+    exclude(mlib, mod.id, other, flag=change == "left out")  # meanwhile 모드 수정 saves
+    if change == "put back":
+        assert keys(mlib, mod.id)[other] == "matfix/" + other  # its repair is in use again
+    mlib.deploy()
+    deployed = (mgame / other).read_bytes() if change == "put back" else None
+
+    assert mlib.finish_materials(found, jobs) == []
+    assert mlib.material_state(mod.id) == "unchecked"
+    assert mlib.repaired_materials(mod.id) == repaired and all(path.is_file() for _rel, path in repaired.values())
+    if change == "put back":
+        assert keys(mlib, mod.id)[other] == "matfix/" + other
+        mlib.deploy()
+        assert (mgame / other).read_bytes() == deployed == repaired[other][1].read_bytes()
+
+    assert M.run(mlib, unchecked_only=True) == []  # the check that follows (the GUI's _matfix_again)
+    assert mlib.material_state(mod.id) == "repaired" and mlib.materials_to_offer() == []
+    assert set(mlib.repaired_materials(mod.id)) == ({ITEM, other} if change == "put back" else {ITEM})
+    assert mlib._material_record(mod.id)["applied_game"] == mlib.game_version()
+
+
 def test_a_stuck_entry_of_a_pak_says_it_cannot_be_repaired(mlib, tmp_path, monkeypatch):
     """matfix labels a PAK's entry "<pak>#<hash>.user": the 게임 수치 page adds that it cannot be repaired for it as
     for a loose file, also when another entry's repair made the repair PAK the base (§2.7, #6)."""

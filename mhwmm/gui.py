@@ -1264,8 +1264,9 @@ class MaterialsDialog(Dialog):
         self.tree.column("detail", width=px(350), anchor="w")
         self.checked = {m.id for m in mods}
         for mod in mods:
+            again = "다시 복구 · " if manager.material_repairs_outdated(mod.id) else ""  # (repaired before a game update)
             self.tree.insert("", "end", iid=mod.id, text=" " + mod.name, image=self.on,
-                             values=(material_summary(manager.material_results(mod.id)),))
+                             values=(again + material_summary(manager.material_results(mod.id)),))
         self.tree.bind("<Button-1>", self._toggle)
         sb = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=autohide(sb, side="right", fill="y"))
@@ -4342,8 +4343,9 @@ class App:
         if mod.update:
             chips.append(("새 버전 있음", "chip_info"))
         material = m.material_state(mod.id)
+        redo = material == "stale" and m.material_repairs_outdated(mod.id)  # (repairs from before a game update)
         if material == "stale":
-            chips.append(("재질 복구 필요", "chip_warn"))
+            chips.append(("재질 다시 복구 필요" if redo else "재질 복구 필요", "chip_warn"))
         elif material == "repaired":
             chips.append(("재질 복구됨", "chip_info"))
         chips += [(KIND_LABELS[k], "chip") for k in KIND_LABELS if k in self._display_kinds(mod)]
@@ -4399,7 +4401,8 @@ class App:
             elif material == "current":
                 chunks += [("현재 게임과 맞음", "value")]
             elif material == "stale":
-                chunks += [("✕ ", ("value", "req_missing")), ("현재 게임과 맞지 않음   ", "value"),
+                chunks += [("✕ ", ("value", "req_missing")),
+                           ("전에 복구한 파일이 현재 게임과 맞지 않음   " if redo else "현재 게임과 맞지 않음   ", "value"),
                            ("재질 복구", ("value", "link", "matfix_repair"))]
             elif material == "repaired":
                 chunks += [("✓ ", ("value", "req_ok")), (f"복구한 파일 {repaired}개 사용 중   ", "value")]
@@ -4447,7 +4450,13 @@ class App:
             link = " 위 '필요한 모드'의 이름을 누르면 Nexus 페이지가 열립니다." if any(r["url"] for r in missing) else ""
             chunks += [("\n", None), ("필요한 모드가 없습니다\n", ("warn", "warn_title")),
                        (f"{names} — 설치하거나 켜야 이 모드가 제대로 작동합니다.{link}\n", "warn")]
-        if material == "stale":
+        if redo:
+            chunks += [("\n", None), ("게임이 업데이트되어 다시 복구해야 합니다\n", ("warn", "warn_title")),
+                       ("게임 업데이트로 재질(.mdf2)이나 .user·.pfb 파일의 구조가 다시 바뀌어 전에 복구한 파일도 현재 게임과 "
+                        "맞지 않습니다. 다시 복구할 때까지는 전에 복구한 파일을 그대로 쓰므로 텍스처가 깨지거나 게임이 검은 "
+                        "화면에서 멈출 수 있습니다. 위 '재질 복구'를 누르면 모드의 원래 파일에서 현재 게임의 구조로 다시 "
+                        "복구합니다.\n", "warn")]
+        elif material == "stale":
             chunks += [("\n", None), ("현재 게임과 맞지 않는 파일이 있습니다\n", ("warn", "warn_title")),
                        ("게임 업데이트로 재질(.mdf2)이나 .user·.pfb 파일의 구조가 바뀌어 텍스처가 깨지거나 게임이 "
                         "검은 화면에서 멈출 수 있습니다. 위 '재질 복구'를 누르면 모드의 내용을 현재 게임의 구조에 옮겨 "
@@ -5818,18 +5827,28 @@ class App:
 
     def _log_materials(self, run: MaterialRun, jobs: list[MaterialJob]):
         names = {j.mod_id: j.name for j in jobs}
+        in_use, carried = self._repairs_in_use(run, jobs)
         for mod_id, error in run.errors.items():
             log.warning("'%s': 재질을 점검하지 못했습니다: %s", names[mod_id], error)
         for mod_id, results in run.results.items():
+            # the mod's own stale files whose repairs in use fit the game: not a problem, one line (none when
+            # finish_materials just said that they carried over a game update), each file only at debug level
+            handled = {r.key for r in results if r.state == "fixable" and r.key in in_use.get(mod_id, ())}
+            if handled and mod_id not in carried:
+                log.info("'%s': 모드의 원래 파일 %d개가 현재 게임과 맞지 않아 복구한 파일을 쓰고 있습니다",
+                         names[mod_id], len(handled))
             for r in results:
                 where = f"'{names[mod_id]}' {r.rel}"
                 moved = f" → {r.new_rel}" if r.new_rel and r.new_rel != r.rel else ""
+                own = r.key in handled
                 if r.state == "error":
                     log.warning("%s: 읽거나 고치지 못했습니다: %s", where, r.error)
                 elif r.state == "fixable" and (r.fixed or r.kind == "mdf2"):
                     what = ", ".join(r.fixed) or "버전 번호"
                     if run.repair:
                         log.info("%s: 재질을 복구했습니다 (%s)%s", where, what, "" if r.rsz else moved)
+                    elif own:
+                        log.debug("%s: 원래 파일의 재질이 현재 게임과 맞지 않아 복구한 파일을 씁니다 (%s)", where, what)
                     else:
                         log.warning("%s: 재질이 현재 게임과 맞지 않습니다 (%s)", where, what)
                 for item in r.rsz:
@@ -5843,6 +5862,8 @@ class App:
                     elif run.repair:
                         log.info("%s: %s 복구 (%s)%s", target, item["kind"], item["method"],
                                  moved if r.kind != "pak" else "")
+                    elif own:
+                        log.debug("%s: 원래 %s 파일이 현재 게임과 맞지 않아 복구한 파일을 씁니다", target, item["kind"])
                     else:
                         log.warning("%s: %s 파일이 현재 게임과 맞지 않습니다 (%s(으)로 고칠 수 있음)", target,
                                     item["kind"], item["method"])
@@ -5857,6 +5878,27 @@ class App:
                 if run.repair:
                     for note in r.notes:
                         log.info("%s: %s", where, note)
+
+    def _repairs_in_use(self, run: MaterialRun, jobs: list[MaterialJob]) -> tuple[dict[str, set], set]:
+        """After finish_materials stored a check (not a repair): {mod id: source keys of its repairs in use} of the
+        mods that are "repaired" for the game the run checked (their own stale files are handled by those repairs),
+        and of them the ones whose repairs carried over a game update in this run (finish_materials said so)."""
+        in_use, carried = {}, set()
+        if run.repair:
+            return in_use, carried
+        m = self.manager
+        for job in jobs:
+            if job.mod_id not in run.results or not self._checked_now(run, job):
+                continue  # (not stored: what the run found is shown as it is)
+            try:
+                if m.material_checked_for(job.mod_id) != run.game or m.material_state(job.mod_id) != "repaired":
+                    continue
+                in_use[job.mod_id] = set(m.repaired_materials(job.mod_id))
+            except KeyError:  # (removed meanwhile)
+                continue
+            if job.repaired and job.repaired_for != run.game:
+                carried.add(job.mod_id)
+        return in_use, carried
 
     def _waits_for_options(self, mod_id: str) -> bool:
         try:

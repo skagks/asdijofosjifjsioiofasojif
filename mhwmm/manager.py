@@ -46,9 +46,10 @@ from .equip.paths import normalize as normalize_path
 from .matfix import MatfixError, rsz
 from .matfix.donors import candidate_paths
 from .matfix.game import GameIndex, ShaderIndex, game_fingerprint
+from .matfix.mdf2 import detect_version
 from .matfix.pak import PakFile, path_hash
-from .matfix.repair import MMTR_VERSIONS, RSZ_RE, Aliases, FileResult, RszContext, check_mod, is_material_file, \
-    rsz_sources, shader_file
+from .matfix.repair import CURRENT_VERSION_HINT, MMTR_VERSIONS, RSZ_RE, Aliases, FileResult, RszContext, check_mod, \
+    is_material_file, rsz_sources, shader_file
 from .modedit import EDITS_DIR, EDITS_PREFIX, EDITS_RECORD, EditError, GameCopyChanged
 from .modedit import build as edit_build
 from .modedit import engines as edit_engines
@@ -75,10 +76,13 @@ MAX_ARCHIVE_DIRS = 8
 # can give a file another result. 2: .user/.pfb/.scn checked too; 3: RSZ rules of v1.11.1-1.11.3;
 # 4: a donor picked from others no longer decides alone (stale when no current material of its shader has
 # all the mod's slots; the copied material still decides), "null" never; paks the game does not read left out;
-# 5: the shaders the game does not have of materials left as shipped are recorded (shader requirements).
-MATFIX_FORMAT = 5
+# 5: the shaders the game does not have of materials left as shipped are recorded (shader requirements);
+# 6: repairs made for an older game version that fit the current one too stay in use as its own (the records
+# v2.7.0 made after a game update called every repaired mod stale).
+MATFIX_FORMAT = 6
 SHADERS_FORMAT = 5  # records from this format on list those shaders (FileResult.shaders)
 SHADER_FILE_RE = re.compile(r"^natives/stm/(.+\.mmtr)\.(\d+)$", re.IGNORECASE)  # a shader file a mod puts in
+PAK_ENTRY_LABEL_RE = re.compile(r"#([0-9a-f]{16})\.[a-z]+$", re.IGNORECASE)  # check_mod's label of a PAK's RSZ entry
 REPORT_SELFTEST_ITEMS = 6  # game parts the diagnostics zip's 3D preview self-test looks at
 REPORT_SELFTEST_SECONDS = 60.0  # ... and for at most this long
 REGISTRY_RETRY = 3 * 86400  # how long to wait before looking for newer .user/.pfb type data again
@@ -659,6 +663,11 @@ class MaterialJob:
     retarget: dict = field(default_factory=dict)  # Mod.retarget: compared with the original equipment's files
     excluded: str = ""  # _exclusion_digest of the files 모드 수정 left out (kept in the record: another set is unchecked)
     left_out: frozenset = frozenset()  # their source keys (their repairs stay: the check does not look at them)
+    # the repairs in use (repaired_materials, without those of the files left out) and the game version they were
+    # made for: a check against another one looks at whether they fit it too (MaterialRun.carried)
+    repaired: dict = field(default_factory=dict)
+    repaired_for: str = ""
+    carried: bool = False  # they were carried over from an older game version (the record's "carried"): looked at too
 
 
 @dataclass
@@ -670,6 +679,10 @@ class MaterialRun:
     registry: str = ""  # date of the .user/.pfb type data used
     registry_updated: str = ""  # newer type data downloaded during the run (read by it when that was before its
     # jobs, else from the next check)
+    # checks: mod id -> {source key: its repair in use, made for another game version (or carried over to this
+    # one: MaterialJob.carried), fits this one} (only mods with files that are still stale; finish_materials keeps
+    # those repairs as this version's, or no longer when carried over ones do not fit)
+    carried: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -1617,12 +1630,29 @@ class ModManager:
         results = self.material_results(mod_id)
         if any(r.stuck for r in results) and record.get("registry", "") < self.registry_date():
             return "unchecked"  # newer .user/.pfb type data may repair what could not be repaired
+        carried = record.get("carried")
+        if isinstance(carried, dict) and str(carried.get("registry") or "") < self.registry_date() \
+                and any(RSZ_RE.search(rel) or is_root_pak(rel) for _key, rel, _path in self.material_files(mod_id)):
+            return "unchecked"  # repairs carried over a game update with older type data: it may find them stale
         fixable = {r.key for r in results if r.state == "fixable"}
         if not fixable:
             return "current"
         if record.get("applied_game") == game and fixable <= set(self.repaired_materials(mod_id)):
             return "repaired"
         return "declined" if record.get("declined") else "stale"
+
+    def material_repairs_outdated(self, mod_id: str) -> bool:
+        """Whether a "stale" mod is so after a game update: a file that is still stale has a repair in use made for
+        an older game version (not carried over to this one, finish_materials), which stays in use until the mod is
+        repaired again. False for any other mod, and for a stale one whose stale files were never repaired."""
+        if self.material_state(mod_id) != "stale":
+            return False
+        made_for = self._material_record(mod_id).get("applied_game")
+        if not made_for or made_for == self.game_version():
+            return False
+        excluded = self._edit_overlay(mod_id).excluded
+        repaired = {k for k in self.repaired_materials(mod_id) if k not in excluded}
+        return any(r.key in repaired for r in self.material_results(mod_id) if r.state == "fixable")
 
     def stale_material_mods(self, enabled_only: bool = False) -> list[Mod]:
         return [m for m in self.mods if (m.enabled or not enabled_only) and self.material_state(m.id) == "stale"]
@@ -1658,9 +1688,16 @@ class ModManager:
                 if mod.retarget:  # (its RSZ files are looked at as the original shipped them)
                     provided |= {re.sub(r"\.\d+$", "", Path(str(move[1])).name).lower()
                                  for move in mod.retarget.get("moves") or () if isinstance(move, list) and len(move) == 2}
+                left_out = frozenset(self._edit_overlay(mod_id).excluded)
+                record = self._material_record(mod_id)
+                made_for = record.get("applied_game")
                 jobs.append(MaterialJob(mod_id, mod.name, mod.files_stamp, list(files), provided,
                                         retarget=copy.deepcopy(mod.retarget), excluded=self._exclusion_digest(mod_id),
-                                        left_out=frozenset(self._edit_overlay(mod_id).excluded)))
+                                        left_out=left_out,
+                                        repaired={k: v for k, v in self.repaired_materials(mod_id).items()
+                                                  if k not in left_out},
+                                        repaired_for=made_for if isinstance(made_for, str) else "",
+                                        carried=isinstance(record.get("carried"), dict)))
         return jobs
 
     def run_materials(self, jobs: list[MaterialJob], repair: bool = False,
@@ -1738,13 +1775,148 @@ class ModManager:
                 numbers = itertools.count(1)
                 out = lambda result, stage=job.stage, numbers=numbers: \
                     stage / f"{next(numbers):03d}_{result.new_rel.rsplit('/', 1)[-1]}"
+            marks = self._type_marks(context)  # (what this mod's check finds of the type data: _types_lag)
             try:
                 aliases = retarget_aliases(job.retarget) if job.retarget else None
-                run.results[job.mod_id] = check_mod(job.files, game, shaders, out, provided=job.provided,
-                                                    rszs=context, aliases=aliases)
+                results = run.results[job.mod_id] = check_mod(job.files, game, shaders, out, provided=job.provided,
+                                                              rszs=context, aliases=aliases)
             except Exception as exc:  # one broken mod must not stop the others
                 log.warning("%s: 재질을 %s하지 못했습니다: %s", job.name, verb, exc)
                 run.errors[job.mod_id] = str(exc)
+                continue
+            # repairs made for another game version, or carried over to this one (checked again: newer type data
+            # may find them stale)
+            if not run.repair and job.repaired and (job.repaired_for != run.game or job.carried) \
+                    and any(r.state == "fixable" for r in results):
+                try:
+                    run.carried[job.mod_id] = self._repairs_fit(job, results, game, shaders, context, aliases, marks)
+                except Exception as exc:  # (then they are not known to fit: the mod stays stale)
+                    log.warning("%s: 전에 복구한 파일을 점검하지 못했습니다: %s", job.name, exc)
+
+    @staticmethod
+    def _repairs_fit(job: MaterialJob, results: list[FileResult], game, shaders, context,
+                     aliases: Aliases | None, marks: tuple[int, int] | None = None) -> dict[str, bool]:
+        """Whether each repair in use (``job.repaired``, made for another game version or carried over to this one)
+        fits this one. The mod's files are checked again as the game gets them, the repaired copies in place of its
+        own files (all of them, read-only: a donor may come from the current copy of another of its files, as in the
+        check of its own). One fits when a repair would not change it: it reads (a PAK: every entry the check of the
+        mod's own PAK reads), nothing in it is stale, and it has no material left as shipped that the mod's own file
+        (``results``) does not have too. An entry stuck in it fits only when the old repair left it as shipped, the
+        mod's own file has it stuck too and the type data is this game version's (not _types_lag since ``marks``,
+        taken before the check of the mod's own files: stuck because the data is behind, newer data may find the
+        entry stale, and a repair then would change it). A repaired copy of a loose .user/.pfb is one the old
+        repair rewrote: stuck, it is not known to fit."""
+        own_files = {key: path for key, _rel, path in job.files}
+        files = [(key, *job.repaired[key]) if key in job.repaired else (key, rel, path) for key, rel, path in job.files]
+        if aliases is not None:  # a repaired copy with another version number is compared with the same old file
+            renamed = {job.repaired[key][0].replace("\\", "/").lower(): aliases.old_path(rel)
+                       for key, rel, _path in job.files if key in job.repaired and aliases.old_path(rel)}
+            aliases = replace(aliases, paths={**aliases.paths, **renamed})
+        seen = {r.key: r for r in check_mod(files, game, shaders, None, provided=job.provided, rszs=context,
+                                            aliases=aliases)}
+        own = {r.key: r for r in results}
+        checked = {key: (rel, path) for key, rel, path in files}
+        lagging = []  # (_types_lag, once it is needed)
+
+        def types_lag() -> bool:
+            if not lagging:
+                lagging.append(ModManager._types_lag(context, marks))
+            return lagging[0]
+
+        def fits(key: str) -> bool:
+            if key not in checked:
+                return False  # (not one of the files looked at)
+            r, before = seen.get(key), own.get(key)
+            rel, path = checked[key]
+            pak = is_root_pak(rel)
+            if pak and not ModManager._pak_reads_alike(own_files[key], path):
+                return False  # (check_mod passes over an entry it cannot read: a damaged copy would look current)
+            if r is None:  # a PAK without materials or RSZ files to look at; a loose file always has a result
+                return pak
+            if RSZ_RE.search(rel) and r.state == "current" and not r.rsz:  # (check_mod: "not an RSZ file after all")
+                try:
+                    if rsz.parse(path.read_bytes()) is None:
+                        return False
+                except Exception:  # (one that cannot be read does not fit)
+                    return False
+            if r.stuck and not (pak and ModManager._pak_entries_unchanged(own_files[key], path, r.stuck)
+                                and not types_lag()):
+                return False
+            return r.state not in ("fixable", "error") and before is not None \
+                and set(r.unresolved) <= set(before.unresolved) \
+                and {i.get("label") for i in r.stuck} <= {i.get("label") for i in before.stuck}
+
+        return {key: fits(key) for key in job.repaired}
+
+    @staticmethod
+    def _type_marks(context) -> tuple[int, int]:
+        """RszContext's counts of the game files its type data could not read and of those with CRCs it does not
+        have as current (they only grow: compared before and after a check, _types_lag)."""
+        return (context.game_unreadable, context.registry_outdated) if context is not None else (0, 0)
+
+    @staticmethod
+    def _types_lag(context, marks: tuple[int, int] | None) -> bool:
+        """Whether the .user/.pfb type data of a check (``context``, an RszContext) is known to be behind the game
+        for what was checked since ``marks`` (_type_marks; None: since the run began): a game file it could not
+        read or whose CRCs it does not have, or the game's sample .pfb (RszContext.matches_game) says so."""
+        if context is None:
+            return False
+        if ModManager._type_marks(context) != (marks if marks is not None else (0, 0)):
+            return True
+        try:
+            return context.matches_game() is False
+        except Exception:  # (not known to be this version's)
+            return True
+
+    @staticmethod
+    def _pak_reads_alike(own: Path, copy: Path) -> bool:
+        """Whether every material and .user/.pfb/.scn entry of the mod's own PAK that a check reads is in the
+        repaired copy too, of the same kind, and reads there as well as in the mod's own PAK."""
+        def reads(head: bytes, data: bytes) -> bool:
+            try:
+                if head in rsz.MAGICS:
+                    return rsz.parse(data) is not None
+                return detect_version(data, prefer=CURRENT_VERSION_HINT) is not None  # (as check_mod reads it)
+            except Exception:
+                return False
+
+        try:
+            mine, theirs = PakFile(own), PakFile(copy)
+        except Exception:
+            return False
+        for i, h in enumerate(mine.hashes):
+            try:
+                head = mine.head(i)
+                if head != b"MDF\x00" and head not in rsz.MAGICS:
+                    continue  # (textures and meshes: the check does not read them)
+                readable = reads(head, mine.read(i))
+            except Exception:  # (the check of the mod's own PAK cannot read it either)
+                continue
+            j = theirs.find(h)
+            try:
+                if j is None or theirs.head(j) != head:
+                    return False
+                data = theirs.read(j)
+            except Exception:
+                return False
+            if readable and not reads(head, data):
+                return False
+        return True
+
+    @staticmethod
+    def _pak_entries_unchanged(own: Path, copy: Path, items: list[dict]) -> bool:
+        """Whether the PAK entries of ``items`` (check_mod's RSZ items, labelled "<pak>#<hash>.<kind>") are in the
+        repaired copy exactly as in the mod's own PAK (the old repair left them as shipped)."""
+        try:
+            mine, theirs = PakFile(own), PakFile(copy)
+            for item in items:
+                m = PAK_ENTRY_LABEL_RE.search(str(item.get("label") or ""))
+                data = mine.read_hash(int(m.group(1), 16)) if m else None
+                if data is None or theirs.read_hash(int(m.group(1), 16)) != data:
+                    return False
+        except Exception:
+            return False
+        return True
 
     def export_material_report(self, job: MaterialJob, target: Path, progress: ProgressFn | None = None) -> int:
         """Write a zip with the mod's .user/.pfb/.scn files, the current game's copies of them, the
@@ -1827,6 +1999,11 @@ class ModManager:
                 if mod is None or results is None or mod.files_stamp != job.stamp:
                     continue  # removed or reinstalled meanwhile, or could not be read (a value edit changes no input)
                 record = dict(self._material_record(mod.id))
+                mark = record.get("carried") if isinstance(record.get("carried"), dict) else None
+                # files left out or put back by 모드 수정 since the jobs were taken: the record is for the files the
+                # run looked at, so the mod is unchecked again (material_state) and its repairs do not carry over
+                # (the repair of a file put back is in use again: it must not go)
+                exclusions_changed = self._exclusion_digest(mod.id) != job.excluded
                 if record.get("excluded", "") != job.excluded:  # other files left out: a stale one may be new
                     record.pop("offered", None)
                 record.update(game=run.game, format=MATFIX_FORMAT, registry=run.registry, checked=now,
@@ -1840,12 +2017,14 @@ class ModManager:
                 if run.repair:
                     applied = {r.key: {"rel": r.new_rel, "file": f"{MATFIX_DIR}/{r.file.name}"}
                                for r in results if r.state == "fixable" and r.file is not None}
-                    if kept and job.stage is not None and record.get("applied_game") == run.game:  # (else they go)
+                    # (else they go: made for another version, or carried over to this one and not looked at since)
+                    if kept and job.stage is not None and record.get("applied_game") == run.game and mark is None:
                         applied.update(self._keep_repairs(kept, repaired, job.stage))
                     fsutil.rmtree(target)
                     if applied:
                         os.replace(job.stage, target)
                     record.update(applied=applied, applied_game=run.game if applied else "", declined=False)
+                    record.pop("carried", None)  # (made for this version now)
                     if applied or had:
                         changed.append(mod)
                     if applied:
@@ -1859,8 +2038,39 @@ class ModManager:
                     else:
                         fsutil.rmtree(target)
                     record.update(applied=kept, applied_game=record.get("applied_game", "") if kept else "")
+                    if not kept:
+                        record.pop("carried", None)
                     if len(kept) < len(repaired):
                         changed.append(mod)
+                elif had and not exclusions_changed and (record.get("applied_game") != run.game or mark is not None):
+                    fit = self._repairs_carry(job, run, record, repaired)
+                    made_for = record.get("applied_game")
+                    if fit and made_for != run.game:
+                        # they fit the updated game too: this version's repairs now, as they are (the deployed files
+                        # and the 모드 수정 built on them stay). Those of the files left out were not looked at: they
+                        # go (nothing of them is deployed: they are still left out, else exclusions_changed; put back
+                        # later, the file is checked again and offered for repair). The record says so ("carried":
+                        # every check looks at them again, newer type data checks the mod again, material_state).
+                        for key in kept:
+                            fsutil.remove_file(repaired[key][1])
+                        record.update(applied={k: dict(record["applied"][k]) for k in repaired if k not in kept},
+                                      applied_game=run.game,
+                                      carried={"from": made_for if isinstance(made_for, str) else "",
+                                               "registry": run.registry})
+                        log.info("재질 복구: '%s'은(는) 게임 업데이트 뒤에도 전에 복구한 파일이 그대로 맞아 계속 씁니다",
+                                 mod.name)
+                    elif fit is False and mark is not None and made_for == run.game:
+                        # carried over to this version, checked again (newer type data, ...): one does not fit it.
+                        # Made for the version before again: stale, to repair again (material_repairs_outdated); in
+                        # use until then
+                        before = mark.get("from")
+                        record.update(applied_game=before if isinstance(before, str) and before != run.game else "")
+                        record.pop("carried")
+                        record.pop("offered", None)  # (stale for another reason than when it was offered)
+                        log.info("재질 복구: '%s'의 게임 업데이트 뒤에도 그대로 쓰던 전에 복구한 파일이 현재 게임과 "
+                                 "맞지 않아 다시 복구해야 합니다", mod.name)
+                if isinstance(record.get("carried"), dict):  # (checked with this run's type data)
+                    record["carried"] = {**record["carried"], "registry": run.registry}
                 self._save_material_record(mod.id, record)
             except OSError as exc:
                 log.error("%s: 재질 복구 결과를 저장하지 못했습니다: %s", job.name, exc)
@@ -1872,6 +2082,21 @@ class ModManager:
             self.dirty = self.dirty or any(m.enabled for m in changed)
             self.save()
         return changed
+
+    @staticmethod
+    def _repairs_carry(job: MaterialJob, run: MaterialRun, record: dict, repaired: dict) -> bool | None:
+        """Whether a check keeps the repairs in use, made for another game version or carried over to this one, as
+        this one's: every one of them fits this version (run.carried). False when one does not, or they could not be
+        looked at; None when the run did not look at them as they are now (repaired, restored or carried over
+        meanwhile). A file the update made stale that has no repair leaves the mod stale (material_state), not its
+        repairs outdated."""
+        made_for = record.get("applied_game")
+        if (made_for if isinstance(made_for, str) else "") != job.repaired_for \
+                or {k: v for k, v in repaired.items() if k not in job.left_out} != job.repaired \
+                or job.carried != isinstance(record.get("carried"), dict):
+            return None
+        fits = run.carried.get(job.mod_id)
+        return bool(fits) and all(fits.values())
 
     @staticmethod
     def _keep_repairs(kept: dict, repaired: dict, stage: Path) -> dict:
@@ -1895,6 +2120,7 @@ class ModManager:
         had = bool(self.repaired_materials(mod_id))
         fsutil.rmtree(self.mod_dir(mod_id) / MATFIX_DIR)
         record.update(applied={}, applied_game="", declined=True)
+        record.pop("carried", None)
         self._save_material_record(mod_id, record)
         if had:
             self.revision += 1
