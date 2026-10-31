@@ -1114,7 +1114,8 @@ def test_old_unpacked_or_copied_reports_and_a_run_without_refw(game, crash_dir, 
     assert not crashes.find_session(crash_dir, a.id).summary.get("game_report")
 
 
-def test_a_damaged_report_never_stops_the_others(game, crash_dir):
+def test_a_damaged_report_never_stops_the_others(game, crash_dir, monkeypatch):
+    monkeypatch.setattr(crashes.time, "time", lambda: T0 + 86400)  # (older reports get no session of their own)
     put(game / "re2_framework_log.txt", log_text(game, T0, [(90, "Hooked DirectX 12", "info")]), T0 + 90)
     put(game / "reframework_faulty_files.txt", "natives/STM/x.tex.241106027\r\n", T0 + 60)
     bad = game / "CrashReport" / "2026_1016_1541.zip"
@@ -1137,7 +1138,8 @@ def test_a_damaged_report_never_stops_the_others(game, crash_dir):
     assert not [p for p in crash_dir.iterdir() if p.is_dir() and not (p / crashes.SESSION_FILE).is_file()]
 
 
-def test_the_process_start_in_the_dump_finds_the_run(game, crash_dir):
+def test_the_process_start_in_the_dump_finds_the_run(game, crash_dir, monkeypatch):
+    monkeypatch.setattr(crashes.time, "time", lambda: T0 + 86400)  # (older reports get no session of their own)
     mods = {"mods": [{"id": "a", "name": "A", "enabled": True}]}
     crashes.note_launch(crash_dir, mods, now=T0 - 10)
     # a long quiet run: REFramework's log stops after loading, the crash comes an hour later

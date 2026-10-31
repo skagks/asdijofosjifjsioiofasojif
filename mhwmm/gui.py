@@ -26,8 +26,9 @@ from .constants import (APP_TITLE, GAME_EXE, NEXUS_SEARCH_URL, NEXUS_URL, PAK_MO
                         STEAM_APP_ID)
 from .deploy import DeployError, DeployReport, is_root_pak, path_key
 from .helptext import SECTIONS as HELP_SECTIONS
-from .manager import (InstallError, InstallSession, MaterialJob, MaterialRun, Mod, ModManager,
-                      acquire_instance_lock, is_game_running, prepare_data_dir, resolve_data_dir, setup_logging)
+from .manager import (MAX_MEMO, InstallError, InstallSession, MaterialJob, MaterialRun, Mod, ModManager,
+                      acquire_instance_lock, clean_memo, is_game_running, prepare_data_dir, resolve_data_dir,
+                      setup_logging)
 from .matfix import MatfixError
 from .modedit import EDITS_PREFIX, EditError, GameCopyChanged
 from .modedit import model as edit_model
@@ -74,11 +75,13 @@ FILTERS = {
     "업데이트 있음": lambda mod, conflicts: bool(mod.update),
     "필요한 모드 없음": None,  # these two need the manager: handled in App.refresh
     "문제 있음": None,
+    "메모 있음": lambda mod, conflicts: bool(mod.memo),
 }
 FILTER_ALL = "전체"
 FILTER_UPDATES = "업데이트 있음"
 FILTER_MISSING = "필요한 모드 없음"
 FILTER_PROBLEMS = "문제 있음"
+FILTER_MEMO = "메모 있음"
 # Errors that are shown to the user without a traceback in the log.
 EXPECTED_ERRORS = (DeployError, InstallError, ArchiveError, UpdateError, MatfixError, OSError, ValueError)
 
@@ -92,6 +95,14 @@ MOD_TOOL_ACTION = MOD_TOOL_TITLE + "..."
 REAPPLY_TRIES = 2  # 모드 수정 edits built again for a mod at most this often after a change (_reapply_soon)
 
 KIND_SHORT = {"reframework": "REF", "pak": "PAK", "loose": "루스", "script": "스크립트", "dll": "DLL", "other": "기타"}
+
+# 모드 메모 (the user's own note on a mod): the mark before the name of a mod with one in the list, and how much of
+# it the row's tooltip shows (all of it is on the info tab)
+MEMO_MARK = "✎"
+MEMO_TIP_LINES = 10
+MEMO_TIP_CHARS = 90
+MEMO_HINT = ("이 모드에 대해 기억해 둘 내용을 적어 두세요 (예: 쓰는 옵션, 함께 쓰면 안 되는 모드, 받은 곳). "
+             "게임에는 영향이 없고 이 PC에만 저장됩니다.")
 
 
 def kinds_text(kinds: set[str]) -> str:
@@ -116,6 +127,49 @@ def shorten_middle(text: str, limit: int) -> str:
         return text
     keep = limit - 1
     return text[: keep // 2] + "…" + text[-(keep - keep // 2):]
+
+
+def memo_time(mod: Mod) -> str:
+    """When a mod's memo was last changed, to the minute ("" when not known)."""
+    return mod.memo_at.replace("T", " ")[:16]
+
+
+def memo_tip(memo: str) -> list[str]:
+    """The lines of a memo a row's tooltip shows: at most MEMO_TIP_LINES, each cut to MEMO_TIP_CHARS."""
+    lines = memo.split("\n")
+    shown = [line if len(line) <= MEMO_TIP_CHARS else line[:MEMO_TIP_CHARS - 1] + "…"
+             for line in lines[:MEMO_TIP_LINES]]
+    if len(lines) > MEMO_TIP_LINES or any(len(line) > MEMO_TIP_CHARS for line in lines[:MEMO_TIP_LINES]):
+        shown.append("… (정보 탭에서 모두 보기)")
+    return shown
+
+
+def memo_too_long(memo: str) -> str:
+    """Why a memo cannot be kept ("" when it can): the words of ModManager.set_memo."""
+    return f"메모는 {MAX_MEMO:,}자까지 쓸 수 있습니다 (지금 {len(memo):,}자)." if len(memo) > MAX_MEMO else ""
+
+
+def configure_memo_tags(t: tk.Text, theme: Theme) -> None:
+    """The tags of a memo shown as a note (the info tab, 메모 모아 보기): "memo" on all of its lines, "memo_top" on
+    the first and "memo_end" on the last (Tk takes a line's spacing from its first character: spacing on the whole
+    note would part every line of it), "memo_title" for its heading."""
+    p, f, px = theme.p, theme.fonts, theme.px
+    t.tag_configure("memo", background=p["memo_bg"], foreground=p["text"], lmargin1=px(12), lmargin2=px(12),
+                    rmargin=px(12), spacing1=0, spacing2=px(3), spacing3=px(3))
+    try:
+        t.tag_configure("memo", lmargincolor=p["memo_bg"], rmargincolor=p["memo_bg"])
+    except tk.TclError:  # Tk < 8.6.6
+        pass
+    t.tag_configure("memo_top", spacing1=px(10))
+    t.tag_configure("memo_end", spacing3=px(10))
+    t.tag_configure("memo_title", foreground=p["memo"], font=f["bold"])
+
+
+def memo_chunks(memo: str) -> list[tuple[str, tuple]]:
+    """A memo as (text, tags) chunks of a note (configure_memo_tags), as written: never read as markup."""
+    lines = memo.split("\n")
+    return [(line + "\n", ("memo",) + (("memo_top",) if i == 0 else ()) +
+             (("memo_end",) if i == len(lines) - 1 else ())) for i, line in enumerate(lines)]
 
 
 def _virtual_screen(root: tk.Misc) -> tuple[int, int, int, int]:
@@ -238,8 +292,8 @@ def _win_functions(dll: str, specs: dict) -> dict:
 
 class _WinPointer:
     """The mouse button, Windows' move or size loop, where the cursor is on a toplevel's frame and where the frame
-    is, as Windows has them (RESIZE_FIRST_STEP). Only queries: no window message is sent (this runs inside Tk's
-    event handling, also in Windows' sizing loop)."""
+    is, as Windows has them (RESIZE_FIRST_STEP); and the work area of a monitor (_work_area). Only queries: no window
+    message is sent (this runs inside Tk's event handling, also in Windows' sizing loop)."""
 
     VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
     SM_SWAPBUTTON, SM_CYSIZEFRAME, SM_CXPADDEDBORDER = 23, 33, 92
@@ -269,6 +323,7 @@ class _WinPointer:
             "GetClientRect": (wt.BOOL, wt.HWND, rect),
             "ClientToScreen": (wt.BOOL, wt.HWND, point),
             "MonitorFromWindow": (wt.HMONITOR, wt.HWND, wt.DWORD),
+            "MonitorFromPoint": (wt.HMONITOR, wt.POINT, wt.DWORD),
             "GetMonitorInfoW": (wt.BOOL, wt.HMONITOR, ctypes.POINTER(MONITORINFO)),
             "GetWindowThreadProcessId": (wt.DWORD, wt.HWND, ctypes.POINTER(wt.DWORD)),
             "GetGUIThreadInfo": (wt.BOOL, wt.DWORD, ctypes.POINTER(GUITHREADINFO)),
@@ -338,19 +393,30 @@ class _WinPointer:
             return False  # the client area
         return not (inside_x and top_ + border <= y < origin.y)  # (not the title bar)
 
+    def _work(self, monitor):
+        """The work area (the monitor without the taskbar) of a monitor, or None."""
+        info = self.MONITORINFO()
+        info.cbSize = self.ctypes.sizeof(info)
+        if not monitor or not self.f["GetMonitorInfoW"](monitor, self.ctypes.byref(info)):
+            return None
+        return info.rcWork
+
     def where(self, top: tk.Misc) -> tuple[tuple[int, int, int, int], bool]:
         """The toplevel's frame on the screen (left, top, right, bottom), and whether it is as wide or as tall as
         the work area of its monitor (maximized, or snapped)."""
-        f, byref = self.f, self.ctypes.byref
         hwnd = self.frame(top)
         rect = left, top_, right, bottom = self._window_rect(hwnd)
-        info = self.MONITORINFO()
-        info.cbSize = self.ctypes.sizeof(info)
-        monitor = f["MonitorFromWindow"](hwnd, self.MONITOR_DEFAULTTONEAREST)
-        if not monitor or not f["GetMonitorInfoW"](monitor, byref(info)):
+        work = self._work(self.f["MonitorFromWindow"](hwnd, self.MONITOR_DEFAULTTONEAREST))
+        if work is None:
             return rect, False
-        work = info.rcWork
         return rect, (left <= work.left and right >= work.right) or (top_ <= work.top and bottom >= work.bottom)
+
+    def work_area(self, x: int, y: int) -> tuple[int, int, int, int]:
+        """The work area (left, top, right, bottom) of the monitor nearest a point of the screen."""
+        work = self._work(self.f["MonitorFromPoint"](self.wt.POINT(x, y), self.MONITOR_DEFAULTTONEAREST))
+        if work is None:
+            raise OSError("GetMonitorInfoW failed")
+        return work.left, work.top, work.right, work.bottom
 
 
 _POINTER: list = []  # [the _WinPointer, or None], made the first time it is needed
@@ -367,6 +433,18 @@ def _pointer():
                 log.debug("마우스 상태를 읽을 수 없습니다: %s", exc)
         _POINTER.append(probe)
     return _POINTER[0]
+
+
+def _work_area(widget: tk.Misc, x: int, y: int) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the screen a window such as a tooltip is kept on, around a point: on Windows
+    the work area of the monitor nearest it (the taskbar would cover the window), else the screen."""
+    probe = _pointer()
+    if probe is not None:
+        try:
+            return probe.work_area(x, y)
+        except Exception as exc:
+            log.debug("화면의 작업 영역을 알 수 없습니다: %s", exc)
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
 
 
 def _place(top: tk.Misc, probe) -> tuple:
@@ -774,14 +852,20 @@ class RowTooltip(Tooltip):
         tip = tk.Toplevel(self.widget)
         tip.wm_overrideredirect(True)
         label = tk.Label(tip, text=text, justify="left", padx=self.theme.px(10), pady=self.theme.px(6),
-                         font=self.theme.fonts["small"])
+                         font=self.theme.fonts["small"], wraplength=self.theme.px(460))  # (a memo's long lines)
         self.theme.mark(label, "tooltip")
         label.pack()
         tip.update_idletasks()
         bbox = self.widget.bbox(self.row) or (0, 0, 0, self.widget.winfo_height())
-        x = self.widget.winfo_pointerx() + self.theme.px(14)
-        x = max(0, min(x, self.widget.winfo_screenwidth() - tip.winfo_reqwidth() - 4))
-        y = self.widget.winfo_rooty() + bbox[1] + bbox[3] + self.theme.px(2)
+        row, pointer = self.widget.winfo_rooty() + bbox[1], self.widget.winfo_pointerx()
+        left, top, right, bottom = _work_area(self.widget, pointer, row)
+        width, height = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        x = max(left, min(pointer + self.theme.px(14), right - width - 4))
+        y = row + bbox[3] + self.theme.px(2)
+        if y + height > bottom:  # (a long memo on a row low in the list: above the row, not off the screen)
+            above = max(top, row - height - self.theme.px(2))  # (taller than the room above: from the top, over it
+            if above + height <= row or x > pointer:  # beside the mouse; under it the row's <Leave> would hide it)
+                y = above
         tip.wm_geometry(f"+{x}+{y}")
         self.tip = tip
 
@@ -896,6 +980,81 @@ class TextDialog(Dialog):
         self.destroy()
 
 
+class MemoDialog(Dialog):
+    """Writes the user's memo on a mod (모드 메모); result is the memo to keep ("" when it is cleared) or None.
+    Enter is a new line in the memo: Ctrl+Enter or Ctrl+S saves."""
+
+    def __init__(self, parent, theme: Theme, mod: Mod):
+        super().__init__(parent, theme, "메모")
+        px, f = theme.px, theme.fonts
+        self.mod_name = mod.name
+        self.initial = clean_memo(mod.memo)
+        ttk.Label(self.body, text=shorten_middle(mod.name, 60), style="DialogTitle.TLabel").pack(anchor="w")
+        hint = ttk.Label(self.body, text=MEMO_HINT, style="Muted.TLabel", justify="left")
+        hint.pack(anchor="w", pady=(px(4), px(12)))
+        box = ttk.Frame(self.body)
+        box.pack(fill="both", expand=True)
+        self.text = theme.mark(tk.Text(box, wrap="word", width=56, height=10, undo=True, font=f["base"],
+                                       padx=px(12), pady=px(10), spacing2=px(3)), "memo")
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=autohide(sb, side="right", fill="y", padx=(px(4), 0)))
+        self.text.pack(side="left", fill="both", expand=True)
+        hint.configure(wraplength=self.text.winfo_reqwidth())  # (as wide as the text)
+        self.text.insert("1.0", self.initial)
+        self.text.edit_reset()  # (undo stops at the memo as it was)
+        self.text.edit_modified(False)
+        self.text.mark_set("insert", "end-1c")
+        self.text.see("insert")
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.count = ttk.Label(self.body, text="", style="Muted.TLabel", font=f["small"])
+        self.count.pack(side="bottom", anchor="e", pady=(px(4), 0), before=box)
+        self._count()
+
+        row = ttk.Frame(self.body)  # (these packed before the text: a shorter window shortens the text, not them)
+        row.pack(side="bottom", fill="x", pady=(px(14), 0), before=self.count)
+        ttk.Button(row, text="취소", command=self.cancel).pack(side="right")
+        ttk.Button(row, text="저장", style="Accent.TButton", command=self.save).pack(side="right", padx=(0, px(8)))
+        if self.initial:
+            ttk.Button(row, text="메모 지우기", command=self.clear).pack(side="left")
+        # (no <Return> on the window as Dialog.buttons binds it; on the text too: its own Ctrl+Enter is a new line)
+        for widget in (self, self.text):
+            for key in ("<Control-Return>", "<Control-KP_Enter>", "<Control-s>", "<Control-S>"):
+                widget.bind(key, lambda e: (self.save(), "break")[1])
+        self.text.focus_set()
+        self.after(50, self.text.focus_set)
+
+    def _memo(self) -> str:
+        return clean_memo(self.text.get("1.0", "end-1c"))
+
+    def _on_modified(self, _event=None):
+        if self.text.edit_modified():
+            self.text.edit_modified(False)  # (<<Modified>> comes again only after the flag is cleared)
+            self._count()
+
+    def _count(self):
+        n = len(self._memo())
+        self.count.configure(text=f"{n:,} / {MAX_MEMO:,}자", style="EditWarn.TLabel" if n > MAX_MEMO else "Muted.TLabel")
+
+    def save(self):
+        memo = self._memo()
+        if memo_too_long(memo):
+            messagebox.showwarning("메모", memo_too_long(memo), parent=self)
+            return
+        self.result = memo
+        self.destroy()
+
+    def clear(self):
+        if messagebox.askyesno("메모 지우기", f"'{self.mod_name}'의 메모를 지울까요?", parent=self):
+            self.result = ""
+            self.destroy()
+
+    def cancel(self):
+        if self._memo() != self.initial and not messagebox.askyesno(
+                "메모", "고친 메모를 저장하지 않고 닫을까요?", parent=self):
+            return
+        super().cancel()
+
+
 class UpdateDialog(Dialog):
     """Shows what a new release changes; result is "install", "page" or None."""
 
@@ -988,8 +1147,9 @@ class HelpDialog(Dialog):
         self.nav_buttons = [ttk.Button(nav, text=s.title, style="Nav.TButton", command=lambda i=i: self.go(i))
                             for i, s in enumerate(HELP_SECTIONS)]
         for button in self.nav_buttons:
-            button.pack(fill="x", pady=(0, px(2)))
-        ttk.Button(nav, text="닫기", command=self.cancel).pack(side="bottom", fill="x")
+            button.pack(fill="x", pady=(0, px(1)))
+        # (packed before the topics: a window shorter than the column cuts the last topic, not the button)
+        ttk.Button(nav, text="닫기", command=self.cancel).pack(side="bottom", fill="x", before=self.nav_buttons[0])
 
         card = theme.mark(tk.Frame(self.body), "card")
         card.pack(side="left", fill="both", expand=True, padx=(px(8), px(18)), pady=px(18))
@@ -1193,6 +1353,72 @@ class ConflictsDialog(Dialog):
         if sel:
             self.result = self.pairs[int(sel[0])][1]
             self.destroy()
+
+
+class MemoOverviewDialog(Dialog):
+    """메모 모아 보기: the memos of all mods (모드 메모) on one page in load order; result is ("show", mod id) or
+    ("edit", mod id)."""
+
+    FREEZE = True  # (the whole page is wrapped again for each new width)
+
+    def __init__(self, parent, theme: Theme, mods: list[Mod]):
+        super().__init__(parent, theme, "메모 모아 보기")
+        px, f, p = theme.px, theme.fonts, theme.p
+        self.minsize(px(560), px(420))
+        noted = [(i, mod) for i, mod in enumerate(mods, 1) if mod.memo]
+        ttk.Label(self.body, text="메모 모아 보기", style="DialogTitle.TLabel").pack(anchor="w")
+        summary = f"메모를 적은 모드 {len(noted)}개 (목록 순서)" if noted else "모드마다 적어 둔 메모를 목록 순서로 모아 봅니다."
+        ttk.Label(self.body, text=summary, style="Muted.TLabel").pack(anchor="w", pady=(px(4), px(10)))
+
+        card = theme.mark(tk.Frame(self.body), "card")
+        card.pack(fill="both", expand=True)
+        self.text = theme.mark(tk.Text(card, wrap="word", width=72, height=18, font=f["base"], padx=px(22),
+                                       pady=px(16), cursor="arrow"), "text")
+        scrollbar = ttk.Scrollbar(card, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=autohide(scrollbar, side="right", fill="y"))
+        self.text.pack(side="left", fill="both", expand=True)
+        t = self.text
+        configure_memo_tags(t, theme)
+        t.tag_configure("head", spacing1=px(18), spacing3=px(6))
+        t.tag_configure("first", spacing1=0)
+        t.tag_configure("name", font=f["bold"])
+        t.tag_configure("muted", foreground=p["muted"])
+        t.tag_configure("link", foreground=p["info"], underline=True)
+        t.tag_bind("link", "<Enter>", lambda e: t.configure(cursor="hand2"))
+        t.tag_bind("link", "<Leave>", lambda e: t.configure(cursor="arrow"))
+        for i, mod in noted:
+            show, edit = f"memo_show_{i}", f"memo_edit_{i}"
+            for tag, action in ((show, "show"), (edit, "edit")):
+                t.tag_bind(tag, "<Button-1>", lambda e, action=action, mod_id=mod.id: self.finish(action, mod_id))
+            # the name: a link without a line under it (one under every heading would be heavy)
+            t.tag_bind(show, "<Enter>", lambda e, tag=show: (t.configure(cursor="hand2"),
+                                                             t.tag_configure(tag, underline=True)))
+            t.tag_bind(show, "<Leave>", lambda e, tag=show: (t.configure(cursor="arrow"),
+                                                             t.tag_configure(tag, underline=False)))
+            head = ("head", "first") if i == noted[0][0] else ("head",)
+            t.insert("end", f"{i}. {mod.name}", head + ("name", show))
+            if not mod.enabled:
+                t.insert("end", "  · 꺼짐", head + ("muted",))
+            if mod.memo_at:
+                t.insert("end", f"  · {memo_time(mod)} 수정", head + ("muted",))
+            t.insert("end", "   ", head)
+            t.insert("end", "편집", head + ("link", edit))
+            t.insert("end", "\n", head)
+            for text, tags in memo_chunks(mod.memo):
+                t.insert("end", text, tags)
+        if not noted:
+            t.insert("end", "아직 메모를 적은 모드가 없습니다.\n", ("head", "first", "name"))
+            t.insert("end", "모드를 오른쪽 클릭 → 메모 추가... (또는 정보 탭의 '＋ 메모 추가', [Ctrl+M])로 적을 수 있습니다.",
+                     ("muted",))
+        t.configure(state="disabled")
+
+        row = ttk.Frame(self.body)  # (packed before the page: a shorter window shortens the page, not the button)
+        row.pack(side="bottom", fill="x", pady=(px(16), 0), before=card)
+        ttk.Button(row, text="닫기", command=self.cancel).pack(side="right")
+
+    def finish(self, action: str, mod_id: str):
+        self.result = (action, mod_id)
+        self.destroy()
 
 
 class RequirementsDialog(Dialog):
@@ -2946,6 +3172,7 @@ class App:
         m.add_command(label=bisect.TITLE, command=self.show_bisect)
         m.add_command(label=precheck.TITLE, command=self.show_precheck)
         m.add_command(label="충돌 한눈에 보기", command=self.show_conflicts)
+        m.add_command(label="메모 모아 보기", command=self.show_memos)
         m.add_command(label="장비 외형 보기", command=lambda: self.show_equipment())
         m.add_command(label="모든 모드 재질 점검", command=self.check_materials)
         m.add_command(label="옵션 그림 다시 찾기 (그림 없는 모드)", command=self.read_all_option_pictures)
@@ -3111,6 +3338,8 @@ class App:
         self.search_entry.bind("<FocusIn>", lambda e: self._update_search_hint(), add="+")
         self.search_entry.bind("<FocusOut>", lambda e: self._update_search_hint(), add="+")
         self.search_entry.bind("<Escape>", lambda e: self.search_var.set(""))
+        for widget in (self.search_entry, self.search_hint):
+            Tooltip(t, widget, "이름 · 제작자 · 메모로 찾습니다")
         self.search_var.trace_add("write", lambda *a: (self._update_search_hint(), self.refresh()))
         self.filter_var = tk.StringVar(value=FILTER_ALL)
         filter_box = ttk.Combobox(right, textvariable=self.filter_var, values=list(FILTERS), state="readonly",
@@ -3173,7 +3402,7 @@ class App:
         self.notebook.bind("<ButtonPress-1>", self._on_tab_click, add="+")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
-        info = ttk.Frame(self.notebook, style="Card.TFrame")
+        info = self.info_tab = ttk.Frame(self.notebook, style="Card.TFrame")
         self.preview_label = ttk.Label(info, style="Card.TLabel", anchor="center", cursor="hand2")
         self.preview_label.bind("<Button-1>", lambda e: self._preview_path and self.show_picture(*self._preview_path))
         self.info_text = t.mark(tk.Text(info, wrap="word", font=t.fonts["base"], padx=px(18), pady=px(14),
@@ -3245,6 +3474,7 @@ class App:
         info.tag_configure("chip_info", background=p["info_bg"], foreground=p["info"], font=f["small_bold"])
         info.tag_configure("key", foreground=p["muted"], spacing1=px(3), spacing3=px(3))
         info.tag_configure("value", foreground=p["text"], spacing1=px(3), spacing3=px(3))
+        configure_memo_tags(info, self.theme)
         info.tag_configure("muted", foreground=p["muted"])
         info.tag_configure("desc", spacing1=px(4), spacing2=px(3))
         for tag, fg_key, bg_key in (("warn", "warn", "warn_bg"), ("note", "info", "info_bg")):
@@ -3265,6 +3495,8 @@ class App:
         info.tag_bind("equip_show", "<Button-1>",
                       lambda e: self.show_equipment(self._selected_mod().id if self._selected_mod() else None))
         info.tag_bind("nexus_search", "<Button-1>", lambda e: self._search_nexus())
+        for tag in ("memo_edit", "memo_add"):
+            info.tag_bind(tag, "<Button-1>", lambda e: self.edit_memo())
         info.tag_bind("modedit_show", "<Button-1>",
                       lambda e: self.open_mod_tool(self._selected_mod().id, "summary") if self._selected_mod() else None)
         for action in ("check", "repair", "restore", "report"):
@@ -3303,6 +3535,8 @@ class App:
         self.tree.bind("<space>", lambda e: (self.toggle(self._selected_ids()), "break")[1])
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<F2>", lambda e: self.rename_selected())
+        for key in ("<Control-m>", "<Control-M>"):
+            self.tree.bind(key, lambda e: (self.edit_memo(), "break")[1])
         self.tree.bind("<Control-Up>", lambda e: (self.move_selected(-1), "break")[1])
         self.tree.bind("<Control-Down>", lambda e: (self.move_selected(1), "break")[1])
 
@@ -3347,7 +3581,8 @@ class App:
         elif self.filter_var.get() == FILTER_PROBLEMS:
             keep = lambda mod, conflicts: mod.id in self._problems  # noqa: E731
         visible = [(i, mod) for i, mod in enumerate(m.mods)
-                   if (not query or query in mod.name.casefold() or query in mod.author.casefold())
+                   if (not query or query in mod.name.casefold() or query in mod.author.casefold()
+                       or query in mod.memo.casefold())
                    and (keep is None or keep(mod, self._conflicts))]
         existing = set(self.tree.get_children())
         on, off = t.image("check_on", 20), t.image("check_off", 20)
@@ -3368,7 +3603,9 @@ class App:
             version = mod.version
             if mod.update:
                 version = f"{mod.version or '?'} → {mod.update.get('version') or '새 파일'}"
-            name = f"⚠ {mod.name}" if mod.id in self._problems else mod.name
+            name = f"{MEMO_MARK} {mod.name}" if mod.memo else mod.name  # (before the name: a cut name keeps it)
+            if mod.id in self._problems:
+                name = f"⚠ {name}"
             values = (index + 1, name, kinds_short(self._display_kinds(mod)), version, options,
                       len(files), conflict)
             image = on if mod.enabled else off
@@ -3886,8 +4123,17 @@ class App:
             return None
 
     def _row_tooltip(self, mod_id: str) -> str:
-        reasons = self._problems.get(mod_id)
-        return "\n".join("⚠ " + r for r in reasons) if reasons else ""
+        """What is wrong with a mod, then its memo."""
+        lines = ["⚠ " + r for r in self._problems.get(mod_id, ())]
+        try:
+            memo = self.manager.get(mod_id).memo
+        except KeyError:
+            memo = ""
+        if memo:
+            if lines:
+                lines.append("")
+            lines += [f"{MEMO_MARK} 메모", *memo_tip(memo)]
+        return "\n".join(lines)
 
     def _highlight_related(self):
         """Colour the mods that override, or are overridden by, the one selected mod."""
@@ -4354,6 +4600,11 @@ class App:
         for text, tag in chips:
             chunks += [(f"  {text}  ", tag), ("  ", None)]
         chunks.append(("\n\n", None))
+        if mod.memo:  # (the user's own note first: plain text as written, not markup like the description)
+            chunks += [(f"{MEMO_MARK} 메모", "memo_title"), ("   ", None), ("편집", ("link", "memo_edit"))]
+            if mod.memo_at:
+                chunks.append((f"   {memo_time(mod)} 수정", "muted"))
+            chunks += [("\n", None), *memo_chunks(mod.memo), ("\n", None)]
         for label, value in (
             ("옵션", f"{len(mod.options)}개 중 {len(mod.selected)}개 사용" if mod.options else ""),
             ("제작자", mod.author),
@@ -4365,6 +4616,8 @@ class App:
         ):
             if value:
                 chunks += [(f"{label}\t", "key"), (f"{value}\n", "value")]
+        if not mod.memo:
+            chunks += [("메모\t", "key"), ("＋ 메모 추가", ("value", "link", "memo_add")), ("\n", "value")]
         reqs = m.requirement_status(mod.id)
         icons = {"ok": ("✓", "req_ok"), "missing": ("✕", "req_missing"), "off": ("!", "req_off"),
                  "unknown": ("?", "req_unknown")}
@@ -5289,14 +5542,55 @@ class App:
             self.manager.rename(mod.id, name)
             self.refresh(select=mod.id)
 
+    def edit_memo(self, mod_id: str | None = None):
+        """Write the memo on a mod (the selected one by default). The user's own note: not a change of what the
+        game gets (nothing to apply), so it may be written during 원인 모드 찾기 too."""
+        try:
+            mod = self.manager.get(mod_id) if mod_id else self._selected_mod()
+        except KeyError:
+            return
+        if mod is None or not self.can_mutate():
+            return
+        memo = MemoDialog(self.root, self.theme, mod).show()
+        if memo is None:
+            return
+        try:
+            changed = self.manager.set_memo(mod.id, memo)
+        except KeyError:  # (removed meanwhile)
+            return
+        except ValueError as exc:
+            messagebox.showwarning("메모", str(exc), parent=self.root)
+            return
+        except OSError as exc:
+            log.error("메모를 저장하지 못했습니다: %s", exc)
+            messagebox.showerror("메모", f"메모를 저장하지 못했습니다: {exc}", parent=self.root)
+            self.refresh(select=mod.id)  # (the memo may have been kept in memory)
+            return
+        if changed:
+            log.info("메모를 저장했습니다: %s" if mod.memo else "메모를 지웠습니다: %s", mod.name)
+            self.refresh(select=mod.id)
+
+    def show_memos(self):
+        """메모 모아 보기: every memo at once; a mod picked there is shown on the info tab (and its memo edited)."""
+        result = MemoOverviewDialog(self.root, self.theme, self.manager.mods).show()
+        if not result or not any(m.id == result[1] for m in self.manager.mods):
+            return
+        action, mod_id = result
+        self.show_mod(mod_id)
+        self._select_tab(self.info_tab)
+        if action == "edit":
+            self.edit_memo(mod_id)
+
     def remove_selected(self):
         ids = self._selected_ids()
         if not ids or self._search_blocks() or not self._idle():
             return
         mods = [self.manager.get(i) for i in ids]
         names = "\n".join(f"  • {m.name}" for m in mods[:10]) + ("\n  ..." if len(mods) > 10 else "")
-        if self.manager.settings.confirm_remove and not messagebox.askyesno(
-                "모드 삭제", f"다음 모드를 삭제할까요? 저장된 모드 파일도 지워집니다.\n\n{names}", parent=self.root):
+        question = f"다음 모드를 삭제할까요? 저장된 모드 파일도 지워집니다.\n\n{names}"
+        if any(m.memo for m in mods):
+            question += "\n\n메모를 적은 모드는 메모도 함께 지워집니다."
+        if self.manager.settings.confirm_remove and not messagebox.askyesno("모드 삭제", question, parent=self.root):
             return
         any_enabled = any(m.enabled for m in mods)
 
@@ -5665,6 +5959,8 @@ class App:
                 menu.add_command(label="맨 위로", command=lambda: self.move_to_edge(True))
                 menu.add_command(label="맨 아래로 (최우선)", command=lambda: self.move_to_edge(False))
                 menu.add_command(label="이름 변경", command=self.rename_selected)
+                menu.add_command(label="메모 편집..." if mods[0].memo else "메모 추가...", accelerator="Ctrl+M",
+                                 command=lambda: self.edit_memo(ids[0]))
                 menu.add_command(label="저장된 모드 폴더 열기", command=self.open_mod_folder)
                 menu.add_command(label="장비 외형 보기", command=lambda: self.show_equipment(ids[0]))
                 if self.editable(mods[0]):

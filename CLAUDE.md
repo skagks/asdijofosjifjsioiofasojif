@@ -32,6 +32,10 @@
     (루스·PAK, 옵션까지)나 게임 폴더에서 찾아 `shader_requirements`(kind "shader", 없음/꺼짐/옵션 꺼짐 `option`/모드 꺼짐
     `mod_off`)로. 게임에 들어가는 파일의 재질만 보고(`foreign_shaders`: `mod_entries`, 켠 옵션·겹치면 아래 옵션), 모드 자신의 셰이더도 켠 옵션에 있을 때만 됨(아니면 자신의 옵션이
     꺼짐으로). 지금 게임 버전의 점검 기록만 씀. 원인 찾기도 함께 켬. 알림은 설치 뒤 첫 점검이 저장된 뒤 한 번(gui `_first_check`, 옵션을 아직 안 골랐으면 고른 뒤)
+    모드 메모: `Mod.memo`·`memo_at`(state.json·mod.json), `clean_memo`(줄바꿈 `\n`, 서로게이트 합침·외톨이는 U+FFFD, 제어 문자 뺌;
+    읽을 때도 정리하지만 `MAX_MEMO` 5,000자로 자르지는 않음), `set_memo`(`rename`처럼 저장만: 게임에 들어가는 것이 아니라
+    revision·dirty·stamp·캐시를 건드리지 않음 → 튕김 기록·원인 찾기·장비 스캔·재질 점검 그대로). 업데이트는 그대로 두고
+    `create_retarget`은 복사. 진단 zip·보고서 등 PC 밖으로 나가는 것에는 넣지 않음(`ReportMod`에 메모 칸을 두지 않음)
   - `mhwmm/matfix/`: 재질(.mdf2) 복구 (MHWmodfixer 기반, MIT). `pak.py` 게임 pak 읽기·모드 pak 쓰기, `game.py` 게임 파일 색인,
     `mdf2.py` 재질 파일, `donors.py` 현재 재질 찾기, `repair.py` 점검·복구, `rsz.py` .user/.pfb/.scn 복구
     (타입 정보 `rsz_types.json.xz`는 `tools/make_rsz_types.py`로 REasy 덤프 기록에서 만듦). 테스트에 zstandard 필요
@@ -205,4 +209,14 @@
       스레드에서 Tk 객체가 풀리면 프로세스가 죽음). 리눅스 시험은 가짜 Windows API(tests/test_resize_bench.py), 리눅스에서는
       `xvfb-run -a python tools/resize_bench.py --quick`로 도구만 점검(CI에서는 돌리지 않음)
     - `tools/bench-patches/`: 커밋하기 전에 워크플로로 잰 변경의 diff(임시). 그 변경을 커밋하거나 버리면 지운다
-  - `mhwmm/cli.py`: 명령줄
+    - 모드 메모: 목록 이름 앞 `✎ `(문제 모드는 `⚠ ✎ `), 줄 툴팁에 문제 다음 메모(줄 수·길이 제한, wraplength; 화면 아래로 넘치면
+      줄 위에, 화면은 `_work_area`: Windows는 그 모니터의 작업 영역, 마우스 밑에는 두지 않음), 정보 탭 칩 줄
+      바로 다음 메모 칸(태그 `memo`·`memo_title`, 링크 `memo_edit`/`memo_add`, 메모는 글 그대로), `MemoDialog`(`Dialog.buttons()`를
+      쓰지 않음: Enter는 줄 바꿈, Ctrl+Enter·Ctrl+S 저장), `App.edit_memo`(`can_mutate`만 봄: 원인 찾기 중에도 됨, 적용·dirty 없음),
+      오른쪽 클릭 '메모 추가...'/'메모 편집...'·Ctrl+M, `MemoOverviewDialog`(☰ → 메모 모아 보기), 필터 '메모 있음', 검색은 이름·
+      제작자·메모. 색은 theme의 `memo`·`memo_bg`(두 팔레트 모두). 늘어나는 글 상자가 있는 창은 버튼 줄을 글 상자보다 먼저
+      `side="bottom"`으로 배치(창을 줄이면 글 상자가 줄어듦)
+    - 사용법 창(HelpDialog)의 높이는 왼쪽 주제 목록의 높이다(글은 스크롤): 주제를 더하면 높이 768 화면(작업 영역, 최대화한 메인
+      창의 제목 표시줄 아래)에 닫기까지 들어가는지 본다(test_gui의 768 시험, `Nav.TButton` padding). 닫기는 주제보다 먼저 배치
+  - `mhwmm/cli.py`: 명령줄. `memo`(쓰지 않는 보기는 `_read_only`라 창이 잠금을 잡고 있어도 되고, `changes_mods`가 아니라 원인
+    찾기 중에도 됨; `-`로 시작하는 내용은 argparse가 옵션으로 읽어 `--set="-..."`처럼 =로 붙여 씀), `list`는 메모의 첫 줄도 보여 줌

@@ -1,6 +1,6 @@
 [project]
 name = "mhwilds-mod-manager"
-version = "2.7.1"
+version = "2.8.0"
 description = "Monster Hunter Wilds mod manager (몬스터 헌터 와일즈 모드 매니저)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ extras = ["tkinterdnd2>=0.4", "Pillow>=10", "py7zr>=0.21", "zstandard>=0.22"]
 mhwmm = "mhwmm.cli:main"
 
 [tool.setuptools]
-packages = ["mhwmm", "mhwmm.matfix", "mhwmm.equip"]
+packages = ["mhwmm", "mhwmm.matfix", "mhwmm.equip", "mhwmm.modedit"]
 
 [tool.setuptools.package-data]
 "mhwmm.matfix" = ["*.xz"]

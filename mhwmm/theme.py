@@ -27,6 +27,7 @@ PALETTES = {
         "danger": "#f0736a", "danger_bg": "#33201f", "chip": "#2a2720", "chip_text": "#e6c48f",
         "info": "#62b6c4", "info_bg": "#1a2a2e",
         "problem_bg": "#3d2222", "over": "#b6a1ee", "over_bg": "#2b2540",
+        "memo": "#e2c96a", "memo_bg": "#2b2918",
     },
     "light": {
         "bg": "#efece6", "surface": "#fbfaf8", "raised": "#ffffff", "hover": "#f3eee5",
@@ -39,6 +40,7 @@ PALETTES = {
         "danger": "#c93c33", "danger_bg": "#f8e1df", "chip": "#f3e7d2", "chip_text": "#8a5a12",
         "info": "#237785", "info_bg": "#dff0f2",
         "problem_bg": "#fbdcd8", "over": "#6a4bb0", "over_bg": "#ebe4f7",
+        "memo": "#7a5d00", "memo_bg": "#fbf3cc",
     },
 }
 THEME_NAMES = {"dark": "다크", "light": "라이트"}
@@ -151,6 +153,11 @@ class Theme:
                             insertbackground=p["text"], selectbackground=p["select"],
                             selectforeground=p["select_text"], highlightthickness=0, borderwidth=0,
                             relief="flat", inactiveselectbackground=p["select"])
+            elif role == "memo":  # a mod's memo being written (모드 메모): the note's colours where it is shown
+                w.configure(bg=p["memo_bg"], fg=p["text"], insertbackground=p["text"], selectbackground=p["select"],
+                            selectforeground=p["select_text"], inactiveselectbackground=p["select"],
+                            highlightthickness=1, highlightbackground=p["border"], highlightcolor=p["memo"],
+                            borderwidth=0, relief="flat")
             elif role in ("canvas", "canvas_bg"):
                 w.configure(bg=p["surface"] if role == "canvas" else p["bg"], highlightthickness=0, borderwidth=0)
             elif role == "menu":
@@ -289,11 +296,11 @@ class Theme:
         button("BannerGhost.TButton", p["info_bg"], p["muted"], p["hover"], p["pressed"], padding=(10, 5),
                font=f["small"], width=-2)
         s.map("BannerGhost.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])
-        # table of contents in the usage guide
-        button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 6), width=-2)
+        # table of contents in the usage guide (low: all of its topics and 닫기 fit a 768-pixel-high screen)
+        button("Nav.TButton", p["bg"], p["muted"], p["hover"], p["pressed"], padding=(14, 4), width=-2)
         s.configure("Nav.TButton", anchor="w")
         s.map("Nav.TButton", foreground=[("active", p["text"]), ("disabled", p["subtle"])])
-        button("NavActive.TButton", p["select"], p["select_text"], p["select"], p["select"], padding=(14, 6),
+        button("NavActive.TButton", p["select"], p["select_text"], p["select"], p["select"], padding=(14, 4),
                font=f["bold"], width=-2)
         s.configure("NavActive.TButton", anchor="w")
 

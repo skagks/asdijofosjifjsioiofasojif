@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import uuid
 import zipfile
@@ -64,6 +65,7 @@ STALE_TEMP_SECONDS = 2 * 3600
 DATA_DIR_NAME = "MHWildsModManager_data"  # next to the exe
 DEFAULT_PROFILE = "기본"
 MAX_PROFILE_NAME = 40
+MAX_MEMO = 5000  # characters in a mod's memo (모드 메모)
 MATFIX_RECORD = "matfix.json"  # per mod: what the material check found and which repairs are in use
 MATFIX_DIR = "matfix"  # per mod: the repaired files (the mod's own files stay as they are)
 OPTION_PREVIEWS = "previews"  # per mod: the pictures of its options, named after the option id
@@ -533,6 +535,18 @@ class Settings:
     bisect_log_files: bool = False  # 원인 모드 찾기: the last choice of "게임이 읽는 파일을 기록해 더 정확하게 찾기"
 
 
+def clean_memo(text: str) -> str:
+    """A mod's memo as it is kept: line breaks as "\n", the surrogate pairs Tk may hand over joined (a lone one,
+    which no save could write, becomes U+FFFD), no control characters but tabs, no spaces at the ends of lines
+    and no blank lines at the start or the end ("" for a memo of only whitespace, and for anything not a str)."""
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
+    return "\n".join(line.rstrip() for line in text.split("\n")).strip("\n")
+
+
 @dataclass
 class Mod:
     id: str = ""
@@ -572,6 +586,8 @@ class Mod:
     #  "source_name", "moves": [[new game path, old one]], "pak_moves": [[new pak entry hash, old one]]}
     retarget: dict = field(default_factory=dict)
     edited_at: str = ""  # the last 모드 수정 saved or applied again (edits.json): "" for a mod never edited
+    memo: str = ""  # the user's own note on the mod (모드 메모): shown in the list and the info tab, never in reports
+    memo_at: str = ""  # when the memo was last changed (_now()), "" without a memo
 
     @property
     def files_stamp(self) -> str:
@@ -595,6 +611,11 @@ class Mod:
         self.selected = [i for i in ids if i in self.selected]
         self.requirements = [r for r in self.requirements if isinstance(r, dict) and isinstance(r.get("name"), str)]
         self.lua_requires = [r for r in self.lua_requires if isinstance(r, str)]
+        # (state.json may have been edited by hand: a lone surrogate would make every save fail; not cut to
+        #  MAX_MEMO, which set_memo keeps)
+        self.memo = clean_memo(self.memo)
+        if not self.memo:
+            self.memo_at = ""
 
     @property
     def needs_option(self) -> bool:
@@ -1270,6 +1291,21 @@ class ModManager:
         mod.name = name
         self._write_mod_meta(mod)
         self.save()
+
+    def set_memo(self, mod_id: str, text: str) -> bool:
+        """Write the user's memo on a mod ("" clears it). Not a change of what the game gets: no revision, dirty,
+        stamp or cache change. False when the memo stays the same. ValueError when it is longer than MAX_MEMO."""
+        memo = clean_memo(text)
+        if len(memo) > MAX_MEMO:
+            raise ValueError(f"메모는 {MAX_MEMO:,}자까지 쓸 수 있습니다 (지금 {len(memo):,}자).")
+        mod = self.get(mod_id)
+        if memo == mod.memo:
+            return False
+        mod.memo = memo
+        mod.memo_at = _now() if memo else ""
+        self._write_mod_meta(mod)
+        self.save()
+        return True
 
     def remove(self, mod_id: str) -> None:
         """Forget a mod and delete its stored files. Deployed copies go on the next deploy."""
@@ -2756,7 +2792,7 @@ class ModManager:
         planned again; ``target`` as there: one piece of equipment, or a part -> Target map for armor parts
         moved to different ones): its files are built in a new folder under temp and installed as one mod
         without options named as retarget_name says, with the original's author, description, version,
-        category and picture (not its Nexus link or update), right after the original in the load order;
+        category, picture and memo (not its Nexus link or update), right after the original in the load order;
         ``enable`` switches it on (whether the original is on or not), ``disable_original`` switches the
         original off. Its recipe (Mod.retarget; a map of every part to one piece of equipment kept as a move
         to it) makes the material check compare it with the original equipment's game files (for a mod
@@ -2782,7 +2818,7 @@ class ModManager:
                 raise InstallError(str(exc)) from None
             mod = Mod(id=new_id, name=name, enabled=enable, version=original.version, author=original.author,
                       description=original.description, category=original.category, installed_at=_now(),
-                      pictures_read=True)
+                      pictures_read=True, memo=original.memo, memo_at=original.memo_at)
             picture = self.mod_picture(mod_id)
             if picture is not None:
                 mod.screenshot = "preview" + picture.suffix.lower()

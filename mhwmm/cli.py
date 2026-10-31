@@ -28,6 +28,7 @@ KIND_NAMES = {
     "reframework": "REFramework", "pak": "PAK", "loose": "루스", "script": "스크립트",
     "dll": "DLL", "other": "기타",
 }
+MEMO_HEAD = 60  # characters of a memo's first line under its mod in ``list``
 
 
 def _kinds(kinds: set[str]) -> str:
@@ -120,6 +121,8 @@ def cmd_list(manager: ModManager, args) -> int:
         if m.options:
             extra += "  옵션 선택 필요" if m.needs_option else f"  옵션 {len(m.selected)}/{len(m.options)}"
         print(f"{i:3d}. {flag} {m.name}{version}  ({_kinds(manager.mod_kinds(m.id))}, id={m.id}){extra}")
+        if m.memo:
+            print(f"       메모: {_memo_head(m.memo)}")
         if m.enabled:
             _print_missing(manager, m, "       ")
     if manager.dirty:
@@ -285,6 +288,67 @@ def cmd_options(manager: ModManager, args) -> int:
     print(f"{mod.name} 옵션:")
     _print_options(manager, mod)
     return _maybe_deploy(manager, args)
+
+
+def _memo_head(memo: str) -> str:
+    """The first line with text of a memo, cut to MEMO_HEAD characters, and how many more lines with text it has."""
+    lines = [line.strip() for line in memo.split("\n") if line.strip()] or [""]
+    first = lines[0] if len(lines[0]) <= MEMO_HEAD else lines[0][:MEMO_HEAD - 1] + "…"
+    return first + (f" (외 {len(lines) - 1}줄)" if len(lines) > 1 else "")
+
+
+def _memo_writes(args) -> bool:
+    return args.set is not None or args.append is not None or args.file is not None or args.clear
+
+
+def cmd_memo(manager: ModManager, args) -> int:
+    """모드 메모: the user's own notes on mods. Not a change of what the game gets (manager.set_memo), so it runs
+    while 원인 모드 찾기 does; reading them needs no instance lock (_read_only)."""
+    if args.mod is None:
+        if _memo_writes(args):
+            raise SystemExit("메모를 쓸 모드를 지정하세요 (예: memo <모드> --set <내용>)")
+        noted = [(i, m) for i, m in enumerate(manager.mods, 1) if m.memo]
+        if not noted:
+            print("메모를 적은 모드가 없습니다.")
+        for n, (i, m) in enumerate(noted):
+            if n:
+                print()
+            print(f"{i:3d}. {'[x]' if m.enabled else '[ ]'} {m.name}")
+            for line in m.memo.split("\n"):
+                print(f"       {line}".rstrip())
+        return 0
+    (mod,) = _resolve(manager, [args.mod])
+    if not _memo_writes(args):
+        if not mod.memo:
+            print(f"'{mod.name}'에 적은 메모가 없습니다.")
+            return 0
+        print(mod.memo)
+        if mod.memo_at:
+            print(f"({mod.memo_at.replace('T', ' ')[:16]} 수정)")
+        return 0
+    if args.file is not None:
+        try:
+            text = Path(args.file).read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            print(f"오류: 메모 파일이 UTF-8이 아닙니다: {args.file}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"오류: 메모 파일을 읽지 못했습니다: {exc}", file=sys.stderr)
+            return 1
+    elif args.append is not None:
+        text = f"{mod.memo}\n{args.append}" if mod.memo else args.append
+    else:
+        text = "" if args.clear else args.set
+    try:
+        changed = manager.set_memo(mod.id, text)
+    except ValueError as exc:  # (too long)
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    if not changed:
+        print(f"메모가 그대로입니다: {mod.name}")
+    else:
+        print(f"{'메모를 저장했습니다' if mod.memo else '메모를 지웠습니다'}: {mod.name}")
+    return 0
 
 
 def _maybe_deploy(manager: ModManager, args) -> int:
@@ -2419,6 +2483,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("conflicts", help="같은 파일을 바꾸는 모드들 보기")
     p.add_argument("--files", action="store_true", help="겹치는 파일을 모두 보기")
 
+    p = sub.add_parser("memo", help="모드 메모 보기/쓰기")
+    p.add_argument("mod", nargs="?", help="모드 id, 번호 또는 이름 (생략하면 메모를 적은 모든 모드)")
+    write = p.add_mutually_exclusive_group()
+    # (a value that starts with "-" is read as an option unless it comes after "=")
+    write.add_argument("--set", metavar="내용", help='메모 쓰기 (바꾸기). -로 시작하는 내용은 --set="-내용"처럼 =로 붙여 씀')
+    write.add_argument("--append", metavar="내용", help='메모 끝에 새 줄로 더하기. -로 시작하는 내용은 --append="-내용"')
+    write.add_argument("--file", metavar="파일", help="파일(UTF-8)의 내용으로 메모 쓰기")
+    write.add_argument("--clear", action="store_true", help="메모 지우기")
+
     sub.add_parser("deploy", help="활성화된 모드를 게임 폴더에 적용")
     sub.add_parser("purge", help="게임 폴더에서 모든 모드 파일 제거")
     sub.add_parser("verify", help="적용된 파일 점검")
@@ -2518,7 +2591,15 @@ COMMANDS = {
     "verify": cmd_verify, "game": cmd_game, "materials": cmd_materials, "matfix": cmd_materials,
     "equipment": cmd_equipment, "equip": cmd_equipment, "equip-preview": cmd_equip_preview, "crash": cmd_crash,
     "bisect": cmd_bisect, "check": cmd_check, "retarget": cmd_retarget, "edit": cmd_edit, "modedit": cmd_edit,
+    "memo": cmd_memo,
 }
+
+
+def _read_only(args) -> bool:
+    """The command only reads the data folder: it runs while another manager (the window) holds the lock."""
+    if args.cmd == "memo":
+        return not _memo_writes(args)
+    return args.cmd in READ_ONLY_COMMANDS
 
 
 def changes_mods(args) -> bool:
@@ -2558,7 +2639,7 @@ def main(argv=None) -> int:
         if problem:
             print(f"경고: {problem}", file=sys.stderr)
         lock = acquire_instance_lock(data_dir)
-        if lock is None and args.cmd not in READ_ONLY_COMMANDS:
+        if lock is None and not _read_only(args):
             print("모드 매니저가 이미 실행 중입니다. 종료한 뒤 다시 시도하세요.", file=sys.stderr)
             return 2
         manager = ModManager(data_dir)

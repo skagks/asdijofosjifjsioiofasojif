@@ -571,6 +571,11 @@ class _FakeUser32:
         assert hwnd == self.HWND and flags == 2
         return 5
 
+    def MonitorFromPoint(self, point, flags):
+        assert flags == 2
+        self.point = (point.x, point.y)
+        return 5
+
     def GetMonitorInfoW(self, monitor, info):
         import ctypes
 
@@ -704,6 +709,33 @@ def test_win_pointer_reads_the_frame_and_the_mouse(monkeypatch):
     assert not drag_step(wider, cursor=(1010, 600))  # the mouse not readable: the time rules
     user32.normal(100, 300, 900, 700)
     assert drag_step(wider, cursor=(1010, 600), by_alone=True)
+
+
+def test_tooltips_keep_to_the_work_area(monkeypatch):
+    """_work_area (where RowTooltip keeps a tall tooltip): on Windows the work area of the monitor nearest the point
+    (_WinPointer.work_area, over a fake user32: the taskbar would cover the tooltip), else or when it cannot be read
+    the screen."""
+    from mhwmm import gui
+
+    user32 = _FakeUser32()
+    monkeypatch.setattr(gui, "_win_functions", user32.functions)
+    pointer = gui._WinPointer()
+    assert pointer.work_area(500, 990) == (0, 0, 1920, 1040) and user32.point == (500, 990)
+
+    class Screen:
+        def winfo_screenwidth(self):
+            return 1366
+
+        def winfo_screenheight(self):
+            return 768
+
+    monkeypatch.setattr(gui, "_pointer", lambda: pointer)
+    assert gui._work_area(Screen(), 500, 990) == (0, 0, 1920, 1040)
+    monkeypatch.setattr(user32, "GetMonitorInfoW", lambda monitor, info: 0)
+    pointer = gui._WinPointer()
+    assert gui._work_area(Screen(), 500, 990) == (0, 0, 1366, 768)  # (not readable: the screen)
+    monkeypatch.setattr(gui, "_pointer", lambda: None)  # (not Windows)
+    assert gui._work_area(Screen(), 500, 990) == (0, 0, 1366, 768)
 
 
 class _FakeClassUser32:
@@ -1695,6 +1727,34 @@ def test_gui_help_window(root, manager):
     dialog.go(0)
     assert str(dialog.nav_buttons[0].cget("style")) == "NavActive.TButton"
     assert str(dialog.nav_buttons[1].cget("style")) == "Nav.TButton"
+    dialog.destroy()
+
+
+def test_the_help_window_fits_a_768_pixel_high_screen(root, monkeypatch):
+    """사용법 is as tall as its column of topics (the guide scrolls): with 닫기 it fits a 1366×768 laptop's work
+    area below a maximized main window's title bar (768 - 40 taskbar - 31 and 23 title bars, a few pixels to spare);
+    a shorter window cuts the last topics, not 닫기."""
+    from mhwmm import gui, helptext
+    from mhwmm.theme import Theme
+
+    theme = Theme(root, "dark")
+    theme.use("dark")
+    monkeypatch.setattr(gui.HelpDialog, "FREEZE", False)  # (the body packed: it follows the window at once)
+    dialog = gui.HelpDialog(root, theme)
+    dialog.maxsize(4000, 3000)
+    dialog.update_idletasks()
+    assert len(dialog.nav_buttons) == len(helptext.SECTIONS)
+    assert dialog.winfo_reqheight() <= theme.px(668)
+    nav = dialog.nav_buttons[0].master
+    (close,) = [w for w in nav.winfo_children() if str(w.winfo_class()) == "TButton" and w.cget("text") == "닫기"]
+    dialog.wait_window = lambda *a: None  # (show() returns at once)
+    dialog.show()
+    pump(root, lambda: dialog.winfo_ismapped())
+    dialog.geometry(f"{dialog.winfo_width()}x{theme.px(500)}")
+    pump(root, lambda: dialog.winfo_height() == theme.px(500))
+    root.update()
+    assert close.winfo_ismapped() and close.winfo_height() > 1
+    assert close.winfo_rooty() + close.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
     dialog.destroy()
 
 
